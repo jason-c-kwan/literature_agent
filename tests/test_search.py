@@ -173,21 +173,227 @@ def mock_all_async_search_methods(mocker, mock_async_search_literature_data):
     # mocker.patch('tools.search.AsyncSearchClient.search_unpaywall', AsyncMock(return_value={}))
     
     # Mock nest_asyncio.apply to prevent it from actually modifying the loop policy
-    mocker.patch('nest_asyncio.apply', MagicMock())
+    # Only apply this broadly if it doesn't interfere with lower-level tests.
+    # For now, let's assume it's okay or manage it per test suite.
+    # mocker.patch('nest_asyncio.apply', MagicMock()) # Moved to be more specific if needed
+
+
+# --- Tests for the OA URL Fallback Mechanism ---
+
+@pytest.mark.asyncio
+async def test_get_oa_url_unpaywall_success(search_client_with_mocks, mocker):
+    search_client, mocks = search_client_with_mocks
+    mock_async_run_sync(mocker, search_client)
+    
+    doi = "10.1234/unpaywall_success"
+    mock_df_data = {
+        "doi": [doi],
+        "is_oa": [True],
+        "best_oa_location": [{"url": "http://unpaywall.example.com/pdf"}]
+    }
+    mocks["UnpywallGlobal"].doi.return_value = pd.DataFrame(mock_df_data)
+
+    result = await search_client._get_open_access_url_with_fallback(doi)
+
+    assert result["is_open_access"] is True
+    assert result["open_access_url"] == "http://unpaywall.example.com/pdf"
+    assert result["open_access_url_source"] == "Unpaywall"
+    mocks["UnpywallGlobal"].doi.assert_called_once_with(dois=[doi])
+
+
+@pytest.mark.asyncio
+async def test_get_oa_url_pmc_fallback_success(search_client_with_mocks, mocker):
+    search_client, mocks = search_client_with_mocks
+    mock_async_run_sync(mocker, search_client)
+    MockEntrez = mocks["Entrez"]
+
+    doi = "10.1234/pmc_success"
+    
+    # Unpaywall fails (returns no OA or error)
+    mocks["UnpywallGlobal"].doi.return_value = pd.DataFrame({"doi": [doi], "is_oa": [False], "best_oa_location": [None]})
+    
+    # PMC search success
+    mock_esearch_handle_pmc = MagicMock()
+    MockEntrez.esearch.return_value = mock_esearch_handle_pmc
+    
+    mock_elink_handle_pmc = MagicMock()
+    MockEntrez.elink.return_value = mock_elink_handle_pmc
+
+    def entrez_read_side_effect_pmc(handle, *args, **kwargs):
+        if handle == mock_esearch_handle_pmc:
+            # Check db parameter if necessary: kwargs.get('db') == 'pmc'
+            return {"IdList": ["PMC123"]}
+        if handle == mock_elink_handle_pmc:
+            return [{"LinkSetDb": [{"LinkName": "pmc_pmc_ft", "Link": [{"Url": "http://pmc.example.com/article/PMC123/pdf"}]}]}]
+        raise ValueError("Unexpected handle for Entrez.read in PMC test")
+
+    MockEntrez.read.side_effect = entrez_read_side_effect_pmc
+    
+    result = await search_client._get_open_access_url_with_fallback(doi)
+
+    assert result["is_open_access"] is True
+    assert result["open_access_url"] == "http://pmc.example.com/article/PMC123/pdf"
+    assert result["open_access_url_source"] == "PMC"
+    
+    mocks["UnpywallGlobal"].doi.assert_called_once_with(dois=[doi])
+    MockEntrez.esearch.assert_called_once_with(db="pmc", term=f"{doi}[DOI]", retmax="1")
+    MockEntrez.elink.assert_called_once_with(dbfrom="pmc", db="pmc", id="PMC123", cmd="prlinks")
+
+
+@pytest.mark.asyncio
+async def test_get_oa_url_europepmc_fallback_success(search_client_with_mocks, mocker):
+    search_client, mocks = search_client_with_mocks
+    mock_async_run_sync(mocker, search_client)
+    MockEntrez = mocks["Entrez"]
+    MockEuropePMCInstance = mocks["EuropePMCInstance"]
+
+    doi = "10.1234/epmc_success"
+
+    # Unpaywall fails
+    mocks["UnpywallGlobal"].doi.return_value = pd.DataFrame({"doi": [doi], "is_oa": [False], "best_oa_location": [None]})
+    
+    # PMC fails (no ID found)
+    mock_esearch_handle_pmc_fail = MagicMock()
+    MockEntrez.esearch.return_value = mock_esearch_handle_pmc_fail
+    MockEntrez.read.side_effect = lambda handle, *args, **kwargs: {"IdList": []} if handle == mock_esearch_handle_pmc_fail else {}
+    
+    # EuropePMC success
+    epmc_api_response = {
+        "pmcid": "PMC789",
+        "doi": doi,
+        "isOpenAccess": "Y",
+        "hasTextMinedTerms": "Y",
+        "fullTextUrlList": {
+            "fullTextUrl": [
+                {"documentStyle": "html", "availabilityCode": "OA", "url": "http://epmc.example.com/html"},
+                {"documentStyle": "pdf", "availabilityCode": "OA", "url": "http://epmc.example.com/pdf"}
+            ]
+        },
+        "_error": "" 
+    }
+    MockEuropePMCInstance.search.return_value = epmc_api_response
+    
+    result = await search_client._get_open_access_url_with_fallback(doi)
+
+    assert result["is_open_access"] is True
+    assert result["open_access_url"] == "http://epmc.example.com/pdf" # Prefers PDF
+    assert result["open_access_url_source"] == "EuropePMC"
+
+    mocks["UnpywallGlobal"].doi.assert_called_once_with(dois=[doi])
+    MockEntrez.esearch.assert_called_once_with(db="pmc", term=f"{doi}[DOI]", retmax="1")
+    MockEuropePMCInstance.search.assert_called_once_with(f"DOI:{doi}")
+
+
+@pytest.mark.asyncio
+async def test_get_oa_url_no_source_success(search_client_with_mocks, mocker):
+    search_client, mocks = search_client_with_mocks
+    mock_async_run_sync(mocker, search_client)
+    MockEntrez = mocks["Entrez"]
+    MockEuropePMCInstance = mocks["EuropePMCInstance"]
+
+    doi = "10.1234/all_fail"
+
+    # Unpaywall fails
+    mocks["UnpywallGlobal"].doi.return_value = pd.DataFrame({"doi": [doi], "is_oa": [False], "best_oa_location": [None]})
+    
+    # PMC fails
+    mock_esearch_handle_pmc_all_fail = MagicMock()
+    MockEntrez.esearch.return_value = mock_esearch_handle_pmc_all_fail
+    MockEntrez.read.side_effect = lambda handle, *args, **kwargs: {"IdList": []} if handle == mock_esearch_handle_pmc_all_fail else {}
+    
+    # EuropePMC fails (no result or error)
+    MockEuropePMCInstance.search.return_value = {"_error": "No results found"}
+    
+    result = await search_client._get_open_access_url_with_fallback(doi)
+
+    assert result["is_open_access"] is False
+    assert result["open_access_url"] is None
+    assert result["open_access_url_source"] is None
+
+
+@pytest.mark.asyncio
+async def test_search_unpaywall_integrates_fallback(search_client_with_mocks, mocker):
+    # This test ensures that the main search_unpaywall method correctly uses the fallback.
+    search_client, mocks = search_client_with_mocks
+    mock_async_run_sync(mocker, search_client)
+
+    doi_unpaywall = "10.1/unpaywall_only"
+    doi_pmc = "10.1/pmc_only"
+    doi_epmc = "10.1/epmc_only"
+    doi_none = "10.1/none"
+
+    # Mock _get_open_access_url_with_fallback directly for simplicity here
+    # rather than mocking all individual API calls again.
+    async def mock_fallback_logic(doi_arg):
+        if doi_arg == doi_unpaywall:
+            return {"doi": doi_unpaywall, "is_open_access": True, "open_access_url": "http://u.pdf", "open_access_url_source": "Unpaywall"}
+        elif doi_arg == doi_pmc:
+            return {"doi": doi_pmc, "is_open_access": True, "open_access_url": "http://p.pdf", "open_access_url_source": "PMC"}
+        elif doi_arg == doi_epmc:
+            return {"doi": doi_epmc, "is_open_access": True, "open_access_url": "http://e.pdf", "open_access_url_source": "EuropePMC"}
+        elif doi_arg == doi_none:
+            return {"doi": doi_none, "is_open_access": False, "open_access_url": None, "open_access_url_source": None}
+        return {} # Should not happen with given DOIs
+
+    mocker.patch.object(search_client, '_get_open_access_url_with_fallback', side_effect=mock_fallback_logic)
+
+    dois_to_search = [doi_unpaywall, doi_pmc, doi_epmc, doi_none]
+    results_map = await search_client.search_unpaywall(dois_to_search)
+
+    assert len(results_map) == 4
+    assert results_map[doi_unpaywall]["open_access_url"] == "http://u.pdf"
+    assert results_map[doi_unpaywall]["open_access_url_source"] == "Unpaywall"
+    assert results_map[doi_pmc]["open_access_url"] == "http://p.pdf"
+    assert results_map[doi_pmc]["open_access_url_source"] == "PMC"
+    assert results_map[doi_epmc]["open_access_url"] == "http://e.pdf"
+    assert results_map[doi_epmc]["open_access_url_source"] == "EuropePMC"
+    assert results_map[doi_none]["is_open_access"] is False
+    assert search_client._get_open_access_url_with_fallback.call_count == 4
+
+
+# --- Tests for search_literature and overall functionality (may need adjustment due to mock_all_async_search_methods) ---
+# For these higher-level tests, we might want mock_all_async_search_methods to be active.
+# If it was `autouse=False`, we'd add `@pytest.mark.usefixtures("mock_all_async_search_methods")` here.
+# For now, assuming it's still autouse=True or we manage its scope.
+# If `mock_all_async_search_methods` is autouse=True, it will mock AsyncSearchClient.search_all,
+# so the detailed OA fallback logic inside search_all (via search_unpaywall) won't be hit directly
+# by these specific `test_search_literature_*` tests unless `search_all`'s mock itself incorporates it.
+# The current `mock_search_all` in that fixture just returns canned data.
+# To test the full integration including OA fallback in `search_literature`,
+# `mock_all_async_search_methods` would need to be more sophisticated or disabled for such a test.
+
+# Let's add a specific test for search_literature that ensures the new OA columns are present.
+# This will rely on the `mock_all_async_search_methods` fixture's behavior.
+# The fixture's `mock_search_all` returns a DataFrame from `mock_async_search_literature_data`.
+# This data does not yet include 'open_access_url_source'.
+# We need to update `mock_async_search_literature_data` or how `search_all` is mocked.
+
+# For now, let's focus on the lower-level tests of the fallback.
+# The existing `test_search_literature_returns_dataframe_with_expected_columns`
+# will need `open_access_url_source` added to `expected_columns`.
 
 
 def test_search_literature_returns_dataframe_with_expected_columns():
-    df = search_literature("test query", max_results_per_source=1)
+    # This test relies on mock_all_async_search_methods fixture.
+    # We need to ensure nest_asyncio.apply is mocked if it's not autouse.
+    with patch('nest_asyncio.apply', MagicMock()):
+        df = search_literature("test query", max_results_per_source=1)
+    
     expected_columns = ['title', 'authors', 'doi', 'pmid', 'pmcid', 'year', 'abstract', 'journal',
-                        'url', 'source_api', 'is_open_access', 'open_access_url']
+                        'url', 'source_api', 'is_open_access', 'open_access_url', 'open_access_url_source']
     assert isinstance(df, pd.DataFrame)
-    assert all(col in df.columns for col in expected_columns)
+    # Check if all expected columns are present. Some might be all NA if not in mock data.
+    for col in expected_columns:
+        assert col in df.columns, f"Expected column '{col}' not found in DataFrame."
 
+
+@pytest.mark.usefixtures("mock_all_async_search_methods") # Explicitly use if autouse=False
 def test_search_literature_deduplication_and_sorting():
-    # The mock_all_async_search_methods fixture provides data with duplicates.
-    # We expect 6 unique results after deduplication (A, B, C, D, E, F)
-    # and sorted by source_api, then year desc.
-    df = search_literature("test query", max_results_per_source=2) # Each source returns 2, total 8 raw
+    with patch('nest_asyncio.apply', MagicMock()):
+        # The mock_all_async_search_methods fixture provides data with duplicates.
+        # We expect 6 unique results after deduplication (A, B, C, D, E, F)
+        # and sorted by source_api, then year desc.
+        df = search_literature("test query", max_results_per_source=2) # Each source returns 2, total 8 raw
     
     # Expected unique DOIs: 10.1/A, 10.1/B, 10.1/C, 10.1/D
     # Expected unique PMIDs (for those without DOI): 5, 6
@@ -206,7 +412,10 @@ def test_search_literature_deduplication_and_sorting():
 
     # Manually construct the expected DataFrame after deduplication and sorting
     # This is a bit brittle if the mock data changes, but necessary for strict sorting checks.
-    expected_data = [
+    # The mock_async_search_literature_data needs to be updated if we want to check new OA columns here.
+    # For now, this test focuses on the original deduplication and sorting logic.
+    expected_data_for_sort_test = [
+        # These are from mock_async_search_literature_data, after deduplication
         SearchResult(title="Title D", authors=["Author D"], doi="10.1/D", pmid="4", year=2023, source_api="CrossRef"),
         SearchResult(title="Title F", authors=["Author F"], doi=None, pmid="6", year=2021, source_api="CrossRef"),
         SearchResult(title="Title B", authors=["Author B"], doi="10.1/B", pmid="2", year=2021, source_api="EuropePMC"),
@@ -215,25 +424,30 @@ def test_search_literature_deduplication_and_sorting():
         SearchResult(title="Title C", authors=["Author C"], doi="10.1/C", pmid="3", year=2022, source_api="SemanticScholar"),
     ]
     # Sort this expected data by source_api (asc), then year (desc)
-    expected_df = pd.DataFrame(expected_data).sort_values(by=['source_api', 'year'], ascending=[True, False]).reset_index(drop=True)
+    expected_df_sorted = pd.DataFrame(expected_data_for_sort_test).sort_values(
+        by=['source_api', 'year'], ascending=[True, False]
+    ).reset_index(drop=True)
 
-    # Compare relevant columns, ignoring potential differences in 'is_open_access', 'open_access_url' if not set by mock
-    # Also, the mock_all_async_search_methods sets search_unpaywall to return {}, so these columns will be NaN.
-    # We only care about the core search results and their order.
+    # Compare relevant columns, ignoring potential differences in 'is_open_access', 'open_access_url' etc.
+    # as these are not the focus of this specific sorting/deduplication test using the old mock data.
+    df_compare = df[['title', 'doi', 'pmid', 'year', 'source_api']].copy().reset_index(drop=True)
+    expected_df_compare = expected_df_sorted[['title', 'doi', 'pmid', 'year', 'source_api']].copy().reset_index(drop=True)
     
-    # Ensure the columns are in the same order for comparison
-    df_compare = df[['title', 'doi', 'pmid', 'year', 'source_api']].copy()
-    expected_df_compare = expected_df[['title', 'doi', 'pmid', 'year', 'source_api']].copy()
+    # Fill NA for comparison as string 'None' might differ from np.nan
+    df_compare.fillna(value=pd.NA, inplace=True)
+    expected_df_compare.fillna(value=pd.NA, inplace=True)
 
-    pd.testing.assert_frame_equal(df_compare, expected_df_compare)
+    pd.testing.assert_frame_equal(df_compare, expected_df_compare, check_dtype=False)
 
 
+@pytest.mark.usefixtures("mock_all_async_search_methods")
 def test_search_literature_max_results_per_source_limit():
-    # With max_results_per_source=1, each of the 4 sources should return 1 unique result.
-    # The mock_async_search_literature_data has 4 unique DOIs and 2 unique PMIDs (no DOI).
-    # If max_results_per_source is 1, search_all will receive 4 results (1 from each source).
-    # After deduplication, we should still have 4 results.
-    df = search_literature("test query", max_results_per_source=1)
+    with patch('nest_asyncio.apply', MagicMock()):
+        # With max_results_per_source=1, each of the 4 sources should return 1 unique result.
+        # The mock_async_search_literature_data has 4 unique DOIs and 2 unique PMIDs (no DOI).
+        # If max_results_per_source is 1, search_all will receive 4 results (1 from each source).
+        # After deduplication, we should still have 4 results.
+        df = search_literature("test query", max_results_per_source=1)
     assert len(df) == 4 # 4 unique results from 4 sources, 1 per source
 
 @pytest.mark.slow

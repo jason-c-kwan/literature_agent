@@ -63,6 +63,7 @@ class SearchResult(TypedDict, total=False):
     source_api: str
     is_open_access: Optional[bool]
     open_access_url: Optional[str]
+    open_access_url_source: Optional[str] # Source of the OA URL (Unpaywall, PMC, EuropePMC)
     # Add other fields as necessary from different APIs
 
 
@@ -119,6 +120,147 @@ class AsyncSearchClient:
         if self.unpaywall_email:
             Unpywall.mailto = self.unpaywall_email
 
+    async def _get_open_access_url_with_fallback(self, doi: str) -> SearchResult:
+        """
+        Tries to find an open-access URL for a given DOI using Unpaywall,
+        then PMC, then Europe PMC as fallbacks.
+        """
+        oa_url: Optional[str] = None
+        is_oa: Optional[bool] = False # Default to False, set to True if any source provides a URL
+        source_of_oa_url: Optional[str] = None
+
+        # 1. Try Unpaywall
+        try:
+            async with self.unpaywall_semaphore, self.unpywall_sync_semaphore:
+                # Unpywall.doi expects a list of DOIs
+                response_df = await self._run_sync_in_thread(Unpywall.doi, dois=[doi])
+            if response_df is not None and not response_df.empty:
+                record = response_df.iloc[0]
+                if record.get('is_oa'):
+                    is_oa = True
+                    best_oa_location = record.get('best_oa_location')
+                    if best_oa_location and isinstance(best_oa_location, dict):
+                        oa_url = best_oa_location.get('url')
+                        if oa_url:
+                            source_of_oa_url = "Unpaywall"
+        except Exception as e:
+            print(f"Unpaywall error for DOI {doi}: {e}")
+
+        # 2. Fallback to PubMed Central (PMC) if no URL from Unpaywall
+        if not oa_url and doi:
+            try:
+                async with self.pubmed_semaphore: # Use existing PubMed semaphore
+                    # Search PMC for the DOI
+                    handle = await self._run_sync_in_thread(
+                        Entrez.esearch,
+                        db="pmc",
+                        term=f"{doi}[DOI]",
+                        retmax="1"
+                    )
+                    search_results = Entrez.read(handle)
+                    handle.close()
+                    pmc_ids = search_results.get("IdList", [])
+
+                    if pmc_ids:
+                        pmcid = pmc_ids[0]
+                        # Attempt to construct a direct link or use elink for more robust link finding
+                        # For simplicity, let's try a common pattern first.
+                        # A more robust way would be to use Entrez.elink to find 'pmc full text' links.
+                        # Example: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC12345/
+                        # Or check for full text links via esummary or efetch if available.
+                        # For now, we'll assume if a PMCID is found, it's likely OA via PMC's main article page.
+                        # The actual PDF link might be on that page.
+                        oa_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmcid}/"
+                        is_oa = True # Assume if found in PMC, it's OA
+                        source_of_oa_url = "PMC"
+                        # To get a direct PDF link from PMC, one might need to parse the article page
+                        # or use more specific Entrez features if they provide direct PDF links.
+                        # Entrez.elink with cmd="prlinks" might be more accurate here.
+                        # Let's try elink to get a more direct link if possible
+                        link_handle = await self._run_sync_in_thread(
+                            Entrez.elink,
+                            dbfrom="pmc",
+                            db="pmc", # Link within pmc to find full text providers or use 'pubmed' for related
+                            id=pmcid,
+                            cmd="prlinks" # This command provides links to full-text providers
+                        )
+                        link_results = Entrez.read(link_handle)
+                        link_handle.close()
+
+                        if link_results and link_results[0].get("LinkSetDb"):
+                            for link_set_db in link_results[0]["LinkSetDb"]:
+                                if link_set_db.get("LinkName") == "pmc_pmc_ft": # Full text link
+                                    if link_set_db.get("Link"):
+                                        # Prefer PDF if available
+                                        pdf_link_found = False
+                                        for link_info in link_set_db["Link"]:
+                                            if link_info.get("Url") and 'pdf' in link_info.get("Url", "").lower():
+                                                oa_url = link_info["Url"]
+                                                pdf_link_found = True
+                                                break
+                                        if not pdf_link_found and link_set_db["Link"]: # Fallback to first link if no PDF
+                                            oa_url = link_set_db["Link"][0].get("Url", oa_url) # Keep previous if no new URL
+                                        break # Found full text links
+                        # If elink didn't provide a better URL, the constructed PMC article URL is a fallback
+            except Exception as e:
+                print(f"PMC fallback error for DOI {doi}: {e}")
+
+        # 3. Fallback to Europe PMC if still no URL
+        if not oa_url and doi:
+            try:
+                async with self.europepmc_semaphore:
+                    # The europe_pmc library's search can take a DOI query
+                    # query format for DOI: "DOI:10.1234/journal.xxxx"
+                    epmc_result_dict = await self._run_sync_in_thread(
+                        self.epmc.search, # self.epmc is EuropePMC() instance
+                        f"DOI:{doi}"
+                    )
+                    
+                    # Check if result is valid and has pmcid for PDF link construction
+                    if epmc_result_dict and not epmc_result_dict.get('_error'):
+                        pmcid = epmc_result_dict.get('pmcid')
+                        if pmcid:
+                             # Check if it has full text available, EuropePMC often indicates this
+                            has_ft = epmc_result_dict.get('hasTextMinedTerms') == 'Y' or \
+                                     epmc_result_dict.get('isOpenAccess') == 'Y' or \
+                                     epmc_result_dict.get('inEPMC') == 'Y'
+
+                            if has_ft or pmcid: # If PMCID exists, good chance of OA link
+                                # Construct the PDF URL as per library's pattern
+                                potential_url = f"https://europepmc.org/backend/ptpmcrender.fcgi?accid={pmcid}&blobtype=pdf"
+                                # Verify if this URL is likely valid or if there's a better one in response
+                                # The library's `fetch` method adds `pdf_url` if pmcid exists.
+                                # We can also check `fullTextUrlList` if present in the response.
+                                ft_urls = epmc_result_dict.get('fullTextUrlList', {}).get('fullTextUrl', [])
+                                found_ft_url = False
+                                if ft_urls:
+                                    for ft_url_info in ft_urls:
+                                        if ft_url_info.get('documentStyle') == 'pdf' and ft_url_info.get('availabilityCode') == 'OA':
+                                            oa_url = ft_url_info.get('url')
+                                            found_ft_url = True
+                                            break
+                                    if not found_ft_url: # Take first OA if no PDF
+                                        for ft_url_info in ft_urls:
+                                            if ft_url_info.get('availabilityCode') == 'OA':
+                                                oa_url = ft_url_info.get('url')
+                                                found_ft_url = True
+                                                break
+                                
+                                if not found_ft_url and pmcid: # Fallback to constructed PDF URL if PMCID exists
+                                    oa_url = potential_url
+                                
+                                if oa_url:
+                                    is_oa = True
+                                    source_of_oa_url = "EuropePMC"
+            except Exception as e:
+                print(f"EuropePMC fallback error for DOI {doi}: {e}")
+        
+        return {
+            "doi": doi, # Ensure DOI is part of the result for mapping
+            "is_open_access": is_oa if oa_url else False, # Only True if a URL was found
+            "open_access_url": oa_url,
+            "open_access_url_source": source_of_oa_url # Track where the URL came from
+        }
 
     async def __aenter__(self):
         return self
@@ -451,26 +593,70 @@ class AsyncSearchClient:
         # Deduplication logic moved to _async_search_literature.
         # The DataFrame df at this point contains all aggregated results before final deduplication.
 
-        # Enrich with Unpaywall data
-        unique_dois = df[df['doi'].notna()]['doi'].unique().tolist() # Use original 'doi' column for Unpaywall
+        # Enrich with OA data using fallback mechanism
+        unique_dois = df[df['doi'].notna()]['doi'].unique().tolist()
         if unique_dois:
-            print(f"DEBUG: Calling search_unpaywall with {len(unique_dois)} unique DOIs.")
-            oa_data_map = await self.search_unpaywall(unique_dois)
-            print(f"DEBUG: search_unpaywall returned {len(oa_data_map)} results.")
+            print(f"DEBUG: Calling search_unpaywall (with fallback) for {len(unique_dois)} unique DOIs.")
+            oa_data_map = await self.search_unpaywall(unique_dois) # This now uses the fallback
+            print(f"DEBUG: search_unpaywall (with fallback) returned {len(oa_data_map)} results.")
             if oa_data_map:
+                # DataFrame from oa_data_map will have 'doi', 'is_open_access', 'open_access_url', 'open_access_url_source'
                 oa_df = pd.DataFrame(list(oa_data_map.values()))
                 if not oa_df.empty and 'doi' in oa_df.columns:
-                    print("DEBUG: Merging Unpaywall data.")
-                    # Normalize DOI in oa_df for merging
+                    print("DEBUG: Merging OA fallback data.")
                     oa_df['doi_norm_merge'] = oa_df['doi'].str.lower().str.replace("https://doi.org/", "", regex=False).str.strip()
-                    # Merge requires 'doi_norm' in the main df to be consistent
-                    df = df.merge(oa_df[['doi_norm_merge', 'is_open_access', 'open_access_url']], 
-                                  left_on='doi_norm', right_on='doi_norm_merge', how='left')
+                    
+                    # Columns to merge from oa_df. Ensure all are present in oa_df.
+                    oa_merge_cols = ['doi_norm_merge']
+                    if 'is_open_access' in oa_df.columns:
+                        oa_merge_cols.append('is_open_access')
+                    if 'open_access_url' in oa_df.columns:
+                        oa_merge_cols.append('open_access_url')
+                    if 'open_access_url_source' in oa_df.columns:
+                        oa_merge_cols.append('open_access_url_source')
+                    
+                    oa_df_to_merge = oa_df[oa_merge_cols].copy()
+
+                    # Store original columns that might be overwritten, to handle NaNs correctly if needed
+                    # However, the fallback mechanism provides the definitive values for these OA fields.
+                    # So, we will overwrite.
+                    
+                    # Suffixes: _orig for original df columns if they clash, _oa for new columns from oa_df
+                    df = df.merge(oa_df_to_merge,
+                                  left_on='doi_norm', right_on='doi_norm_merge',
+                                  how='left',
+                                  suffixes=('_orig', '_oa'))
+                    
                     df.drop(columns=['doi_norm_merge'], inplace=True, errors='ignore')
-                    print("DEBUG: Unpaywall data merge complete.")
+
+                    # Update main df columns with the authoritative data from the OA search
+                    if 'is_open_access_oa' in df.columns:
+                        # If 'is_open_access_orig' exists, we are replacing it.
+                        # If it doesn't exist, 'is_open_access_oa' becomes the new 'is_open_access'.
+                        df['is_open_access'] = df['is_open_access_oa']
+                        df.drop(columns=['is_open_access_oa'], inplace=True)
+                        if 'is_open_access_orig' in df.columns and 'is_open_access_orig' != 'is_open_access':
+                             df.drop(columns=['is_open_access_orig'], inplace=True, errors='ignore')
 
 
-        df.drop(columns=['doi_norm', 'pmid_norm'], inplace=True, errors='ignore')
+                    if 'open_access_url_oa' in df.columns:
+                        df['open_access_url'] = df['open_access_url_oa']
+                        df.drop(columns=['open_access_url_oa'], inplace=True)
+                        if 'open_access_url_orig' in df.columns and 'open_access_url_orig' != 'open_access_url':
+                            df.drop(columns=['open_access_url_orig'], inplace=True, errors='ignore')
+
+                    if 'open_access_url_source_oa' in df.columns:
+                        df['open_access_url_source'] = df['open_access_url_source_oa']
+                        df.drop(columns=['open_access_url_source_oa'], inplace=True)
+                        if 'open_access_url_source_orig' in df.columns and 'open_access_url_source_orig' != 'open_access_url_source':
+                             df.drop(columns=['open_access_url_source_orig'], inplace=True, errors='ignore')
+                    
+                    print("DEBUG: OA fallback data merge complete.")
+
+        # Drop the main doi_norm column used for merging, pmid_norm is handled in _async_search_literature
+        df.drop(columns=['doi_norm'], inplace=True, errors='ignore')
+        # The pmid_norm column is dropped in _async_search_literature after deduplication.
+        # df.drop(columns=['doi_norm', 'pmid_norm'], inplace=True, errors='ignore') # Original line
         print("DEBUG: Dropped normalization columns.")
         end_time = time.time()
         print(f"Overall search_all took {end_time - start_time:.2f} seconds")
@@ -478,69 +664,28 @@ class AsyncSearchClient:
 
     async def search_unpaywall(self, dois: List[str]) -> Dict[str, SearchResult]:
         start_time = time.time()
-        # Returns a dict mapping DOI to its Unpaywall info
+        # Returns a dict mapping DOI to its OA info (URL, is_oa status, source)
         oa_info_map: Dict[str, SearchResult] = {}
-        if not self.unpaywall_email:
-            print("Unpaywall email not set, skipping Unpaywall search.")
-            return oa_info_map
+        if not self.unpaywall_email: # Unpaywall email check is still relevant for the first step
+            print("Unpaywall email not set, Unpaywall part of OA search might be skipped or fail.")
+            # We can still proceed with PMC and EuropePMC fallbacks if DOI is available.
+
+        tasks = [self._get_open_access_url_with_fallback(doi) for doi in dois if doi]
+        print(f"OA Fallback Search: Gathering {len(tasks)} DOI fetch tasks...")
         
-        # Unpywall.mailto should be set at class initialization
-        
-        async def fetch_one_doi(doi: str):
-            print(f"Unpaywall: Starting fetch for DOI {doi}...")
-            async with self.unpaywall_semaphore:
-                try:
-                    print(f"DEBUG: Before Unpywall.doi call for {doi}")
-                    # Unpywall library is synchronous
-                    async with self.unpywall_sync_semaphore: # Serialize calls to Unpywall.doi
-                        response_df = await self._run_sync_in_thread(Unpywall.doi, dois=[doi])
-                    print(f"DEBUG: After Unpywall.doi call for {doi}")
-                    print(f"Unpaywall: Finished fetch for DOI {doi}. Processing results...")
-                    
-                    is_oa = None
-                    oa_url = None
-                    
-                    if response_df is not None and not response_df.empty:
-                        response_plain_dict = response_df.iloc[0].to_dict()
-                        
-                        # Ensure 'doi' is present in the response_plain_dict
-                        # This check is already done by the caller, but good to be explicit
-                        if response_plain_dict.get('doi') == doi:
-                            is_oa = response_plain_dict.get('is_oa', False)
-                            best_oa_location = response_plain_dict.get('best_oa_location', None)
-                            if best_oa_location and isinstance(best_oa_location, dict):
-                                oa_url = best_oa_location.get('url')
-                    
-                    # Always return a SearchResult for the DOI, even if OA info is not found
-                    return {
-                        "is_open_access": is_oa,
-                        "open_access_url": oa_url,
-                        "doi": doi
-                    }
-                except Exception as e:
-                    print(f"Unpaywall error for DOI {doi}: {e}")
-            
-            # If an exception occurs, or if response_df is None/empty and not handled above,
-            # still return a basic SearchResult for the DOI.
-            return {
-                "is_open_access": None,
-                "open_access_url": None,
-                "doi": doi
-            }
-        
-        tasks = [fetch_one_doi(doi) for doi in dois if doi] # Filter out None or empty DOIs
-        print(f"Unpaywall: Gathering {len(tasks)} DOI fetch tasks...")
         # Collect results from all concurrent fetches
-        raw_oa_results = await asyncio.gather(*tasks)
-        print(f"DEBUG: All Unpaywall DOI fetch tasks gathered.")
+        all_oa_results = await asyncio.gather(*tasks)
+        print(f"DEBUG: All OA Fallback DOI fetch tasks gathered.")
 
         # Build the oa_info_map from collected results
-        for result in raw_oa_results:
-            if result and result.get('doi'):
-                oa_info_map[result['doi']] = result
-
+        for result_item in all_oa_results:
+            # result_item is a SearchResult dict from _get_open_access_url_with_fallback
+            if result_item and result_item.get('doi'):
+                # Ensure we store the complete SearchResult structure
+                oa_info_map[result_item['doi']] = result_item
+        
         end_time = time.time()
-        print(f"Unpaywall search took {end_time - start_time:.2f} seconds")
+        print(f"OA Fallback search (Unpaywall, PMC, EuropePMC) took {end_time - start_time:.2f} seconds")
         return oa_info_map
 
 
@@ -599,7 +744,15 @@ async def _async_search_literature(query: str,
             df = df.sort_values(by=['source_api', 'year'], ascending=[True, False])
             
             # Ensure all expected columns from SearchResult are present
+            # Add 'open_access_url_source' to expected columns if it's now part of SearchResult
+            # For now, SearchResult TypedDict is not modified, but the merge below adds it.
+            # If we formally add it to SearchResult, this list should be updated.
             expected_df_cols = list(SearchResult.__annotations__.keys())
+            # Manually add new columns if not in SearchResult TypedDict yet for ordering
+            if 'open_access_url_source' not in expected_df_cols:
+                 expected_df_cols.append('open_access_url_source')
+
+
             for col in expected_df_cols:
                 if col not in df.columns:
                     df[col] = pd.NA # Use pandas NA for missing values
