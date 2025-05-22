@@ -2,17 +2,18 @@ import asyncio
 import os
 import time # Added for debug timing
 from typing import List, Dict, Any, Optional, TypedDict
-
 import httpx
 import pandas as pd
 from dotenv import load_dotenv
-
 from Bio import Entrez
 from europe_pmc import EuropePMC # Import the client class
 from semanticscholar import SemanticScholar
-# from crossref.restful import Works # Original attempt
 from unpywall import Unpywall
 from crossref.restful import Etiquette # Added for CrossRef mailto
+from autogen_core.tools import BaseTool # Import BaseTool
+from autogen_core._component_config import Component # Import Component
+from pydantic import BaseModel, Field # For defining schema fields
+from typing import Type # For Type hint
 
 # Attempt to import from crossrefapi, with fallbacks for robustness
 _Works_imported = False
@@ -118,6 +119,12 @@ class AsyncSearchClient:
         if self.unpaywall_email:
             Unpywall.mailto = self.unpaywall_email
 
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
 
     async def close(self):
         await self.client.aclose()
@@ -397,49 +404,6 @@ class AsyncSearchClient:
         print(f"CrossRef search took {end_time - start_time:.2f} seconds")
         return results
 
-    async def search_unpaywall(self, dois: List[str]) -> Dict[str, SearchResult]:
-        start_time = time.time()
-        # Returns a dict mapping DOI to its Unpaywall info
-        oa_info_map: Dict[str, SearchResult] = {}
-        if not self.unpaywall_email:
-            print("Unpaywall email not set, skipping Unpaywall search.")
-            return oa_info_map
-        
-        # Unpywall.mailto should be set at class initialization
-        # The library itself might handle batching or we do it one by one with semaphore
-        
-        async def fetch_one_doi(doi: str):
-            print(f"Unpaywall: Starting fetch for DOI {doi}...")
-            async with self.unpaywall_semaphore:
-                try:
-                    # Unpywall library is synchronous
-                    # Unpywall.doi expects a list of DOIs via the 'dois' keyword argument
-                    response_list = await self._run_sync_in_thread(Unpywall.doi, dois=[doi])
-                    print(f"Unpaywall: Finished fetch for DOI {doi}. Processing results...")
-                    # It should return a list of results, even for a single DOI
-                    if response_list and isinstance(response_list, list) and len(response_list) > 0:
-                        response = response_list[0] # Get the first (and only) result
-                        if response and getattr(response, 'doi', None): # Check if response is valid
-                            is_oa = getattr(response, 'is_oa', False)
-                        best_oa_location = getattr(response, 'best_oa_location', None)
-                        oa_url = best_oa_location.url if best_oa_location and hasattr(best_oa_location, 'url') else None
-                        
-                        oa_info_map[doi] = {
-                            "is_open_access": is_oa,
-                            "open_access_url": oa_url,
-                            "doi": doi # ensure doi is part of the result for merging
-                        }
-                except Exception as e:
-                    # Log error for specific DOI, but don't let it stop others
-                    print(f"Unpaywall error for DOI {doi}: {e}")
-        
-        tasks = [fetch_one_doi(doi) for doi in dois if doi] # Filter out None or empty DOIs
-        print(f"Unpaywall: Gathering {len(tasks)} DOI fetch tasks...")
-        await asyncio.gather(*tasks)
-        end_time = time.time()
-        print(f"Unpaywall search took {end_time - start_time:.2f} seconds")
-        return oa_info_map
-
     async def search_all(self, query: str, max_results_per_source: int = 20) -> pd.DataFrame:
         start_time = time.time()
         # Gather results from all sources concurrently
@@ -473,38 +437,22 @@ class AsyncSearchClient:
             print("DEBUG: Normalizing DOIs.")
             df['doi_norm'] = df['doi'].str.lower().str.replace("https://doi.org/", "", regex=False).str.strip()
         else:
-            df['doi_norm'] = None # Ensure column exists
+            df['doi_norm'] = None
         print("DEBUG: DOI normalization complete.")
 
-        if 'pmid' in df.columns:
-            print("DEBUG: Normalizing PMIDs.")
-            df['pmid_norm'] = df['pmid'].str.strip()
-        else:
-            df['pmid_norm'] = None
-        print("DEBUG: PMID normalization complete.")
+        # pmid_norm creation removed as deduplication is handled in _async_search_literature
+        # if 'pmid' in df.columns:
+        #     print("DEBUG: Normalizing PMIDs.")
+        #     df['pmid_norm'] = df['pmid'].str.strip()
+        # else:
+        #     df['pmid_norm'] = None
+        # print("DEBUG: PMID normalization complete.")
 
-
-        # Sort by a preferred source or completeness before dropping duplicates
-        # For now, simple deduplication:
-        print("DEBUG: Starting deduplication by DOI.")
-        df_deduped = df.sort_values(by=['doi_norm', 'pmid_norm']).drop_duplicates(subset=['doi_norm'], keep='first')
-        print(f"DEBUG: Deduplication by DOI complete. {len(df_deduped)} rows remaining.")
-        # For those without DOI, deduplicate by PMID
-        df_no_doi = df_deduped[df_deduped['doi_norm'].isna()]
-        df_with_doi = df_deduped[df_deduped['doi_norm'].notna()]
-        
-        if not df_no_doi.empty:
-            print("DEBUG: Deduplicating rows without DOI by PMID.")
-            df_no_doi = df_no_doi.drop_duplicates(subset=['pmid_norm'], keep='first')
-            df = pd.concat([df_with_doi, df_no_doi]).reset_index(drop=True)
-            print(f"DEBUG: Deduplication by PMID complete. Total {len(df)} rows.")
-        else:
-            df = df_with_doi.reset_index(drop=True)
-            print(f"DEBUG: No rows without DOI to deduplicate. Total {len(df)} rows.")
-
+        # Deduplication logic moved to _async_search_literature.
+        # The DataFrame df at this point contains all aggregated results before final deduplication.
 
         # Enrich with Unpaywall data
-        unique_dois = df[df['doi'].notna()]['doi'].unique().tolist()
+        unique_dois = df[df['doi'].notna()]['doi'].unique().tolist() # Use original 'doi' column for Unpaywall
         if unique_dois:
             print(f"DEBUG: Calling search_unpaywall with {len(unique_dois)} unique DOIs.")
             oa_data_map = await self.search_unpaywall(unique_dois)
@@ -596,66 +544,162 @@ class AsyncSearchClient:
         return oa_info_map
 
 
-# Example Usage (for testing purposes)
-async def main():
-    search_client = AsyncSearchClient()
+async def _async_search_literature(query: str,
+                                   max_results_per_source: int = 50) -> pd.DataFrame:
+    """
+    Internal helper that instantiates AsyncSearchClient and returns the DataFrame
+    from client.search_all(). Always awaits client.close().
+    """
+    async with AsyncSearchClient() as client:
+        df = await client.search_all(query, max_results_per_source)
+
+        # Post-processing: drop duplicates, sort, reset index
+        if not df.empty:
+            # Deduplication: prefer DOI, else PMID
+            # Assuming 'doi_norm' and 'pmid_norm' are created by search_all
+            # If not, ensure they are created here or in search_all
+            if 'doi' in df.columns:
+                df['doi_norm'] = df['doi'].str.lower().str.replace("https://doi.org/", "", regex=False).str.strip()
+            else:
+                df['doi_norm'] = None # Use None, pandas handles it as NaN for str ops
+
+            if 'pmid' in df.columns:
+                df['pmid_norm'] = df['pmid'].str.strip()
+            else:
+                df['pmid_norm'] = None
+
+            # Corrected Deduplication Strategy for _async_search_literature
+            df_with_doi_present = df[df['doi_norm'].notna()].copy()
+            df_no_doi_present = df[df['doi_norm'].isna()].copy()
+
+            df_with_doi_deduped = pd.DataFrame(columns=df.columns)
+            if not df_with_doi_present.empty:
+                df_with_doi_present = df_with_doi_present.sort_values(
+                    by=['doi_norm', 'year', 'pmid_norm'], 
+                    ascending=[True, False, True], 
+                    na_position='last'
+                )
+                df_with_doi_deduped = df_with_doi_present.drop_duplicates(subset=['doi_norm'], keep='first')
+
+            df_no_doi_deduped = pd.DataFrame(columns=df.columns)
+            if not df_no_doi_present.empty:
+                df_no_doi_present = df_no_doi_present.sort_values(
+                    by=['pmid_norm', 'year'], 
+                    ascending=[True, False], 
+                    na_position='last'
+                )
+                df_no_doi_deduped = df_no_doi_present.drop_duplicates(subset=['pmid_norm'], keep='first')
+            
+            df = pd.concat([df_with_doi_deduped, df_no_doi_deduped])
+
+            # Drop the temporary normalization columns
+            df.drop(columns=['doi_norm', 'pmid_norm'], inplace=True, errors='ignore')
+
+            # Sort by source_api, then year desc
+            df = df.sort_values(by=['source_api', 'year'], ascending=[True, False])
+            
+            # Ensure all expected columns from SearchResult are present
+            expected_df_cols = list(SearchResult.__annotations__.keys())
+            for col in expected_df_cols:
+                if col not in df.columns:
+                    df[col] = pd.NA # Use pandas NA for missing values
+            
+            # Reorder columns to a canonical order (optional, but good for consistency)
+            # Ensure only columns that *could* exist are included in reindex
+            current_cols_ordered = [col for col in expected_df_cols if col in df.columns]
+            # Add any other columns that might have been created (e.g. by merge, though unlikely here)
+            other_cols = [col for col in df.columns if col not in current_cols_ordered]
+            df = df[current_cols_ordered + other_cols]
+
+            # Reset index
+            df = df.reset_index(drop=True)
+
+    return df
+
+def search_literature(query: str,
+                      max_results_per_source: int = 50) -> pd.DataFrame:
+    """
+    Search the biomedical literature via PubMed, Europe PMC, Semantic Scholar
+    and Crossref.
+
+    Args:
+        query: Free-text Boolean search string.
+        max_results_per_source: Records to pull from each API (default = 50).
+
+    Returns:
+        pandas.DataFrame with columns:
+        ['title','authors','doi','pmid','pmcid','year','abstract','journal',
+         'url','source_api','is_open_access','open_access_url'].
+    """
     try:
-        query = "COVID-19 vaccine"
-        print(f"Searching for: {query}")
-        
-        # Test individual sources
-        # print("\n--- PubMed ---")
-        # pubmed_results = await search_client.search_pubmed(query, max_results=5)
-        # print(pd.DataFrame(pubmed_results))
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
 
-        # print("\n--- EuropePMC ---")
-        # europepmc_results = await search_client.search_europepmc(query, max_results=5)
-        # print(pd.DataFrame(europepmc_results))
+    if loop and loop.is_running():
+        import nest_asyncio
+        nest_asyncio.apply()
+        task = loop.create_task(_async_search_literature(query, max_results_per_source))
+        return loop.run_until_complete(task)
+    else:
+        return asyncio.run(_async_search_literature(query, max_results_per_source))
 
-        # print("\n--- Semantic Scholar ---")
-        # s2_results = await search_client.search_semanticscholar(query, max_results=5)
-        # print(pd.DataFrame(s2_results))
-        
-        # print("\n--- CrossRef ---")
-        # cr_results = await search_client.search_crossref(query, max_results=5)
-        # print(pd.DataFrame(cr_results))
+class SearchLiteratureParams(BaseModel): # For the 'run' method arguments
+    query: str = Field(..., description="Free-text Boolean search string.")
+    max_results_per_source: int = Field(50, description="Records to pull from each API (default = 50).")
 
-        # Test individual sources (commented out after debugging)
-        # print("\n--- PubMed ---")
-        # pubmed_results = await search_client.search_pubmed(query, max_results=5)
-        # print(pd.DataFrame(pubmed_results))
+# Config model for ComponentLoader instantiation (matches config: {} in YAML)
+class LiteratureSearchToolInstanceConfig(BaseModel):
+    pass
 
-        # print("\n--- EuropePMC ---")
-        # europepmc_results = await search_client.search_europepmc(query, max_results=5)
-        # print(pd.DataFrame(europepmc_results))
+class LiteratureSearchTool(
+    BaseTool[SearchLiteratureParams, pd.DataFrame],
+    Component[LiteratureSearchToolInstanceConfig]
+):
+    # Required by ComponentSchemaType (via Component)
+    component_config_schema: Type[LiteratureSearchToolInstanceConfig] = LiteratureSearchToolInstanceConfig
 
-        # print("\n--- Semantic Scholar ---")
-        # s2_results = await search_client.search_semanticscholar(query, max_results=1) # Changed max_results to 1
-        # print(pd.DataFrame(s2_results))
-        
-        # print("\n--- CrossRef ---")
-        # cr_results = await search_client.search_crossref(query, max_results=5)
-        # print(pd.DataFrame(cr_results))
+    # component_type = "tool" is inherited from BaseTool
 
-        # Test combined search
-        print("\n--- All Sources Combined & Deduplicated ---")
-        combined_df = await search_client.search_all(query, max_results_per_source=10)
-        print(combined_df)
-        
-        if not combined_df.empty and 'doi' in combined_df.columns:
-            sample_dois = combined_df[combined_df['doi'].notna()]['doi'].head(3).tolist()
-            if sample_dois:
-                print(f"\n--- Unpaywall for DOIs: {sample_dois} ---")
-                unpaywall_res = await search_client.search_unpaywall(sample_dois)
-                print(unpaywall_res)
+    def __init__(self):
+        # Call BaseTool's __init__
+        super().__init__(
+            args_type=SearchLiteratureParams,
+            return_type=pd.DataFrame,
+            name="search_literature",
+            description="High-throughput literature search across PubMed, Europe PMC, Semantic Scholar and Crossref."
+        )
 
+    # Required by ComponentFromConfig (via Component)
+    @classmethod
+    def _from_config(cls, config: LiteratureSearchToolInstanceConfig) -> "LiteratureSearchTool":
+        # The 'config' parameter is from YAML's 'config: {}'.
+        # LiteratureSearchTool's __init__ doesn't take arguments from this config.
+        return cls()
 
-    finally:
-        await search_client.close()
+    # Required by ComponentToConfig (via Component, effectively overriding placeholder in ComponentBase)
+    def _to_config(self) -> LiteratureSearchToolInstanceConfig:
+        # Corresponds to the config used in _from_config.
+        return LiteratureSearchToolInstanceConfig()
+
+    # run method is inherited from BaseTool and needs to be implemented
+    async def run(self, args: SearchLiteratureParams, cancellation_token: Any) -> pd.DataFrame:
+        # Call the synchronous search_literature function
+        return search_literature(args.query, args.max_results_per_source)
+
+__all__ = ["search_literature", "AsyncSearchClient"]
 
 if __name__ == "__main__":
-    # To run this example: python -m tools.search
+    import sys, rich
+    # To run this example: python -m tools.search "CRISPR base editing"
     # Ensure .env file is present in the root directory or where the script is run from.
-    if os.name == 'nt': # Fix for ProactorLoop an Windows for asyncio
+    if os.name == 'nt': # Fix for ProactorLoop on Windows for asyncio
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+    
+    # Use sys.argv for query, default to "metagenomics" if no args
+    query_args = sys.argv[1:]
+    query = " AND ".join(query_args) if query_args else "metagenomics"
+    
+    print(f"Searching for: {query}")
+    df = search_literature(query)
+    rich.print(df.head()) # pretty debug view
