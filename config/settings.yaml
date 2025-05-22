@@ -7,3 +7,10 @@ caps:
   max_results_per_api: 250
   max_ranked_papers: 100
   max_summary_tokens: 2048
+triage:
+  sjr_percentile_threshold: 50  # Accept journals in the top 50% (Q1 and Q2)
+  min_age_normalized_citations: 1.0  # Require at least 1 citation per year since publication
+  open_access_statuses:
+    - gold
+    - hybrid
+    - green

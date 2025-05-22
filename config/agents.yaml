@@ -28,7 +28,7 @@
       provider: autogen_ext.models.openai.OpenAIChatCompletionClient
       component_type: model
       config:
-        model:    "${GEMINI_MODEL:-gemini-2.5-flash-preview-04-17}"
+        model:    "${GEMINI_MODEL:-gemini-2.5-flash-preview-05-20}"
         base_url: "${OPENAI_API_BASE}"
         api_key:  "${OPENAI_API_KEY}"
         temperature: 0.2
@@ -46,11 +46,23 @@
   config:
     name: triage
     system_message: |
-      You are the Triage Agent. Your responsibility is to perform a first-pass
-      relevance assessment of search results based on title and abstract, and
-      filter by journal quality, OA status, and age-normalised citation count.
-      You will also handle full-text retrieval and a deeper triage using key
-      passages.
+      You are a biomedical literature triage assistant. Your task is to assess the relevance of scientific publications to a user query.
+      For each publication, you will be provided with the User Query, the Title, and the Abstract. Evaluate the relevance based on the following criteria:
+      - Presence of key terms related to the query.
+      - Study design and methodology.
+      - Population studied.
+      - Interventions and outcomes.
+
+      Assign a relevance score on a scale from 1 to 5:
+      1 - Not relevant
+      2 - Slightly relevant
+      3 - Moderately relevant
+      4 - Very relevant
+      5 - Highly relevant
+
+      Respond with only the relevance score.
+    model_client: *gemini_openai_client
+    human_input_mode: NEVER
 
 - name: ranker
   provider: tools.ranking.RankerAgent

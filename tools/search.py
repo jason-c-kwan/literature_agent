@@ -64,6 +64,7 @@ class SearchResult(TypedDict, total=False):
     is_open_access: Optional[bool]
     open_access_url: Optional[str]
     open_access_url_source: Optional[str] # Source of the OA URL (Unpaywall, PMC, EuropePMC)
+    oa_status: Optional[str] # e.g., 'gold', 'green', 'hybrid' from Unpaywall
     # Add other fields as necessary from different APIs
 
 
@@ -80,11 +81,11 @@ class AsyncSearchClient:
             raise ValueError("API_EMAIL must be set in the .env file.")
 
         # Semaphores for rate limiting
-        # PubMed: 3 RPS (anon), 10 RPS (key)
-        pubmed_rps = 10 if self.pubmed_api_key else 3
+        # PubMed: 1 RPS (anon), 2 RPS (key) - Reduced to avoid 429 errors
+        pubmed_rps = 2 if self.pubmed_api_key else 1
         self.pubmed_semaphore = asyncio.Semaphore(pubmed_rps)
-        # EuropePMC: 10 RPS
-        self.europepmc_semaphore = asyncio.Semaphore(10)
+        # EuropePMC: 5 RPS - Reduced to avoid 429 errors
+        self.europepmc_semaphore = asyncio.Semaphore(5)
         # Semantic Scholar: 1 RPS
         self.semanticscholar_semaphore = asyncio.Semaphore(1) # Strictest limit
         # Crossref: 50 RPS
@@ -124,10 +125,12 @@ class AsyncSearchClient:
         """
         Tries to find an open-access URL for a given DOI using Unpaywall,
         then PMC, then Europe PMC as fallbacks.
+        It also extracts the specific 'oa_status' from Unpaywall.
         """
         oa_url: Optional[str] = None
         is_oa: Optional[bool] = False # Default to False, set to True if any source provides a URL
         source_of_oa_url: Optional[str] = None
+        oa_status_str: Optional[str] = None # To store 'gold', 'green', etc.
 
         # 1. Try Unpaywall
         try:
@@ -136,17 +139,18 @@ class AsyncSearchClient:
                 response_df = await self._run_sync_in_thread(Unpywall.doi, dois=[doi])
             if response_df is not None and not response_df.empty:
                 record = response_df.iloc[0]
+                oa_status_str = record.get('oa_status') # Get the specific OA status
                 if record.get('is_oa'):
                     is_oa = True
                     best_oa_location = record.get('best_oa_location')
                     if best_oa_location and isinstance(best_oa_location, dict):
                         oa_url = best_oa_location.get('url')
                         if oa_url:
-                            source_of_oa_url = "Unpaywall"
+                            source_of_oa_url = "Unpaywall" # Prioritize Unpaywall if it gives a URL
         except Exception as e:
             print(f"Unpaywall error for DOI {doi}: {e}")
 
-        # 2. Fallback to PubMed Central (PMC) if no URL from Unpaywall
+        # 2. Fallback to PubMed Central (PMC) if no URL from Unpaywall (and Unpaywall was the preferred source)
         if not oa_url and doi:
             try:
                 async with self.pubmed_semaphore: # Use existing PubMed semaphore
@@ -202,8 +206,14 @@ class AsyncSearchClient:
                                             oa_url = link_set_db["Link"][0].get("Url", oa_url) # Keep previous if no new URL
                                         break # Found full text links
                         # If elink didn't provide a better URL, the constructed PMC article URL is a fallback
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    retry_after = e.response.headers.get('Retry-After')
+                    print(f"PMC fallback error for DOI {doi}: HTTP Error 429: Too Many Requests. Retry-After: {retry_after}. Full response: {e.response.text}")
+                else:
+                    print(f"PMC fallback HTTP error for DOI {doi}: {e}")
             except Exception as e:
-                print(f"PMC fallback error for DOI {doi}: {e}")
+                print(f"PMC fallback general error for DOI {doi}: {e}")
 
         # 3. Fallback to Europe PMC if still no URL
         if not oa_url and doi:
@@ -259,7 +269,8 @@ class AsyncSearchClient:
             "doi": doi, # Ensure DOI is part of the result for mapping
             "is_open_access": is_oa if oa_url else False, # Only True if a URL was found
             "open_access_url": oa_url,
-            "open_access_url_source": source_of_oa_url # Track where the URL came from
+            "open_access_url_source": source_of_oa_url, # Track where the URL came from
+            "oa_status": oa_status_str # Add the specific oa_status
         }
 
     async def __aenter__(self):
@@ -614,6 +625,8 @@ class AsyncSearchClient:
                         oa_merge_cols.append('open_access_url')
                     if 'open_access_url_source' in oa_df.columns:
                         oa_merge_cols.append('open_access_url_source')
+                    if 'oa_status' in oa_df.columns: # Add oa_status to merge
+                        oa_merge_cols.append('oa_status')
                     
                     oa_df_to_merge = oa_df[oa_merge_cols].copy()
 
@@ -651,6 +664,12 @@ class AsyncSearchClient:
                         if 'open_access_url_source_orig' in df.columns and 'open_access_url_source_orig' != 'open_access_url_source':
                              df.drop(columns=['open_access_url_source_orig'], inplace=True, errors='ignore')
                     
+                    if 'oa_status_oa' in df.columns: # Handle merging oa_status
+                        df['oa_status'] = df['oa_status_oa']
+                        df.drop(columns=['oa_status_oa'], inplace=True)
+                        if 'oa_status_orig' in df.columns and 'oa_status_orig' != 'oa_status':
+                            df.drop(columns=['oa_status_orig'], inplace=True, errors='ignore')
+
                     print("DEBUG: OA fallback data merge complete.")
 
         # Drop the main doi_norm column used for merging, pmid_norm is handled in _async_search_literature
@@ -744,14 +763,14 @@ async def _async_search_literature(query: str,
             df = df.sort_values(by=['source_api', 'year'], ascending=[True, False])
             
             # Ensure all expected columns from SearchResult are present
-            # Add 'open_access_url_source' to expected columns if it's now part of SearchResult
+            # Add 'open_access_url_source' and 'oa_status' to expected columns if it's now part of SearchResult
             # For now, SearchResult TypedDict is not modified, but the merge below adds it.
             # If we formally add it to SearchResult, this list should be updated.
             expected_df_cols = list(SearchResult.__annotations__.keys())
             # Manually add new columns if not in SearchResult TypedDict yet for ordering
-            if 'open_access_url_source' not in expected_df_cols:
-                 expected_df_cols.append('open_access_url_source')
-
+            # 'open_access_url_source' is already in SearchResult TypedDict as of previous edits.
+            # 'oa_status' was added to SearchResult TypedDict in this change.
+            # So, SearchResult.__annotations__.keys() should now include them.
 
             for col in expected_df_cols:
                 if col not in df.columns:
