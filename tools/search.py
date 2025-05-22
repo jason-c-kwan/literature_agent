@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time # Added for debug timing
 from typing import List, Dict, Any, Optional, TypedDict
 
 import httpx
@@ -7,27 +8,20 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from Bio import Entrez
-import europe_pmc
+from europe_pmc import EuropePMC # Import the client class
 from semanticscholar import SemanticScholar
 # from crossref.restful import Works # Original attempt
 from unpywall import Unpywall
+from crossref.restful import Etiquette # Added for CrossRef mailto
 
 # Attempt to import from crossrefapi, with fallbacks for robustness
 _Works_imported = False
-_crossref_settings_imported = False
 Works = None
-crossref_settings = None
 
 try:
     from crossref.restful import Works as CrWorks
     Works = CrWorks # Assign to global Works
     _Works_imported = True
-    try:
-        import crossref.settings as cr_settings
-        crossref_settings = cr_settings
-        _crossref_settings_imported = True
-    except ImportError:
-        print("Warning: Failed to import crossref.settings. CrossRef mailto parameter may not be set.")
 except ImportError as e:
     print(f"Warning: Failed to import Works from crossref.restful ({e}). CrossRef search will be disabled.")
 except AttributeError as e: # Catching AttributeError during import of crossref.restful
@@ -43,8 +37,16 @@ load_dotenv()
 API_EMAIL = os.getenv("API_EMAIL")
 PUBMED_API_KEY = os.getenv("PUBMED_API_KEY")
 SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
-UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL", API_EMAIL) # Default to API_EMAIL
-CROSSREF_MAILTO = os.getenv("CROSSREF_MAILTO", API_EMAIL) # Default to API_EMAIL
+UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL")
+CROSSREF_MAILTO = os.getenv("CROSSREF_MAILTO")
+
+# If UNPAYWALL_EMAIL or CROSSREF_MAILTO were set to "$API_EMAIL" in the .env file,
+# os.getenv will return that literal string. We need to resolve it to the actual API_EMAIL value.
+# Also, provide a fallback to API_EMAIL if they are not set at all.
+if UNPAYWALL_EMAIL == "$API_EMAIL" or UNPAYWALL_EMAIL is None:
+    UNPAYWALL_EMAIL = API_EMAIL
+if CROSSREF_MAILTO == "$API_EMAIL" or CROSSREF_MAILTO is None:
+    CROSSREF_MAILTO = API_EMAIL
 
 
 class SearchResult(TypedDict, total=False):
@@ -87,6 +89,8 @@ class AsyncSearchClient:
         self.crossref_semaphore = asyncio.Semaphore(50)
         # Unpaywall: No hard limit, but let's be nice (e.g., 10 concurrent)
         self.unpaywall_semaphore = asyncio.Semaphore(10)
+        # Semaphore to serialize synchronous Unpywall.doi calls
+        self.unpywall_sync_semaphore = asyncio.Semaphore(1)
         
         # Initialize Bio.Entrez settings
         Entrez.email = self.email
@@ -94,14 +98,15 @@ class AsyncSearchClient:
             Entrez.api_key = self.pubmed_api_key
 
         # Initialize other synchronous clients
+        self.epmc = EuropePMC() # Initialize EuropePMC client
         self.s2 = SemanticScholar(api_key=self.semantic_scholar_api_key if self.semantic_scholar_api_key else None, timeout=20)
         
         self.cr = None
         if _Works_imported and Works is not None:
-            if _crossref_settings_imported and self.crossref_mailto and crossref_settings:
-                crossref_settings.mailto = self.crossref_mailto
             try:
-                self.cr = Works()
+                # Pass Etiquette object with mailto for CrossRef
+                etiquette_obj = Etiquette(contact_email=self.crossref_mailto)
+                self.cr = Works(etiquette=etiquette_obj)
             except Exception as e_init: # Catch error if Works() instantiation fails
                 print(f"Warning: Failed to instantiate CrossRef Works client ({e_init}). CrossRef search disabled.")
                 self.cr = None
@@ -123,6 +128,7 @@ class AsyncSearchClient:
         return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
     async def search_pubmed(self, query: str, max_results: int = 20) -> List[SearchResult]:
+        start_time = time.time()
         results: List[SearchResult] = []
         async with self.pubmed_semaphore:
             try:
@@ -176,13 +182,16 @@ class AsyncSearchClient:
                     authors = [author['Name'] for author in summary.get("AuthorList", []) if 'Name' in author]
                     pub_date_str = summary.get("PubDate", "")
                     year = None
-                    if pub_date_str and isinstance(pub_date_str, str) and pub_date_str.isdigit() and len(pub_date_str) >= 4:
-                        year = int(pub_date_str[:4])
-                    elif pub_date_str and isinstance(pub_date_str, str): # Handle cases like "2023 Spring"
-                        year_match = Entrez._get_date(summary).year # Biopython internal helper
-                        if year_match:
-                            year = year_match
-
+                    if pub_date_str and isinstance(pub_date_str, str):
+                        # Attempt to extract year. PubDate can be "YYYY", "YYYY Mon", "YYYY Mon DD", etc.
+                        # Split by space and check if the first part is a 4-digit year.
+                        parts = pub_date_str.split()
+                        if parts and parts[0].isdigit() and len(parts[0]) == 4:
+                            year = int(parts[0])
+                        # Fallback for cases where PubDate might just be "YYYY" and isdigit() would catch it
+                        elif pub_date_str.isdigit() and len(pub_date_str) == 4:
+                             year = int(pub_date_str)
+                        # Add more sophisticated parsing if needed for other formats
 
                     journal = summary.get("Source", "")
                     
@@ -200,20 +209,24 @@ class AsyncSearchClient:
 
             except Exception as e:
                 print(f"PubMed search error: {e}") # Basic error logging
+        end_time = time.time()
+        print(f"PubMed search took {end_time - start_time:.2f} seconds")
         return results
 
     async def search_europepmc(self, query: str, max_results: int = 20) -> List[SearchResult]:
+        start_time = time.time() # Added missing start_time initialization
         results: List[SearchResult] = []
         async with self.europepmc_semaphore:
             try:
                 # The europe_pmc library is synchronous
+                # Use the initialized client and its 'search' method
+                # Adjust parameter names: resulttype -> result_type
                 raw_results = await self._run_sync_in_thread(
-                    europe_pmc.query,
-                    query,
-                    resulttype='CORE', # 'LITE' for less data, 'IDLIST', 'ABSTRACTS'
-                    page_size=max_results 
+                    self.epmc.search,
+                    query
                 )
                 
+                # The library returns a generator of Record objects
                 for item in raw_results: # raw_results is an iterator of Record objects
                     doi = getattr(item, 'doi', None)
                     pmid = getattr(item, 'pmid', None)
@@ -248,9 +261,12 @@ class AsyncSearchClient:
                     results.append(result_item)
             except Exception as e:
                 print(f"EuropePMC search error: {e}")
+        end_time = time.time()
+        print(f"EuropePMC search took {end_time - start_time:.2f} seconds")
         return results
 
     async def search_semanticscholar(self, query: str, max_results: int = 20) -> List[SearchResult]:
+        start_time = time.time()
         results: List[SearchResult] = []
         async with self.semanticscholar_semaphore:
             try:
@@ -259,42 +275,61 @@ class AsyncSearchClient:
                 # The library handles fields internally for search results.
                 # For more details like abstract, citations, references, a second call per paper might be needed.
                 # For bulk search, we get basic info.
+                print(f"Semantic Scholar: Starting search for '{query}' with limit {max_results}...")
                 raw_results = await self._run_sync_in_thread(
                     self.s2.search_paper,
                     query,
                     limit=max_results,
-                    fields=['title', 'authors', 'year', 'journal', 'doi', 'pmid', 'abstract', 'url', 'venue', 'publicationDate', 'externalIds']
+                    fields=['title', 'authors', 'year', 'journal', 'abstract', 'url', 'venue', 'publicationDate', 'externalIds']
                 )
+                print(f"Semantic Scholar: Finished search for '{query}'. Processing results...")
                 
+                print("DEBUG: Starting iteration over Semantic Scholar raw_results.")
+                item_count = 0
                 for item in raw_results: # Item is a Paper object
-                    # Access attributes directly from the Paper object
-                    title = item.title
-                    authors = [author['name'] for author in item.authors] if item.authors else []
-                    year = item.year
-                    journal_info = item.journal if item.journal else {} # journal is a dict {'name': ..., 'volume': ...} or None
-                    journal_name = journal_info.get('name') if isinstance(journal_info, dict) else None
-                    
-                    doi = item.doi or item.externalIds.get('DOI') if item.externalIds else None
-                    pmid = item.externalIds.get('PubMed') if item.externalIds else None
-                    pmcid = item.externalIds.get('PubMedCentral') if item.externalIds else None
-                    abstract = item.abstract
-                    url = item.url
+                    if item_count >= max_results: # Explicitly break if max_results is reached
+                        print(f"DEBUG: Reached max_results ({max_results}) for Semantic Scholar. Breaking loop.")
+                        break
+                    item_count += 1
+                    print(f"DEBUG: Processing Semantic Scholar item {item_count}...")
+                    try:
+                        # Access attributes directly from the Paper object
+                        title = item.title
+                        authors = [author['name'] for author in item.authors] if item.authors else []
+                        year = item.year
+                        journal_info = item.journal if item.journal else {} # journal is a dict {'name': ..., 'volume': ...} or None
+                        journal_name = journal_info.get('name') if isinstance(journal_info, dict) else None
+                        
+                        external_ids = item.externalIds if item.externalIds else {}
+                        doi = external_ids.get('DOI')
+                        pmid = external_ids.get('PubMed')
+                        pmcid = external_ids.get('PubMedCentral')
+                        
+                        abstract = item.abstract
+                        url = item.url
 
-                    result_item: SearchResult = {
-                        "title": title,
-                        "authors": authors,
-                        "doi": doi,
-                        "pmid": pmid,
-                        "pmcid": pmcid,
-                        "year": year,
-                        "abstract": abstract,
-                        "journal": journal_name,
-                        "url": url,
-                        "source_api": "SemanticScholar"
-                    }
-                    results.append(result_item)
+                        result_item: SearchResult = {
+                            "title": title,
+                            "authors": authors,
+                            "doi": doi,
+                            "pmid": pmid,
+                            "pmcid": pmcid,
+                            "year": year,
+                            "abstract": abstract,
+                            "journal": journal_name,
+                            "url": url,
+                            "source_api": "SemanticScholar"
+                        }
+                        results.append(result_item)
+                        print(f"DEBUG: Successfully processed Semantic Scholar item {item_count}.")
+                    except Exception as item_e:
+                        print(f"Semantic Scholar item processing error for item {item_count}: {item_e}")
+                        # Continue to next item even if one fails
+                print(f"DEBUG: Finished iteration over Semantic Scholar raw_results. Processed {item_count} items.")
             except Exception as e:
                 print(f"Semantic Scholar search error: {e}")
+        end_time = time.time()
+        print(f"Semantic Scholar search took {end_time - start_time:.2f} seconds")
         return results
 
     async def search_crossref(self, query: str, max_results: int = 20) -> List[SearchResult]:
@@ -302,16 +337,15 @@ class AsyncSearchClient:
             print("CrossRef client not initialized. Skipping CrossRef search.")
             return []
             
+        start_time = time.time()
         results: List[SearchResult] = []
         async with self.crossref_semaphore:
             try:
                 # Crossref API library is synchronous
                 # Use the query() method of the Works instance
                 raw_results_iterable = await self._run_sync_in_thread(
-                    self.cr.query,
-                    bibliographic=query, 
-                    limit=max_results,
-                    # select="DOI,title,author,issued,container-title,URL,abstract" # To limit fields
+                    self.cr.query(bibliographic=query).sample,
+                    max_results
                 )
                 
                 # The iterable might be a generator, convert to list if needed or iterate directly
@@ -329,8 +363,13 @@ class AsyncSearchClient:
                         name_parts = [author_entry.get('given'), author_entry.get('family')]
                         authors.append(" ".join(filter(None, name_parts)))
                     
-                    issued_date_parts = item.get("issued", {}).get("date-parts", [[]])[0]
-                    year = int(issued_date_parts[0]) if issued_date_parts and len(issued_date_parts) > 0 else None
+                    issued_date_parts_list = item.get("issued", {}).get("date-parts", [[]])
+                    year = None
+                    if issued_date_parts_list and issued_date_parts_list[0] and issued_date_parts_list[0][0] is not None:
+                        try:
+                            year = int(issued_date_parts_list[0][0])
+                        except (ValueError, TypeError):
+                            year = None
                     
                     journal_list = item.get("container-title", [])
                     journal = journal_list[0] if journal_list else None
@@ -354,9 +393,12 @@ class AsyncSearchClient:
                     results.append(result_item)
             except Exception as e:
                 print(f"CrossRef search error: {e}")
+        end_time = time.time()
+        print(f"CrossRef search took {end_time - start_time:.2f} seconds")
         return results
 
     async def search_unpaywall(self, dois: List[str]) -> Dict[str, SearchResult]:
+        start_time = time.time()
         # Returns a dict mapping DOI to its Unpaywall info
         oa_info_map: Dict[str, SearchResult] = {}
         if not self.unpaywall_email:
@@ -367,11 +409,13 @@ class AsyncSearchClient:
         # The library itself might handle batching or we do it one by one with semaphore
         
         async def fetch_one_doi(doi: str):
+            print(f"Unpaywall: Starting fetch for DOI {doi}...")
             async with self.unpaywall_semaphore:
                 try:
                     # Unpywall library is synchronous
                     # Unpywall.doi expects a list of DOIs via the 'dois' keyword argument
                     response_list = await self._run_sync_in_thread(Unpywall.doi, dois=[doi])
+                    print(f"Unpaywall: Finished fetch for DOI {doi}. Processing results...")
                     # It should return a list of results, even for a single DOI
                     if response_list and isinstance(response_list, list) and len(response_list) > 0:
                         response = response_list[0] # Get the first (and only) result
@@ -390,10 +434,14 @@ class AsyncSearchClient:
                     print(f"Unpaywall error for DOI {doi}: {e}")
         
         tasks = [fetch_one_doi(doi) for doi in dois if doi] # Filter out None or empty DOIs
+        print(f"Unpaywall: Gathering {len(tasks)} DOI fetch tasks...")
         await asyncio.gather(*tasks)
+        end_time = time.time()
+        print(f"Unpaywall search took {end_time - start_time:.2f} seconds")
         return oa_info_map
 
     async def search_all(self, query: str, max_results_per_source: int = 20) -> pd.DataFrame:
+        start_time = time.time()
         # Gather results from all sources concurrently
         all_source_results = await asyncio.gather(
             self.search_pubmed(query, max_results_per_source),
@@ -402,62 +450,150 @@ class AsyncSearchClient:
             self.search_crossref(query, max_results_per_source),
             # Unpaywall is called later for enrichment
         )
+        print("DEBUG: All source searches completed.")
 
         flat_results: List[SearchResult] = []
+        print("DEBUG: Starting to flatten results.")
         for source_result_list in all_source_results:
             if source_result_list: # Ensure it's not None
                 flat_results.extend(source_result_list)
+        print(f"DEBUG: flat_results created with {len(flat_results)} items.")
 
         if not flat_results:
+            print("DEBUG: No flat_results, returning empty DataFrame.")
             return pd.DataFrame()
 
         df = pd.DataFrame(flat_results)
+        print(f"DEBUG: DataFrame created with {len(df)} rows.")
 
         # Deduplication strategy:
         # 1. Prioritize records with DOI.
         # 2. Normalize DOIs (e.g., lowercase, remove http://doi.org/)
         if 'doi' in df.columns:
+            print("DEBUG: Normalizing DOIs.")
             df['doi_norm'] = df['doi'].str.lower().str.replace("https://doi.org/", "", regex=False).str.strip()
         else:
             df['doi_norm'] = None # Ensure column exists
+        print("DEBUG: DOI normalization complete.")
 
         if 'pmid' in df.columns:
+            print("DEBUG: Normalizing PMIDs.")
             df['pmid_norm'] = df['pmid'].str.strip()
         else:
             df['pmid_norm'] = None
+        print("DEBUG: PMID normalization complete.")
 
 
         # Sort by a preferred source or completeness before dropping duplicates
         # For now, simple deduplication:
+        print("DEBUG: Starting deduplication by DOI.")
         df_deduped = df.sort_values(by=['doi_norm', 'pmid_norm']).drop_duplicates(subset=['doi_norm'], keep='first')
+        print(f"DEBUG: Deduplication by DOI complete. {len(df_deduped)} rows remaining.")
         # For those without DOI, deduplicate by PMID
         df_no_doi = df_deduped[df_deduped['doi_norm'].isna()]
         df_with_doi = df_deduped[df_deduped['doi_norm'].notna()]
         
         if not df_no_doi.empty:
+            print("DEBUG: Deduplicating rows without DOI by PMID.")
             df_no_doi = df_no_doi.drop_duplicates(subset=['pmid_norm'], keep='first')
             df = pd.concat([df_with_doi, df_no_doi]).reset_index(drop=True)
+            print(f"DEBUG: Deduplication by PMID complete. Total {len(df)} rows.")
         else:
             df = df_with_doi.reset_index(drop=True)
+            print(f"DEBUG: No rows without DOI to deduplicate. Total {len(df)} rows.")
 
 
         # Enrich with Unpaywall data
         unique_dois = df[df['doi'].notna()]['doi'].unique().tolist()
         if unique_dois:
+            print(f"DEBUG: Calling search_unpaywall with {len(unique_dois)} unique DOIs.")
             oa_data_map = await self.search_unpaywall(unique_dois)
+            print(f"DEBUG: search_unpaywall returned {len(oa_data_map)} results.")
             if oa_data_map:
                 oa_df = pd.DataFrame(list(oa_data_map.values()))
                 if not oa_df.empty and 'doi' in oa_df.columns:
+                    print("DEBUG: Merging Unpaywall data.")
                     # Normalize DOI in oa_df for merging
                     oa_df['doi_norm_merge'] = oa_df['doi'].str.lower().str.replace("https://doi.org/", "", regex=False).str.strip()
                     # Merge requires 'doi_norm' in the main df to be consistent
                     df = df.merge(oa_df[['doi_norm_merge', 'is_open_access', 'open_access_url']], 
                                   left_on='doi_norm', right_on='doi_norm_merge', how='left')
                     df.drop(columns=['doi_norm_merge'], inplace=True, errors='ignore')
+                    print("DEBUG: Unpaywall data merge complete.")
 
 
         df.drop(columns=['doi_norm', 'pmid_norm'], inplace=True, errors='ignore')
+        print("DEBUG: Dropped normalization columns.")
+        end_time = time.time()
+        print(f"Overall search_all took {end_time - start_time:.2f} seconds")
         return df
+
+    async def search_unpaywall(self, dois: List[str]) -> Dict[str, SearchResult]:
+        start_time = time.time()
+        # Returns a dict mapping DOI to its Unpaywall info
+        oa_info_map: Dict[str, SearchResult] = {}
+        if not self.unpaywall_email:
+            print("Unpaywall email not set, skipping Unpaywall search.")
+            return oa_info_map
+        
+        # Unpywall.mailto should be set at class initialization
+        
+        async def fetch_one_doi(doi: str):
+            print(f"Unpaywall: Starting fetch for DOI {doi}...")
+            async with self.unpaywall_semaphore:
+                try:
+                    print(f"DEBUG: Before Unpywall.doi call for {doi}")
+                    # Unpywall library is synchronous
+                    async with self.unpywall_sync_semaphore: # Serialize calls to Unpywall.doi
+                        response_df = await self._run_sync_in_thread(Unpywall.doi, dois=[doi])
+                    print(f"DEBUG: After Unpywall.doi call for {doi}")
+                    print(f"Unpaywall: Finished fetch for DOI {doi}. Processing results...")
+                    
+                    is_oa = None
+                    oa_url = None
+                    
+                    if response_df is not None and not response_df.empty:
+                        response_plain_dict = response_df.iloc[0].to_dict()
+                        
+                        # Ensure 'doi' is present in the response_plain_dict
+                        # This check is already done by the caller, but good to be explicit
+                        if response_plain_dict.get('doi') == doi:
+                            is_oa = response_plain_dict.get('is_oa', False)
+                            best_oa_location = response_plain_dict.get('best_oa_location', None)
+                            if best_oa_location and isinstance(best_oa_location, dict):
+                                oa_url = best_oa_location.get('url')
+                    
+                    # Always return a SearchResult for the DOI, even if OA info is not found
+                    return {
+                        "is_open_access": is_oa,
+                        "open_access_url": oa_url,
+                        "doi": doi
+                    }
+                except Exception as e:
+                    print(f"Unpaywall error for DOI {doi}: {e}")
+            
+            # If an exception occurs, or if response_df is None/empty and not handled above,
+            # still return a basic SearchResult for the DOI.
+            return {
+                "is_open_access": None,
+                "open_access_url": None,
+                "doi": doi
+            }
+        
+        tasks = [fetch_one_doi(doi) for doi in dois if doi] # Filter out None or empty DOIs
+        print(f"Unpaywall: Gathering {len(tasks)} DOI fetch tasks...")
+        # Collect results from all concurrent fetches
+        raw_oa_results = await asyncio.gather(*tasks)
+        print(f"DEBUG: All Unpaywall DOI fetch tasks gathered.")
+
+        # Build the oa_info_map from collected results
+        for result in raw_oa_results:
+            if result and result.get('doi'):
+                oa_info_map[result['doi']] = result
+
+        end_time = time.time()
+        print(f"Unpaywall search took {end_time - start_time:.2f} seconds")
+        return oa_info_map
 
 
 # Example Usage (for testing purposes)
@@ -478,6 +614,23 @@ async def main():
 
         # print("\n--- Semantic Scholar ---")
         # s2_results = await search_client.search_semanticscholar(query, max_results=5)
+        # print(pd.DataFrame(s2_results))
+        
+        # print("\n--- CrossRef ---")
+        # cr_results = await search_client.search_crossref(query, max_results=5)
+        # print(pd.DataFrame(cr_results))
+
+        # Test individual sources (commented out after debugging)
+        # print("\n--- PubMed ---")
+        # pubmed_results = await search_client.search_pubmed(query, max_results=5)
+        # print(pd.DataFrame(pubmed_results))
+
+        # print("\n--- EuropePMC ---")
+        # europepmc_results = await search_client.search_europepmc(query, max_results=5)
+        # print(pd.DataFrame(europepmc_results))
+
+        # print("\n--- Semantic Scholar ---")
+        # s2_results = await search_client.search_semanticscholar(query, max_results=1) # Changed max_results to 1
         # print(pd.DataFrame(s2_results))
         
         # print("\n--- CrossRef ---")
