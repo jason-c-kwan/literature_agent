@@ -10,10 +10,23 @@ pymupdf4llm
 markdownify>=0.11.6
 tiktoken>=0.6.0
 
+# --- Tool utilities ----------------------------
+biopython
+europe_pmc
+semanticscholar
+crossrefapi
+unpywall
+httpx[http2]
+xmltodict 
+pandas 
+pydantic 
+ratelimit
+
 # --- Project hygiene ---------------------------
 python-dotenv
 pytest
 pytest-mock
+pytest-asyncio       # For testing asyncio code with pytest
 rich                 # pretty CLI logs
 # (ruff, black, pre-commit go in dev-requirements.txt)
 
