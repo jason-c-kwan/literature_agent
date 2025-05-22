@@ -1,5 +1,9 @@
-# config/agents.yaml  – tested with autogen-agentchat[gemini] 0.5.7
+# ──────────────────────────────────────────────────────────────
+# config/agents.yaml  – Gemini via OpenAI-compatible Chat Completions
+# works with autogen-core/agentchat/ext == 0.5.7 + autogen-ext[openai]
+# ──────────────────────────────────────────────────────────────
 
+# ─── USER PROXY ────────────────────────────────────────────────
 - name: user_proxy
   provider: autogen_agentchat.agents.UserProxyAgent
   component_type: agent
@@ -8,7 +12,7 @@
     human_input_mode: ALWAYS
     code_execution_config: false
 
-# ──────────────────────────────────────────────────────────────
+# ─── QUERY-REFINER (uses Gemini) ───────────────────────────────
 - name: query_refiner
   provider: autogen_agentchat.agents.AssistantAgent
   component_type: agent
@@ -16,28 +20,26 @@
     name: query_refiner
     description: Clarifies user queries and expands them with synonyms/MeSH terms.
     system_message: |
-      You are the Query Refiner Agent. Your purpose is to interact with the user
-      to clarify their literature search query, expand it with synonyms, and
-      generate optimised Boolean or MeSH search strings.
+      You are the Query Refiner Agent. …
     reflect_on_tool_use: false
     tool_call_summary_format: "{result}"
-
-    model_client:
+        # anchor lives HERE, not as a separate list item
+    model_client: &gemini_openai_client
       provider: autogen_ext.models.openai.OpenAIChatCompletionClient
       component_type: model
       config:
-        model: ${GEMINI_MODEL:-gemini-pro}
-        api_key: ${GEMINI_API_KEY}
-        base_url: https://generativelanguage.googleapis.com/v1beta
-        temperature: 0.2         # same as earlier prompt_settings
-        model_info:              # <-- optional but recommended
-          family: GEMINI_1_0_PRO # any valid ModelFamily enum; UNKNOWN also OK
-          vision: true
-          function_calling: true
+        model:    "${GEMINI_MODEL:-gemini-2.5-flash-preview-04-17}"
+        base_url: "${OPENAI_API_BASE}"
+        api_key:  "${OPENAI_API_KEY}"
+        temperature: 0.2
+        model_info:
+          structured_output: false      # ← new required field
+          vision: false
           json_output: true
-          structured_output: true
+          function_calling: true
+          family: "GEMINI_2_5_FLASH"
 
-# ──────────────────────────────────────────────────────────────
+# ─── SEARCH / TRIAGE / RANKER (unchanged; no LLM) ─────────────
 - name: search_tool
   provider: tools.search.SearchToolAgent
   component_type: agent
@@ -70,7 +72,8 @@
       including LLM relevance scores, z-scored citation rates, and journal SJR
       percentiles, into a final ranked list of literature.
 
-# ──────────────────────────────────────────────────────────────
+
+# ─── SUMMARISER (also Gemini) ─────────────────────────────────
 - name: summariser
   provider: autogen_agentchat.agents.AssistantAgent
   component_type: agent
@@ -78,28 +81,12 @@
     name: summariser
     description: Creates a structured Markdown summary of ranked papers.
     system_message: |
-      You are the Summariser Agent. Your role is to compose a structured,
-      human-readable Markdown report summarising the findings, complete with
-      numerically indexed citations.
+      You are the Summariser Agent. …
     reflect_on_tool_use: false
     tool_call_summary_format: "{result}"
+    model_client: *gemini_openai_client
 
-    model_client:
-      provider: autogen_ext.models.openai.OpenAIChatCompletionClient
-      component_type: model
-      config:
-        model: ${GEMINI_MODEL:-gemini-pro}
-        api_key: ${GEMINI_API_KEY}
-        base_url: https://generativelanguage.googleapis.com/v1beta
-        temperature: 0.2
-        model_info:            # mirror the settings above (optional)
-          family: GEMINI_1_0_PRO
-          vision: true
-          function_calling: true
-          json_output: true
-          structured_output: true
-
-# ──────────────────────────────────────────────────────────────
+# ─── EXPORTER (unchanged) ─────────────────────────────────────
 - name: exporter
   provider: tools.export.ExporterAgent
   component_type: agent
