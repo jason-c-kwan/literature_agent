@@ -1,0 +1,112 @@
+# config/agents.yaml  – tested with autogen-agentchat[gemini] 0.5.7
+
+- name: user_proxy
+  provider: autogen_agentchat.agents.UserProxyAgent
+  component_type: agent
+  config:
+    name: user_proxy
+    human_input_mode: ALWAYS
+    code_execution_config: false
+
+# ──────────────────────────────────────────────────────────────
+- name: query_refiner
+  provider: autogen_agentchat.agents.AssistantAgent
+  component_type: agent
+  config:
+    name: query_refiner
+    description: Clarifies user queries and expands them with synonyms/MeSH terms.
+    system_message: |
+      You are the Query Refiner Agent. Your purpose is to interact with the user
+      to clarify their literature search query, expand it with synonyms, and
+      generate optimised Boolean or MeSH search strings.
+    reflect_on_tool_use: false
+    tool_call_summary_format: "{result}"
+
+    model_client:
+      provider: autogen_ext.models.openai.OpenAIChatCompletionClient
+      component_type: model
+      config:
+        model: ${GEMINI_MODEL:-gemini-pro}
+        api_key: ${GEMINI_API_KEY}
+        base_url: https://generativelanguage.googleapis.com/v1beta
+        temperature: 0.2         # same as earlier prompt_settings
+        model_info:              # <-- optional but recommended
+          family: GEMINI_1_0_PRO # any valid ModelFamily enum; UNKNOWN also OK
+          vision: true
+          function_calling: true
+          json_output: true
+          structured_output: true
+
+# ──────────────────────────────────────────────────────────────
+- name: search_tool
+  provider: tools.search.SearchToolAgent
+  component_type: agent
+  config:
+    name: search_tool
+    system_message: |
+      You are the Search Tool Agent. Your role is to execute searches across
+      multiple academic APIs, perform asynchronous calls, and de-duplicate
+      results based on DOI/PMID.
+
+- name: triage
+  provider: tools.triage.TriageAgent
+  component_type: agent
+  config:
+    name: triage
+    system_message: |
+      You are the Triage Agent. Your responsibility is to perform a first-pass
+      relevance assessment of search results based on title and abstract, and
+      filter by journal quality, OA status, and age-normalised citation count.
+      You will also handle full-text retrieval and a deeper triage using key
+      passages.
+
+- name: ranker
+  provider: tools.ranking.RankerAgent
+  component_type: agent
+  config:
+    name: ranker
+    system_message: |
+      You are the Ranker Agent. Your task is to combine various metrics,
+      including LLM relevance scores, z-scored citation rates, and journal SJR
+      percentiles, into a final ranked list of literature.
+
+# ──────────────────────────────────────────────────────────────
+- name: summariser
+  provider: autogen_agentchat.agents.AssistantAgent
+  component_type: agent
+  config:
+    name: summariser
+    description: Creates a structured Markdown summary of ranked papers.
+    system_message: |
+      You are the Summariser Agent. Your role is to compose a structured,
+      human-readable Markdown report summarising the findings, complete with
+      numerically indexed citations.
+    reflect_on_tool_use: false
+    tool_call_summary_format: "{result}"
+
+    model_client:
+      provider: autogen_ext.models.openai.OpenAIChatCompletionClient
+      component_type: model
+      config:
+        model: ${GEMINI_MODEL:-gemini-pro}
+        api_key: ${GEMINI_API_KEY}
+        base_url: https://generativelanguage.googleapis.com/v1beta
+        temperature: 0.2
+        model_info:            # mirror the settings above (optional)
+          family: GEMINI_1_0_PRO
+          vision: true
+          function_calling: true
+          json_output: true
+          structured_output: true
+
+# ──────────────────────────────────────────────────────────────
+- name: exporter
+  provider: tools.export.ExporterAgent
+  component_type: agent
+  config:
+    name: exporter
+    system_message: |
+      You are the Exporter Agent. Your responsibilities include building RIS
+      files, ensuring all cited PDFs are fetched and saved correctly, writing
+      the final Markdown report to disk, and creating a convenience ZIP archive
+      of the outputs.

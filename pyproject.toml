@@ -1,0 +1,23 @@
+# pyproject.toml -- place in repo root
+[build-system]                # PEP 517 section
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]                     # PEP 621 metadata
+name = "literature_agent"
+version = "0.0.1"
+description = "Agents and tools for literature search"
+authors = [{ name = "Jason Kwan", email = "jason.kwan@wisc.edu" }]
+readme = "README.md"
+requires-python = ">=3.10"
+
+# pyproject.toml
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tools", "tools.*"]      # or "literature_agent.tools*"
+
+## Optional: entry-points, dependencies, extras, etc.
+#dependencies = [
+#  "autogen-agentchat[gemini]>=0.5.7",
+#  "autogen-ext[semantic-kernel-google]>=0.5.7",
+#]

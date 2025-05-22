@@ -1,0 +1,19 @@
+# --- AutoGen core & extensions -----------------
+autogen-agentchat[gemini]~=0.4        # pulls core, google-genai, vertexai
+autogen-ext[semantic-kernel-google]   # SK adapter for Gemini via SK
+semantic-kernel>=1.0.0
+
+# --- Pipeline utilities ------------------------
+chromadb>=0.4.24
+pymupdf4llm        
+markdownify>=0.11.6
+tiktoken>=0.6.0
+
+# --- Project hygiene ---------------------------
+python-dotenv
+pytest
+pytest-mock
+rich                 # pretty CLI logs
+# (ruff, black, pre-commit go in dev-requirements.txt)
+
+-e .
