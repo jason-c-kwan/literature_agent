@@ -1,0 +1,9 @@
+version: '0.1'
+weights:
+  relevance: 0.5
+  journal_quality: 0.2
+  citation_zscore: 0.3
+caps:
+  max_results_per_api: 250
+  max_ranked_papers: 100
+  max_summary_tokens: 2048
