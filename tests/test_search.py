@@ -12,29 +12,26 @@ MOCKED_S2_KEY = "test_s2_key"
 @pytest_asyncio.fixture
 async def search_client_with_mocks():
     # Using 4-space indentation consistently
-    with patch('tools.search.API_EMAIL', MOCKED_API_EMAIL), \
+    with patch('tools.search.load_dotenv', MagicMock()), \
+         patch('tools.search.API_EMAIL', MOCKED_API_EMAIL), \
          patch('tools.search.PUBMED_API_KEY', MOCKED_PUBMED_KEY), \
          patch('tools.search.SEMANTIC_SCHOLAR_API_KEY', MOCKED_S2_KEY), \
          patch('tools.search.UNPAYWALL_EMAIL', MOCKED_API_EMAIL), \
          patch('tools.search.CROSSREF_MAILTO', MOCKED_API_EMAIL):
         
-        with patch('tools.search.Entrez', autospec=True) as MockEntrez, \
-             patch('tools.search.europe_pmc', new_callable=MagicMock) as MockEuropePMC, \
+        with patch('tools.search.Entrez') as MockEntrez, \
+             patch('tools.search.EuropePMC', new_callable=MagicMock) as MockEuropePMCClass, \
              patch('tools.search.SemanticScholar') as MockS2Class, \
-             patch('tools.search.Works', create=True) as MockWorksClass, \
-             patch('tools.search.Unpywall', autospec=True) as MockUnpywallGlobal, \
-             patch('tools.search.crossref_settings', create=True) as MockCrossrefSettings, \
-             patch('tools.search._Works_imported', True), \
-             patch('tools.search._crossref_settings_imported', True):
+             patch('tools.search.Works') as MockWorksClass, \
+             patch('tools.search.Unpywall') as MockUnpywallGlobal, \
+             patch('tools.search._Works_imported', True):
 
-            if MockCrossrefSettings is not None and hasattr(MockCrossrefSettings, 'mailto'):
-                 MockCrossrefSettings.mailto = None 
-            
             client = AsyncSearchClient()
             
             mocks = {
                 "Entrez": MockEntrez,
-                "europe_pmc": MockEuropePMC,
+                "MockEuropePMCClass": MockEuropePMCClass,
+                "EuropePMCInstance": MockEuropePMCClass.return_value,
                 "S2Instance": client.s2,
                 "WorksInstance": client.cr,
                 "UnpywallGlobal": MockUnpywallGlobal,
@@ -92,12 +89,12 @@ async def test_search_pubmed_api_error(search_client_with_mocks, mocker):
 @pytest.mark.asyncio
 async def test_search_europepmc_success(search_client_with_mocks, mocker):
     search_client, mocks = search_client_with_mocks
-    MockEuropePMC = mocks["europe_pmc"]
+    MockEuropePMCInstance = mocks["EuropePMCInstance"]
     mock_record = MagicMock(doi="10.test/epmc", pmid="epmc123", title="EuropePMC Test", 
                             authorList=[MagicMock(fullName="Author EPMC")], 
                             journalTitle="EPMC Journal", pubYear="2023", 
                             abstractText="Abstract here.", pmcid="PMC12345")
-    MockEuropePMC.query.return_value = [mock_record]
+    MockEuropePMCInstance.search.return_value = [mock_record]
     mock_async_run_sync(mocker, search_client)
     results = await search_client.search_europepmc("test query", max_results=1)
     assert len(results) == 1
@@ -107,8 +104,8 @@ async def test_search_europepmc_success(search_client_with_mocks, mocker):
 async def test_search_semanticscholar_success(search_client_with_mocks, mocker):
     search_client, mocks = search_client_with_mocks
     mock_paper = MagicMock(title="S2 Title", authors=[{'name': 'S2 Author'}], year=2023, 
-                           journal={'name': 'S2 Journal'}, doi="10.test/s2", 
-                           externalIds={'PubMed': 's2pmid123', 'DOI': '10.test/s2'}, 
+                           journal={'name': 'S2 Journal'}, 
+                           externalIds={'PubMed': 's2pmid123', 'DOI': '10.test/s2', 'PubMedCentral': 's2pmcid123'}, 
                            abstract="S2 abstract.", url="http://s2.example.com")
     mocks["S2Instance"].search_paper.return_value = [mock_paper] 
     mock_async_run_sync(mocker, search_client)
@@ -121,8 +118,12 @@ async def test_search_crossref_success(search_client_with_mocks, mocker):
     search_client, mocks = search_client_with_mocks
     mock_item = {"DOI": "10.test/cr", "title": ["CrossRef Title"], "author": [{"given": "CR", "family": "Author"}],
                  "issued": {"date-parts": [[2023]]}, "container-title": ["CR Journal"], "URL": "http://cr.example.com"}
-    if mocks["WorksInstance"]: # This is client.cr, which is MockWorksClass.return_value
-        mocks["WorksInstance"].query.return_value = [mock_item]
+    # Mock the chain: client.cr.query(bibliographic=...).sample(max_results)
+    # MockWorksClass is the class itself, client.cr is the instance
+    if mocks["WorksInstance"]: # client.cr is the mocked Works instance
+        mock_query_result = MagicMock()
+        mock_query_result.sample.return_value = [mock_item]
+        mocks["WorksInstance"].query.return_value = mock_query_result
     
     mock_async_run_sync(mocker, search_client)
     results = await search_client.search_crossref("test query", max_results=1)
@@ -142,7 +143,13 @@ async def test_search_unpaywall_success(search_client_with_mocks, mocker):
     mock_response_obj = MagicMock(doi="10.test/unpaywall", is_oa=True, 
                                   best_oa_location=MagicMock(url="http://oa.example.com"))
     # Unpywall.doi is a static method or class method, so we mock it on the module mock
-    MockUnpywallGlobal.doi.return_value = [mock_response_obj]
+    # Unpywall.doi returns a pandas DataFrame
+    mock_df_data = {
+        "doi": ["10.test/unpaywall"],
+        "is_oa": [True],
+        "best_oa_location": [{"url": "http://oa.example.com"}]
+    }
+    MockUnpywallGlobal.doi.return_value = pd.DataFrame(mock_df_data)
     mock_async_run_sync(mocker, search_client)
     results_map = await search_client.search_unpaywall(["10.test/unpaywall"])
     assert len(results_map) == 1
