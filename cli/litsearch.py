@@ -44,135 +44,131 @@ def load_rich_theme(base_path: Path) -> Theme:
         return Theme(theme_config)
     return Theme({}) # Return empty theme if not found
 
-async def run_search_pipeline(query_refiner_agent, literature_search_tool, original_query: str, rounds: int, console: Console):
+async def run_search_pipeline(query_refiner_agent, literature_search_tool, original_query: str, console: Console):
     all_dois = set()
     all_refined_queries = []
 
-    for i in range(rounds):
-        console.print(f"[primary]--- Refining Query Round {i+1}/{rounds} ---[/primary]")
+    # 2. Call the Query-RefinerAgent to clarify ambiguities and expand the query
+    console.print(f"[secondary]Input to Query-RefinerAgent:[/secondary] [highlight]'{original_query}'[/highlight]")
+    
+    # The Query-RefinerAgent is expected to return a list of three Boolean/MeSH-style search strings.
+    # Assuming the agent's 'run' method returns a TaskResult with messages, and the last message content
+    # can be parsed as a list of strings. This might need adjustment based on actual agent output format.
+    try:
+        refiner_result = await query_refiner_agent.run(task=f"Refine the following research query into three distinct Boolean/MeSH-style search strings: {original_query}")
         
-        # 2. Call the Query-RefinerAgent to clarify ambiguities and expand the query
-        console.print(f"[secondary]Input to Query-RefinerAgent:[/secondary] [highlight]'{original_query}'[/highlight]")
+        refined_queries_str = ""
+        if refiner_result.messages and isinstance(refiner_result.messages, list) and len(refiner_result.messages) > 0:
+            last_message = refiner_result.messages[-1]
+            if hasattr(last_message, 'content'):
+                refined_queries_str = last_message.content
+            else:
+                console.print(f"[red]Warning: Query-RefinerAgent returned unexpected message format: {last_message}[/red]")
         
-        # The Query-RefinerAgent is expected to return a list of three Boolean/MeSH-style search strings.
-        # Assuming the agent's 'run' method returns a TaskResult with messages, and the last message content
-        # can be parsed as a list of strings. This might need adjustment based on actual agent output format.
+        # Attempt to parse the refined queries. This is a placeholder and might need robust parsing.
+        # For now, assuming the agent returns a string that can be split into lines, or a JSON string.
+        # A more robust solution would involve the agent returning a structured JSON.
+        # For the purpose of this task, let's assume it returns a comma-separated string or similar.
+        # If the agent is designed to return a JSON array string, json.loads would be appropriate.
+        # For now, a simple split for demonstration.
+        
+        # Example: Agent returns "query1, query2, query3" or "['query1', 'query2', 'query3']"
+        # Let's assume it returns a string that can be evaluated as a list or is comma-separated.
+        # A safer approach would be to define a specific output format for the agent.
+        
+        # For now, let's assume the agent returns a string like "['query1', 'query2', 'query3']"
+        # or a simple string that we can split.
+        
+        # Attempt to parse the refined queries.
+        # The agent is expected to return a JSON array of objects with 'pubmed_query' and 'general_query' fields.
         try:
-            refiner_result = await query_refiner_agent.run(task=f"Refine the following research query into three distinct Boolean/MeSH-style search strings: {original_query}")
+            # Extract content from markdown code blocks first
+            code_block_pattern = re.compile(r"```(?:json|python|text)?\n(.*?)\n```", re.DOTALL)
+            extracted_json_str = ""
+            for block in code_block_pattern.findall(refined_queries_str):
+                try:
+                    # Try to load as JSON. If successful, this is our block.
+                    json.loads(block)
+                    extracted_json_str = block
+                    break # Found the JSON block
+                except json.JSONDecodeError:
+                    continue # Not a valid JSON block, try next
+
+            if not extracted_json_str:
+                raise ValueError("No valid JSON code block found in agent's response.")
+
+            refined_query_objects = json.loads(extracted_json_str)
+            if not isinstance(refined_query_objects, list):
+                raise ValueError("Agent did not return a JSON array.")
             
-            refined_queries_str = ""
-            if refiner_result.messages and isinstance(refiner_result.messages, list) and len(refiner_result.messages) > 0:
-                last_message = refiner_result.messages[-1]
-                if hasattr(last_message, 'content'):
-                    refined_queries_str = last_message.content
-                else:
-                    console.print(f"[red]Warning: Query-RefinerAgent returned unexpected message format: {last_message}[/red]")
+            # Ensure each object has 'pubmed_query' and 'general_query'
+            for obj in refined_query_objects:
+                if not isinstance(obj, dict) or "pubmed_query" not in obj or "general_query" not in obj:
+                    raise ValueError("Each object in the JSON array must have 'pubmed_query' and 'general_query' fields.")
+
+            # Take only the first refined query object
+            refined_query_objects = refined_query_objects[:1]
             
-            # Attempt to parse the refined queries. This is a placeholder and might need robust parsing.
-            # For now, assuming the agent returns a string that can be split into lines, or a JSON string.
-            # A more robust solution would involve the agent returning a structured JSON.
-            # For the purpose of this task, let's assume it returns a comma-separated string or similar.
-            # If the agent is designed to return a JSON array string, json.loads would be appropriate.
-            # For now, a simple split for demonstration.
+        except (json.JSONDecodeError, ValueError) as e:
+            console.print(f"[red]Error parsing Query-RefinerAgent output: {e}. Raw output: {refined_queries_str}[/red]")
+            console.print("[yellow]Attempting fallback parsing (may not be accurate).[/yellow]")
+            # Fallback parsing if JSON parsing fails (less robust, but prevents crash)
+            refined_query_objects = []
+            # This fallback is a heuristic and might not perfectly align with the new structured output.
+            # It's primarily to prevent a crash if the agent deviates from the expected JSON.
+            # A better long-term solution is to ensure the agent strictly adheres to the JSON format.
+            lines = [line.strip() for line in refined_queries_str.split('\n') if line.strip()]
+            for line in lines:
+                # Simple heuristic: if a line contains "pubmed_query" or "general_query", try to extract.
+                # This is very fragile and mostly for graceful degradation.
+                if "pubmed_query" in line or "general_query" in line:
+                    # Attempt to extract key-value pairs, e.g., from "pubmed_query: 'term'"
+                    match_pubmed = re.search(r"pubmed_query:\s*['\"](.*?)['\"]", line)
+                    match_general = re.search(r"general_query:\s*['\"](.*?)['\"]", line)
+                    
+                    pq = match_pubmed.group(1) if match_pubmed else ""
+                    gq = match_general.group(1) if match_general else ""
+                    
+                    if pq or gq:
+                        refined_query_objects.append({"pubmed_query": pq, "general_query": gq})
             
-            # Example: Agent returns "query1, query2, query3" or "['query1', 'query2', 'query3']"
-            # Let's assume it returns a string that can be evaluated as a list or is comma-separated.
-            # A safer approach would be to define a specific output format for the agent.
+            # Ensure we have at least one query object for processing
+            if not refined_query_objects:
+                refined_query_objects.append({"pubmed_query": "", "general_query": ""})
+            refined_query_objects = refined_query_objects[:1] # Trim if too many from fallback
+
+        console.print(f"[secondary]Refined Query Objects from Query-RefinerAgent:[/secondary] {refined_query_objects}")
+        # Store the general queries for the final output JSON
+        all_refined_queries.extend([obj["general_query"] for obj in refined_query_objects])
+
+        # 3. For each refined query object, call the `search_literature` tool
+        for j, query_obj in enumerate(refined_query_objects):
+            pubmed_q = query_obj.get("pubmed_query", "")
+            general_q = query_obj.get("general_query", "")
+
+            if not pubmed_q and not general_q:
+                console.print(f"[yellow]Skipping empty refined query object in query {j+1}.[/yellow]")
+                continue
             
-            # For now, let's assume the agent returns a string like "['query1', 'query2', 'query3']"
-            # or a simple string that we can split.
+            console.print(f"[secondary]Calling search_literature with:[/secondary]")
+            console.print(f"  [highlight]PubMed Query: '{pubmed_q}'[/highlight]")
+            console.print(f"  [highlight]General Query: '{general_q}'[/highlight]")
             
-            # Attempt to parse the refined queries.
-            # The agent is expected to return a JSON array of objects with 'pubmed_query' and 'general_query' fields.
-            try:
-                # Extract content from markdown code blocks first
-                code_block_pattern = re.compile(r"```(?:json|python|text)?\n(.*?)\n```", re.DOTALL)
-                extracted_json_str = ""
-                for block in code_block_pattern.findall(refined_queries_str):
-                    try:
-                        # Try to load as JSON. If successful, this is our block.
-                        json.loads(block)
-                        extracted_json_str = block
-                        break # Found the JSON block
-                    except json.JSONDecodeError:
-                        continue # Not a valid JSON block, try next
-
-                if not extracted_json_str:
-                    raise ValueError("No valid JSON code block found in agent's response.")
-
-                refined_query_objects = json.loads(extracted_json_str)
-                if not isinstance(refined_query_objects, list):
-                    raise ValueError("Agent did not return a JSON array.")
-                
-                # Ensure each object has 'pubmed_query' and 'general_query'
-                for obj in refined_query_objects:
-                    if not isinstance(obj, dict) or "pubmed_query" not in obj or "general_query" not in obj:
-                        raise ValueError("Each object in the JSON array must have 'pubmed_query' and 'general_query' fields.")
-
-                # Take up to 'rounds' number of refined query objects
-                refined_query_objects = refined_query_objects[:rounds]
-                
-            except (json.JSONDecodeError, ValueError) as e:
-                console.print(f"[red]Error parsing Query-RefinerAgent output: {e}. Raw output: {refined_queries_str}[/red]")
-                console.print("[yellow]Attempting fallback parsing (may not be accurate).[/yellow]")
-                # Fallback parsing if JSON parsing fails (less robust, but prevents crash)
-                refined_query_objects = []
-                # This fallback is a heuristic and might not perfectly align with the new structured output.
-                # It's primarily to prevent a crash if the agent deviates from the expected JSON.
-                # A better long-term solution is to ensure the agent strictly adheres to the JSON format.
-                lines = [line.strip() for line in refined_queries_str.split('\n') if line.strip()]
-                for line in lines:
-                    # Simple heuristic: if a line contains "pubmed_query" or "general_query", try to extract.
-                    # This is very fragile and mostly for graceful degradation.
-                    if "pubmed_query" in line or "general_query" in line:
-                        # Attempt to extract key-value pairs, e.g., from "pubmed_query: 'term'"
-                        match_pubmed = re.search(r"pubmed_query:\s*['\"](.*?)['\"]", line)
-                        match_general = re.search(r"general_query:\s*['\"](.*?)['\"]", line)
-                        
-                        pq = match_pubmed.group(1) if match_pubmed else ""
-                        gq = match_general.group(1) if match_general else ""
-                        
-                        if pq or gq:
-                            refined_query_objects.append({"pubmed_query": pq, "general_query": gq})
-                
-                # Ensure we have 'rounds' number of query objects, padding if necessary
-                while len(refined_query_objects) < rounds:
-                    refined_query_objects.append({"pubmed_query": "", "general_query": ""})
-                refined_query_objects = refined_query_objects[:rounds] # Trim if too many from fallback
-
-            console.print(f"[secondary]Refined Query Objects from Query-RefinerAgent:[/secondary] {refined_query_objects}")
-            # Store the general queries for the final output JSON
-            all_refined_queries.extend([obj["general_query"] for obj in refined_query_objects])
-
-            # 3. For each refined query object, call the `search_literature` tool
-            for j, query_obj in enumerate(refined_query_objects):
-                pubmed_q = query_obj.get("pubmed_query", "")
-                general_q = query_obj.get("general_query", "")
-
-                if not pubmed_q and not general_q:
-                    console.print(f"[yellow]Skipping empty refined query object in round {i+1}, query {j+1}.[/yellow]")
-                    continue
-                
-                console.print(f"[secondary]Calling search_literature with:[/secondary]")
-                console.print(f"  [highlight]PubMed Query: '{pubmed_q}'[/highlight]")
-                console.print(f"  [highlight]General Query: '{general_q}'[/highlight]")
-                
-                # Call the run method of LiteratureSearchTool with structured queries
-                search_output = await literature_search_tool.run(
-                    args=SearchLiteratureParams(pubmed_query=pubmed_q, general_query=general_q),
-                    cancellation_token=CancellationToken()
-                )
-                
-                # Extract the 'data' field from the new structured output
-                search_results_data = search_output.get("data", [])
-                
-                # 4. Extract the DOIs from all results
-                for record in search_results_data:
-                    if 'doi' in record and record['doi']:
-                        all_dois.add(record['doi'])
-        except Exception as e:
-            console.print(f"[red]Error during query refinement or search in round {i+1}: {e}[/red]")
-            break
+            # Call the run method of LiteratureSearchTool with structured queries
+            search_output = await literature_search_tool.run(
+                args=SearchLiteratureParams(pubmed_query=pubmed_q, general_query=general_q),
+                cancellation_token=CancellationToken()
+            )
+            
+            # Extract the 'data' field from the new structured output
+            search_results_data = search_output.get("data", [])
+            
+            # 4. Extract the DOIs from all results
+            for record in search_results_data:
+                if 'doi' in record and record['doi']:
+                    all_dois.add(record['doi'])
+    except Exception as e:
+        console.print(f"[red]Error during query refinement or search: {e}[/red]")
 
     # Deduplicate DOIs (already handled by using a set)
     unique_dois = sorted(list(all_dois)) # Sort for consistent output
@@ -198,7 +194,6 @@ def main():
     Main function to load configurations, instantiate agents, and run the search pipeline.
     """
     parser = argparse.ArgumentParser(description="Run the literature search pipeline.")
-    parser.add_argument("--rounds", type=int, default=3, help="Number of rounds for query refinement and search.")
     args = parser.parse_args()
 
     base_path = Path(".").resolve() # Resolve to absolute path for clarity
@@ -291,7 +286,7 @@ def main():
         console.print("[yellow]No query entered. Exiting.[/yellow]")
         return
 
-    asyncio.run(run_search_pipeline(query_refiner_agent, literature_search_tool, original_query, args.rounds, console))
+    asyncio.run(run_search_pipeline(query_refiner_agent, literature_search_tool, original_query, console))
 
 
 if __name__ == "__main__":
