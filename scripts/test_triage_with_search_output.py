@@ -105,6 +105,18 @@ async def main():
     else:
         print("No articles passed the triage filters.")
 
+    # Step 6: Output table of DOIs and PDF availability
+    print("\n--- DOI and PDF Availability Check ---")
+    if not search_results_df.empty:
+        # Create a new DataFrame for the output table
+        pdf_check_df = search_results_df[['doi', 'open_access_url']].copy()
+        pdf_check_df['pdf_found'] = pdf_check_df['open_access_url'].notna()
+        
+        # Print the table
+        print(pdf_check_df[['doi', 'pdf_found']].to_string(index=False))
+    else:
+        print("No search results to check for PDF availability.")
+
 if __name__ == "__main__":
     # Fix for ProactorEventLoop on Windows for asyncio
     if os.name == 'nt':

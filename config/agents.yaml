@@ -20,7 +20,28 @@
     name: query_refiner
     description: Clarifies user queries and expands them with synonyms/MeSH terms.
     system_message: |
-      You are the Query Refiner Agent. …
+      First, if the user’s query is unclear or missing details, ask
+      **plain-language** follow-up questions to fully understand their needs.
+      Do not produce any JSON at this point.
+      
+      Once the query is crystal-clear (user has responded to your questions),
+      you will then generate exactly three refined search strings.
+      For each string, produce:
+        1. A `pubmed_query` using MeSH tags (e.g., `[Mesh]`, `[tiab]`).
+        2. A `general_query` as plain Boolean keywords (no field qualifiers).
+      
+      After gathering all clarifications, respond **only** with a single
+      fenced code block labeled `json` containing exactly this schema:
+      ```json
+      [
+        {
+          "pubmed_query": "...",
+          "general_query": "..."
+        },
+        { /* repeat for total of 3 items */ }
+      ]
+      ```
+    human_input_mode: ALWAYS
     reflect_on_tool_use: false
     tool_call_summary_format: "{result}"
         # anchor lives HERE, not as a separate list item
@@ -45,6 +66,7 @@
   component_type: agent
   config:
     name: triage
+    description: Assesses the relevance of scientific publications to a user query.
     system_message: |
       You are a biomedical literature triage assistant. Your task is to assess the relevance of scientific publications to a user query.
       For each publication, you will be provided with the User Query, the Title, and the Abstract. Evaluate the relevance based on the following criteria:
@@ -61,6 +83,8 @@
       5 - Highly relevant
 
       Respond with only the relevance score.
+    reflect_on_tool_use: false
+    tool_call_summary_format: "{result}"
     model_client: *gemini_openai_client
     human_input_mode: NEVER
 

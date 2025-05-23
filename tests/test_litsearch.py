@@ -1,25 +1,31 @@
 import pytest
 import os
 import yaml
+import json
+import pandas as pd
 from pathlib import Path
-from unittest.mock import MagicMock, call # For more detailed call assertions if needed
+from unittest.mock import MagicMock, call
+from rich.console import Console
+from rich.theme import Theme
 
 # Assuming tests are run from the project root, so cli.litsearch is importable
-# Ensure __init__.py exists in cli/ and tests/ if not already present and needed for older Pythons
-# For modern pytest, direct import should work if project root is in sys.path
 try:
-    from cli.litsearch import main as litsearch_main
-    from autogen_core import ComponentLoader # To patch it correctly
+    from cli.litsearch import main as litsearch_main, run_search_pipeline, load_rich_theme
+    from autogen_core import ComponentLoader, CancellationToken
+    from tools.search import LiteratureSearchTool, SearchLiteratureParams
 except ImportError as e:
-    # This might happen if PYTHONPATH is not set up correctly for tests
-    # or if __init__.py files are missing in relevant directories for older Python versions.
-    print(f"ImportError in test setup: {e}. Ensure cli/litsearch.py is accessible.")
+    print(f"ImportError in test setup: {e}. Ensure cli/litsearch.py and tools/search.py are accessible.")
     litsearch_main = None
+    run_search_pipeline = None
+    load_rich_theme = None
     ComponentLoader = None
+    CancellationToken = None
+    LiteratureSearchTool = None
+    SearchLiteratureParams = None
 
 
 # Helper to create dummy config files
-def create_dummy_configs(tmp_path: Path, agents_content=None, settings_content=None, env_content=None):
+def create_dummy_configs(tmp_path: Path, agents_content=None, settings_content=None, env_content=None, rich_theme_content=None):
     config_dir = tmp_path / "config"
     config_dir.mkdir(exist_ok=True)
 
@@ -36,6 +42,14 @@ def create_dummy_configs(tmp_path: Path, agents_content=None, settings_content=N
 
     if env_content is not None:
         (tmp_path / ".env").write_text(env_content)
+    
+    if rich_theme_content is None:
+        rich_theme_content = {
+            "primary": "cyan",
+            "secondary": "green",
+            "highlight": "yellow"
+        }
+    (config_dir / "rich_theme.json").write_text(json.dumps(rich_theme_content))
 
 
 @pytest.mark.skipif(litsearch_main is None, reason="cli.litsearch.main could not be imported")
@@ -47,16 +61,16 @@ def test_dotenv_loading(monkeypatch, tmp_path):
     
     create_dummy_configs(tmp_path, env_content=env_content)
 
-    # Ensure the variable is not already in the environment
     monkeypatch.delenv(sentinel_key, raising=False)
     
-    # Call the main function of the script, pointing to the temp directory
-    litsearch_main(base_path_str=str(tmp_path))
+    with monkeypatch.context() as m:
+        m.chdir(tmp_path)
+        litsearch_main()
     
     assert os.getenv(sentinel_key) == sentinel_value
 
 @pytest.mark.skipif(litsearch_main is None or ComponentLoader is None, reason="Imports failed")
-def test_component_loader_mocking(mocker, tmp_path):
+def test_component_loader_mocking(mocker, tmp_path, monkeypatch):
     """Mocks ComponentLoader.load_component."""
     dummy_agents_data = [
         {"name": "agent_one", "provider": "provider.One", "component_type": "agent", "config": {"id": 1}},
@@ -64,16 +78,11 @@ def test_component_loader_mocking(mocker, tmp_path):
     ]
     create_dummy_configs(tmp_path, agents_content=dummy_agents_data)
 
-    # Patch load_component on the ComponentLoader class from autogen_core
-    # This will affect instances of ComponentLoader created in litsearch_main
     mocked_load_component_method = mocker.patch.object(ComponentLoader, "load_component", return_value=MagicMock())
-    # Alternative if the above doesn't work as expected due to import nuances:
-    # mocked_load_component_method = mocker.patch("autogen_core.ComponentLoader.load_component", return_value=MagicMock())
-    # Or even more specific if litsearch.py imports it as `from autogen_core import ComponentLoader`:
-    # mocked_load_component_method = mocker.patch("cli.litsearch.ComponentLoader.load_component", return_value=MagicMock())
-    # Sticking with patch.object for now as it's often robust for class methods.
 
-    litsearch_main(base_path_str=str(tmp_path))
+    with monkeypatch.context() as m:
+        m.chdir(tmp_path)
+        litsearch_main()
 
     assert mocked_load_component_method.call_count == len(dummy_agents_data)
     
@@ -86,19 +95,15 @@ def test_component_loader_mocking(mocker, tmp_path):
                 config=agent_cfg["config"]
             )
         )
-    # Check if all expected calls were made, regardless of order for any_call
-    # For specific order, use `mocked_load_component_method.assert_has_calls(expected_calls, any_order=False)`
-    # For checking presence of each call:
     for expected_call_args in expected_calls:
          mocked_load_component_method.assert_any_call(*expected_call_args.args, **expected_call_args.kwargs)
 
 
 @pytest.mark.skipif(litsearch_main is None or ComponentLoader is None, reason="Imports failed")
-def test_script_output_captures_reply(capsys, mocker, tmp_path):
+def test_script_output_captures_reply(capsys, mocker, tmp_path, monkeypatch):
     """Confirms the script prints the assistant’s reply."""
     user_proxy_name = "user_proxy"
-    assistant_name = "query_refiner" # Matches the default assistant litsearch.py tries to get
-    expected_reply_text = "Mocked assistant reply for Hello"
+    assistant_name = "query_refiner"
 
     agents_config_for_test = [
         {"name": user_proxy_name, "provider": "mock.UserProxy", "component_type": "agent", "config": {"name": user_proxy_name}},
@@ -108,50 +113,164 @@ def test_script_output_captures_reply(capsys, mocker, tmp_path):
 
     mock_user_proxy_agent = MagicMock(name="MockUserProxyAgent")
     mock_assistant_agent = MagicMock(name="MockAssistantAgent")
+    # Mock the system_message attribute as it's set dynamically
+    mock_assistant_agent.system_message = "" 
 
-    # Configure mock_user_proxy_agent.initiate_chat
-    # It needs to populate its own chat_messages attribute as the script expects
-    def mock_initiate_chat_impl(recipient, message):
-        if message == "Hello" and recipient == mock_assistant_agent:
-            # Simulate storing the message history
-            # The script expects user_proxy.chat_messages[assistant][-1]['content']
-            if not hasattr(mock_user_proxy_agent, 'chat_messages') or not isinstance(mock_user_proxy_agent.chat_messages, dict):
-                 mock_user_proxy_agent.chat_messages = {} # Ensure it's a dict
-
-            mock_user_proxy_agent.chat_messages[mock_assistant_agent] = [
-                {"role": "assistant", "content": expected_reply_text} # Assistant's reply
-            ]
-        # else:
-            # print(f"Unexpected chat: to {recipient} msg: {message}")
-
-
-    mock_user_proxy_agent.initiate_chat = MagicMock(side_effect=mock_initiate_chat_impl)
-    
-    # Patch ComponentLoader.load_component to return our mocks
-    def side_effect_load_component(provider, component_type, config):
+    def side_effect_load_component(config):
         if config.get("name") == user_proxy_name:
             return mock_user_proxy_agent
         elif config.get("name") == assistant_name:
             return mock_assistant_agent
-        return MagicMock() # Default mock for any other agents
+        return MagicMock()
 
-    # Using patch.object on the ComponentLoader class from autogen_core
     mocker.patch.object(ComponentLoader, "load_component", side_effect=side_effect_load_component)
-    # As above, consider "autogen_core.ComponentLoader.load_component" or "cli.litsearch.ComponentLoader.load_component"
-    # if patch.object doesn't behave as expected.
+    
+    mocker.patch("argparse.ArgumentParser.parse_args", return_value=MagicMock(rounds=1))
+    mocker.patch("rich.console.Console.input", return_value="test query")
 
-    litsearch_main(base_path_str=str(tmp_path))
+    # Mock the query_refiner_agent.run to return expected JSON output
+    mock_assistant_agent.run.return_value = MagicMock(messages=[MagicMock(content=json.dumps([
+        {"pubmed_query": "test_pubmed_q", "general_query": "test_general_q"}
+    ]))])
+    
+    # Mock LiteratureSearchTool.run to return the new structured output
+    mock_literature_search_tool = MagicMock(spec=LiteratureSearchTool)
+    mock_literature_search_tool.run.return_value = {
+        "data": [{"doi": "10.123/test", "title": "Test Title", "abstract": "Test Abstract"}],
+        "meta": {"total_hits": 1, "query": "test_general_q", "timestamp": "2023-01-01T00:00:00Z"}
+    }
+    mocker.patch("cli.litsearch.LiteratureSearchTool", return_value=mock_literature_search_tool)
+
+
+    with monkeypatch.context() as m:
+        m.chdir(tmp_path)
+        litsearch_main()
 
     captured = capsys.readouterr()
     
-    # Check that initiate_chat was called correctly
-    mock_user_proxy_agent.initiate_chat.assert_called_once_with(
-        recipient=mock_assistant_agent,
-        message="Hello"
-    )
+    assert "Search pipeline completed. Results saved to dois.json" in captured.out
+    # Verify the system message was set
+    assert "For a given user question, generate exactly 1 refined search strings." in mock_assistant_agent.system_message
+
+
+@pytest.mark.skipif(run_search_pipeline is None or LiteratureSearchTool is None or CancellationToken is None or SearchLiteratureParams is None, reason="Required imports failed for test_search_pipeline_logic")
+@pytest.mark.asyncio
+async def test_search_pipeline_logic(mocker, tmp_path, monkeypatch):
+    """
+    Verifies the core search pipeline logic with new structured queries:
+    - Query-RefinerAgent calls and output parsing
+    - LiteratureSearchTool calls with correct arguments
+    - DOI extraction and deduplication
+    - JSON output format and content
+    """
+    original_query = "impact of climate change on marine ecosystems"
+    num_rounds = 2
     
-    # Check that the expected reply is in the script's output
-    assert f"Assistant's final reply: {expected_reply_text}" in captured.out
+    # Mock the Query-RefinerAgent
+    mock_query_refiner_agent = MagicMock()
+    # Simulate the agent returning a JSON string of structured queries
+    mock_query_refiner_agent.run.side_effect = [
+        MagicMock(messages=[MagicMock(content=json.dumps([
+            {"pubmed_query": "climate change[Mesh] AND marine ecosystems[Mesh]", "general_query": "climate change marine ecosystems"},
+            {"pubmed_query": "ocean acidification[Mesh] AND coral reefs[Mesh]", "general_query": "ocean acidification coral reefs"},
+            {"pubmed_query": "sea level rise[Mesh] AND coastal habitats[Mesh]", "general_query": "sea level rise coastal habitats"}
+        ]))]),
+        MagicMock(messages=[MagicMock(content=json.dumps([
+            {"pubmed_query": "marine biodiversity[Mesh] AND loss[tiab]", "general_query": "marine biodiversity loss"},
+            {"pubmed_query": "polar ice melt[Mesh] AND effects[tiab]", "general_query": "polar ice melt effects"},
+            {"pubmed_query": "fisheries[Mesh] AND collapse[tiab]", "general_query": "fisheries collapse"}
+        ]))]),
+    ]
+
+    # Mock the LiteratureSearchTool
+    mock_literature_search_tool = MagicMock(spec=LiteratureSearchTool)
+    # The run method returns the new structured output
+    mock_literature_search_tool.run.side_effect = [
+        {"data": [{"doi": "10.1000/doi1", "title": "Doc 1", "abstract": "Abs 1"}, {"doi": "10.1000/doi2", "title": "Doc 2", "abstract": "Abs 2"}], "meta": {"total_hits": 2, "query": "q1", "timestamp": "ts1"}},
+        {"data": [{"doi": "10.1000/doi2", "title": "Doc 2 (duplicate)", "abstract": "Abs 2 Dup"}, {"doi": "10.1000/doi3", "title": "Doc 3", "abstract": "Abs 3"}], "meta": {"total_hits": 2, "query": "q2", "timestamp": "ts2"}},
+        {"data": [{"doi": "10.1000/doi4", "title": "Doc 4", "abstract": "Abs 4"}], "meta": {"total_hits": 1, "query": "q3", "timestamp": "ts3"}},
+        {"data": [{"doi": "10.1000/doi5", "title": "Doc 5", "abstract": "Abs 5"}], "meta": {"total_hits": 1, "query": "q4", "timestamp": "ts4"}},
+        {"data": [{"doi": "10.1000/doi1", "title": "Doc 1 (duplicate)", "abstract": "Abs 1 Dup"}, {"doi": "10.1000/doi6", "title": "Doc 6", "abstract": "Abs 6"}], "meta": {"total_hits": 2, "query": "q5", "timestamp": "ts5"}},
+        {"data": [{"doi": "10.1000/doi7", "title": "Doc 7", "abstract": "Abs 7"}], "meta": {"total_hits": 1, "query": "q6", "timestamp": "ts6"}},
+    ]
+
+    # Mock rich.console.Console for input/output
+    mock_console = MagicMock(spec=Console)
+    mock_console.input.return_value = original_query
+    mock_console.print.return_value = None
+
+    with monkeypatch.context() as m:
+        m.chdir(tmp_path)
+        result_data = await run_search_pipeline(
+            mock_query_refiner_agent,
+            mock_literature_search_tool,
+            original_query,
+            num_rounds,
+            mock_console
+        )
+
+        # Verify Query-RefinerAgent calls
+        assert mock_query_refiner_agent.run.call_count == num_rounds
+        expected_refiner_task_calls = [
+            call(task=f"Refine the following research query into three distinct Boolean/MeSH-style search strings: {original_query}")
+        ] * num_rounds
+        mock_query_refiner_agent.run.assert_has_calls(expected_refiner_task_calls, any_order=False)
+
+        # Verify LiteratureSearchTool calls
+        expected_search_tool_calls = [
+            call(args=SearchLiteratureParams(pubmed_query="climate change[Mesh] AND marine ecosystems[Mesh]", general_query="climate change marine ecosystems"), cancellation_token=mocker.ANY),
+            call(args=SearchLiteratureParams(pubmed_query="ocean acidification[Mesh] AND coral reefs[Mesh]", general_query="ocean acidification coral reefs"), cancellation_token=mocker.ANY),
+            call(args=SearchLiteratureParams(pubmed_query="sea level rise[Mesh] AND coastal habitats[Mesh]", general_query="sea level rise coastal habitats"), cancellation_token=mocker.ANY),
+            call(args=SearchLiteratureParams(pubmed_query="marine biodiversity[Mesh] AND loss[tiab]", general_query="marine biodiversity loss"), cancellation_token=mocker.ANY),
+            call(args=SearchLiteratureParams(pubmed_query="polar ice melt[Mesh] AND effects[tiab]", general_query="polar ice melt effects"), cancellation_token=mocker.ANY),
+            call(args=SearchLiteratureParams(pubmed_query="fisheries[Mesh] AND collapse[tiab]", general_query="fisheries collapse"), cancellation_token=mocker.ANY),
+        ]
+        assert mock_literature_search_tool.run.call_count == num_rounds * 3
+        mock_literature_search_tool.run.assert_has_calls(expected_search_tool_calls, any_order=False)
+
+        # Verify dois.json content
+        output_file_path = tmp_path / "dois.json"
+        assert output_file_path.exists()
+        with open(output_file_path, "r") as f:
+            output_json = json.load(f)
+
+        expected_dois = sorted([
+            "10.1000/doi1", "10.1000/doi2", "10.1000/doi3", "10.1000/doi4",
+            "10.1000/doi5", "10.1000/doi6", "10.1000/doi7"
+        ])
+        expected_refined_queries = [
+            "climate change marine ecosystems", "ocean acidification coral reefs", "sea level rise coastal habitats",
+            "marine biodiversity loss", "polar ice melt effects", "fisheries collapse"
+        ]
+
+        assert output_json["query"] == original_query
+        assert output_json["refined_queries"] == expected_refined_queries
+        assert sorted(output_json["dois"]) == expected_dois
+        assert len(output_json["dois"]) == len(expected_dois)
+
+        # Verify the returned data from run_search_pipeline
+        assert result_data["query"] == original_query
+        assert result_data["refined_queries"] == expected_refined_queries
+        assert sorted(result_data["dois"]) == expected_dois
+
+
+@pytest.mark.skipif(load_rich_theme is None, reason="load_rich_theme could not be imported")
+def test_load_rich_theme(tmp_path):
+    """Verify rich theme loading."""
+    theme_content = {
+        "info": "blue",
+        "warning": "orange"
+    }
+    create_dummy_configs(tmp_path, rich_theme_content=theme_content)
+    
+    loaded_theme = load_rich_theme(tmp_path)
+    assert loaded_theme.styles["info"].color.name == "blue"
+    assert loaded_theme.styles["warning"].color.name == "orange"
+
+    (tmp_path / "config" / "rich_theme.json").unlink()
+    empty_theme = load_rich_theme(tmp_path)
+    assert empty_theme.styles == {}
+
 
 # To run these tests, navigate to the project root and run:
 # pytest

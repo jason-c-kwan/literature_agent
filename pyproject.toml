@@ -21,3 +21,9 @@ include = ["tools", "tools.*"]      # or "literature_agent.tools*"
 #  "autogen-agentchat[gemini]>=0.5.7",
 #  "autogen-ext[semantic-kernel-google]>=0.5.7",
 #]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "slow: marks tests as slow to run",
+]
