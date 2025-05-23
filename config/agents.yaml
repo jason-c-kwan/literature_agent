@@ -4,7 +4,8 @@
 # ──────────────────────────────────────────────────────────────
 
 # ─── USER PROXY ────────────────────────────────────────────────
-- name: user_proxy
+- &user_proxy_agent
+  name: user_proxy
   provider: autogen_agentchat.agents.UserProxyAgent
   component_type: agent
   config:
@@ -13,52 +14,78 @@
     code_execution_config: false
 
 # ─── QUERY-REFINER (uses Gemini) ───────────────────────────────
-- name: query_refiner
+- &query_refiner_agent
+  name: query_refiner
   provider: autogen_agentchat.agents.AssistantAgent
   component_type: agent
   config:
     name: query_refiner
     description: Clarifies user queries and expands them with synonyms/MeSH terms.
     system_message: |
-      First, if the user’s query is unclear or missing details, ask
-      **plain-language** follow-up questions to fully understand their needs.
-      Do not produce any JSON at this point.
+      You are a **query refinement agent**. 
+
+      **Clarification Phase:**  
+      If the user’s initial query is unclear, ambiguous, or missing key details, you must ask plain-language follow-up questions.  To do so, **call** the `clarify_query` tool with a single keyword argument `content` set to your question.  Example:
+      ```
+      clarify_query(content="What specific type of antibiotics are you interested in (e.g., penicillins, cephalosporins)?")
+      ```
       
-      Once the query is crystal-clear (user has responded to your questions),
-      you will then generate exactly three refined search strings.
-      For each string, produce:
-        1. A `pubmed_query` using MeSH tags (e.g., `[Mesh]`, `[tiab]`).
-        2. A `general_query` as plain Boolean keywords (no field qualifiers).
-      
-      After gathering all clarifications, respond **only** with a single
-      fenced code block labeled `json` containing exactly this schema:
-      ```json
+      **Query Generation Phase:**  
+      Once you have received the user’s answers to all clarifying questions and the query is crystal-clear, generate **exactly three** refined search strings.  For each, produce:
+      1. A `pubmed_query` using MeSH tags (e.g. `"[Antibiotics/therapeutic use]"[Mesh]` or `"[tiab]"`).  
+      2. A `general_query` using plain Boolean keywords (no field qualifiers).
+
+      **Output format:**  
+      Respond **only** with a single fenced code block labeled `json` containing an array of three objects, each with exactly these two fields:
+      \```json
       [
         {
           "pubmed_query": "...",
           "general_query": "..."
         },
-        { /* repeat for total of 3 items */ }
+        {
+          "pubmed_query": "...",
+          "general_query": "..."
+        },
+        {
+          "pubmed_query": "...",
+          "general_query": "..."
+        }
       ]
-      ```
-    human_input_mode: ALWAYS
+      \```
+
+    human_input_mode: NEVER
     reflect_on_tool_use: false
     tool_call_summary_format: "{result}"
-        # anchor lives HERE, not as a separate list item
-    model_client: &gemini_openai_client
+    tools:
+      - clarify_query
+    model_client:
       provider: autogen_ext.models.openai.OpenAIChatCompletionClient
-      component_type: model
       config:
         model:    "${GEMINI_MODEL:-gemini-2.5-flash-preview-05-20}"
         base_url: "${OPENAI_API_BASE}"
         api_key:  "${OPENAI_API_KEY}"
         temperature: 0.2
+        parallel_tool_calls: false
         model_info:
-          structured_output: false      # ← new required field
+          structured_output: false
           vision: false
           json_output: true
           function_calling: true
           family: "GEMINI_2_5_FLASH"
+
+
+- name: query_team
+  provider: autogen_agentchat.teams.RoundRobinGroupChat
+  component_type: team
+  config:
+    participants:
+      - *query_refiner_agent
+      - *user_proxy_agent
+    termination_condition:
+      provider: autogen_agentchat.conditions.HandoffTermination
+      config:
+        target: user
 
 # ─── TRIAGE / RANKER (unchanged; no LLM) ─────────────
 - name: triage
@@ -85,7 +112,19 @@
       Respond with only the relevance score.
     reflect_on_tool_use: false
     tool_call_summary_format: "{result}"
-    model_client: *gemini_openai_client
+    model_client:
+      provider: autogen_ext.models.openai.OpenAIChatCompletionClient
+      config:
+        model:    "${GEMINI_MODEL:-gemini-2.5-flash-preview-05-20}"
+        base_url: "${OPENAI_API_BASE}"
+        api_key:  "${OPENAI_API_KEY}"
+        temperature: 0.2
+        model_info:
+          structured_output: false
+          vision: false
+          json_output: true
+          function_calling: true
+          family: "GEMINI_2_5_FLASH"
     human_input_mode: NEVER
 
 - name: ranker
@@ -110,7 +149,19 @@
       You are the Summariser Agent. …
     reflect_on_tool_use: false
     tool_call_summary_format: "{result}"
-    model_client: *gemini_openai_client
+    model_client:
+      provider: autogen_ext.models.openai.OpenAIChatCompletionClient
+      config:
+        model:    "${GEMINI_MODEL:-gemini-2.5-flash-preview-05-20}"
+        base_url: "${OPENAI_API_BASE}"
+        api_key:  "${OPENAI_API_KEY}"
+        temperature: 0.2
+        model_info:
+          structured_output: false
+          vision: false
+          json_output: true
+          function_calling: true
+          family: "GEMINI_2_5_FLASH"
 
 # ─── EXPORTER (unchanged) ─────────────────────────────────────
 - name: exporter

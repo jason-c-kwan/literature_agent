@@ -8,6 +8,10 @@ from unittest.mock import MagicMock, call
 from rich.console import Console
 from rich.theme import Theme
 
+import sys
+# Add the site-packages directory of the conda environment to sys.path
+sys.path.append('/Users/jkwan2/miniconda3/envs/litagent/lib/python3.10/site-packages/')
+
 # Assuming tests are run from the project root, so cli.litsearch is importable
 try:
     from cli.litsearch import main as litsearch_main, run_search_pipeline, load_rich_theme
@@ -270,6 +274,94 @@ def test_load_rich_theme(tmp_path):
     (tmp_path / "config" / "rich_theme.json").unlink()
     empty_theme = load_rich_theme(tmp_path)
     assert empty_theme.styles == {}
+
+
+@pytest.mark.skipif(run_search_pipeline is None or LiteratureSearchTool is None or CancellationToken is None or SearchLiteratureParams is None, reason="Required imports failed for test_groupchat_query_pipeline")
+@pytest.mark.asyncio
+async def test_groupchat_query_pipeline(mocker, tmp_path, monkeypatch):
+    """
+    Verifies the GroupChat-based search pipeline logic:
+    - query_team.run() is called with the correct task.
+    - The output from query_team is correctly parsed into exactly 3 query objects.
+    - LiteratureSearchTool is called exactly 3 times with the correct arguments.
+    """
+    original_query = "impact of climate change on marine ecosystems"
+    
+    # Mock the query_team (GroupChat)
+    mock_query_team = MagicMock()
+    
+    # Simulate query_team.run() returning a TaskResult with messages.
+    # The last message content should be the JSON from query_refiner.
+    # We'll simulate one handoff by having the first call return an intermediate message,
+    # and the second call return the final JSON.
+    mock_query_team.run.side_effect = [
+        # First call: Simulate a clarification question (handoff)
+        MagicMock(messages=[MagicMock(content="Please clarify the specific marine ecosystems you are interested in.")],
+                   task_result_type="intermediate"),
+        # Second call: Simulate the final JSON output after clarification
+        MagicMock(messages=[MagicMock(content=json.dumps([
+            {"pubmed_query": "climate change[Mesh] AND marine ecosystems[Mesh]", "general_query": "climate change marine ecosystems"},
+            {"pubmed_query": "ocean acidification[Mesh] AND coral reefs[Mesh]", "general_query": "ocean acidification coral reefs"},
+            {"pubmed_query": "sea level rise[Mesh] AND coastal habitats[Mesh]", "general_query": "sea level rise coastal habitats"}
+        ]))], task_result_type="final"),
+    ]
+
+    # Mock the LiteratureSearchTool
+    mock_literature_search_tool = MagicMock(spec=LiteratureSearchTool)
+    mock_literature_search_tool.run.return_value = {
+        "data": [{"doi": "10.1000/test", "title": "Test Doc", "abstract": "Test Abs"}],
+        "meta": {"total_hits": 1, "query": "test_q", "timestamp": "2023-01-01T00:00:00Z"}
+    }
+
+    # Mock rich.console.Console for input/output
+    mock_console = MagicMock(spec=Console)
+    mock_console.input.return_value = original_query
+    mock_console.print.return_value = None
+
+    # Mock ComponentLoader.load_component to return our mocked query_team
+    mocker.patch.object(ComponentLoader, "load_component", side_effect=lambda config: mock_query_team if config.get("name") == "query_team" else MagicMock())
+
+    with monkeypatch.context() as m:
+        m.chdir(tmp_path)
+        result_data = await run_search_pipeline(
+            mock_query_team, # Pass the mocked query_team
+            mock_literature_search_tool,
+            original_query,
+            mock_console
+        )
+
+        # Verify query_team.run() calls
+        # The run_search_pipeline calls query_team.run once.
+        # The side_effect is set up to simulate the internal workings of the groupchat,
+        # but from the perspective of run_search_pipeline, it's one call to query_team.run.
+        mock_query_team.run.assert_called_once_with(task=original_query)
+
+        # Verify that exactly 3 query objects were parsed
+        assert len(result_data["refined_queries"]) == 3
+        assert len(result_data["dois"]) > 0 # Should have at least one DOI from the mock search tool
+
+        # Verify LiteratureSearchTool calls
+        expected_search_tool_calls = [
+            call(args=SearchLiteratureParams(pubmed_query="climate change[Mesh] AND marine ecosystems[Mesh]", general_query="climate change marine ecosystems"), cancellation_token=mocker.ANY),
+            call(args=SearchLiteratureParams(pubmed_query="ocean acidification[Mesh] AND coral reefs[Mesh]", general_query="ocean acidification coral reefs"), cancellation_token=mocker.ANY),
+            call(args=SearchLiteratureParams(pubmed_query="sea level rise[Mesh] AND coastal habitats[Mesh]", general_query="sea level rise coastal habitats"), cancellation_token=mocker.ANY),
+        ]
+        assert mock_literature_search_tool.run.call_count == 3
+        mock_literature_search_tool.run.assert_has_calls(expected_search_tool_calls, any_order=False)
+
+        # Verify the output JSON file
+        output_file_path = tmp_path / "dois.json"
+        assert output_file_path.exists()
+        with open(output_file_path, "r") as f:
+            output_json = json.load(f)
+        
+        assert output_json["query"] == original_query
+        assert output_json["refined_queries"] == [
+            "climate change marine ecosystems",
+            "ocean acidification coral reefs",
+            "sea level rise coastal habitats"
+        ]
+        assert "10.1000/test" in output_json["dois"]
 
 
 # To run these tests, navigate to the project root and run:
