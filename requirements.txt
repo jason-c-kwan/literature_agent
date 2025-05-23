@@ -28,6 +28,7 @@ pytest
 pytest-mock
 pytest-asyncio       # For testing asyncio code with pytest
 rich                 # pretty CLI logs
+prompt_toolkit       # advanced input with proper readline support
 # (ruff, black, pre-commit go in dev-requirements.txt)
 
 -e .

@@ -5,43 +5,125 @@ import argparse
 from pathlib import Path
 from dotenv import load_dotenv
 from autogen_core import CancellationToken
-from autogen_core.models import ModelInfo
+from autogen_core.models import ModelInfo, LLMMessage, CreateResult, SystemMessage as SystemMessageFromCore # Added SystemMessageFromCore
 from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
 from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_agentchat.base import TerminationCondition
 from tools.search import LiteratureSearchTool, SearchLiteratureParams
+from typing import Sequence, Any, Optional, List, Union, Type # Added for DebugClient
+from pydantic import BaseModel # Added for DebugClient
 from tools.triage import TriageAgent
 from tools.ranking import RankerAgent
 from tools.export import ExporterAgent
 from tools._base import StubConfig # Added import
 import asyncio
-import pdb
 import re
 import json
-
 from rich.console import Console
 from rich.theme import Theme
+from prompt_toolkit import prompt
+from prompt_toolkit.formatted_text import HTML
+# Using prompt_toolkit for proper readline support with multi-line editing
 
 # Import GroupChat for the new query logic
 from autogen_agentchat.teams import BaseGroupChat
 #from autogen_agentchat.messages import HandoffMessage
-from autogen_agentchat.messages import ToolCallRequestEvent
+from autogen_agentchat.messages import ToolCallRequestEvent, TextMessage, ToolCallSummaryMessage # Added ToolCallSummaryMessage
 
 from autogen_core.tools import FunctionTool
-
-def clarifier_stub(content: str) -> None:
-    """No-op placeholder; we’ll catch the callEvent ourselves."""
-    return None
-
-clarify_tool = FunctionTool(
-    name="clarify_query",
-    func=clarifier_stub,
-    description="Ask a plain-language follow-up",
-    strict=True,
-)
+# clarifier_stub and its FunctionTool definition will be replaced by actual_clarifier_tool_func
+# and its FunctionTool definition within the main() function, as it needs access to 'console'.
 
 
+class DebugOpenAIChatCompletionClient(OpenAIChatCompletionClient):
+    async def create(
+        self,
+        messages: Sequence[LLMMessage],
+        *,
+        tools: Optional[List[Any]] = None,
+        cancellation_token: Optional[CancellationToken] = None,
+        json_output: Optional[Type[BaseModel]] = None,
+        **kwargs: Any,
+    ) -> CreateResult:
+        print("\n" + "="*80)
+        print("DEBUG: LLM Messages Payload to model_client.create():")
+        print(f"Number of messages: {len(messages)}")
+        
+        # Use the 'tools' argument as it's passed to this create method
+        tools_arg = tools # The argument received by this DebugClient.create method
+        
+        print(f"Tools argument received by DebugClient.create: {'Yes, content:' + str(tools_arg) if tools_arg is not None else 'No (None)'}")
+        if tools_arg: # Check if tools_arg is not None and not empty
+            print(f"  Type of tools_arg: {type(tools_arg)}")
+            if isinstance(tools_arg, list):
+                for tool_idx, tool_def_item in enumerate(tools_arg):
+                    tool_name_to_print = f"Unknown (type: {type(tool_def_item)})"
+                    if hasattr(tool_def_item, 'name') and isinstance(getattr(tool_def_item, 'name'), str): # Covers FunctionTool
+                        tool_name_to_print = getattr(tool_def_item, 'name')
+                    elif isinstance(tool_def_item, dict) and tool_def_item.get("type") == "function":
+                        func_dict = tool_def_item.get("function")
+                        if isinstance(func_dict, dict):
+                            tool_name_to_print = func_dict.get("name", "Name N/A in func dict")
+                    print(f"  Tool {tool_idx}: {tool_name_to_print}")
+            else:
+                print(f"  Tools argument is not a list: {tools_arg}")
+
+
+        print(f"JSON output mode: {'Yes, type: ' + str(json_output) if json_output else 'No'}")
+        print("-" * 80)
+        for i, msg in enumerate(messages):
+            # Determine role for printing
+            role_to_print = "unknown"
+            if isinstance(msg, SystemMessageFromCore):
+                role_to_print = "system"
+            elif hasattr(msg, "role") and msg.role is not None:
+                role_to_print = msg.role
+            
+            print(f"Message {i}: Role: {role_to_print}")
+            print(f"  Content type: {type(msg.content)}")
+            if isinstance(msg.content, str):
+                try:
+                    # Try to pretty print if content is JSON string
+                    parsed_json = json.loads(msg.content)
+                    print("  Content (parsed as JSON):")
+                    print(json.dumps(parsed_json, indent=2))
+                except json.JSONDecodeError:
+                    print("  Content (string):")
+                    print(msg.content)
+            elif isinstance(msg.content, list): # For multimodal or tool messages with list content
+                print("  Content (list of parts):")
+                for part_idx, part in enumerate(msg.content):
+                    print(f"    Part {part_idx}: Type: {type(part)}")
+                    if isinstance(part, dict): # e.g. text part, image_url part
+                         print(f"      {json.dumps(part, indent=2)}")
+                    else: # e.g. FunctionCall in AssistantMessage
+                         print(f"      {part!r}") # Use repr for other types
+            else:
+                print(f"  Content: {msg.content!r}") # Use repr for other types
+
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                print(f"  Tool Calls: {msg.tool_calls!r}")
+            if hasattr(msg, 'tool_call_id') and msg.tool_call_id: # For ToolMessage
+                print(f"  Tool Call ID: {msg.tool_call_id}")
+        print("="*80 + "\n")
+        
+        await asyncio.sleep(0.1) # Ensure print buffer flushes
+
+        try:
+            # If tools is None (e.g. during reflection), pass an empty list to super().create.
+            # This ensures convert_tools receives an iterable.
+            effective_tools_for_super = tools if tools is not None else []
+            return await super().create(
+                messages,
+                tools=effective_tools_for_super,
+                cancellation_token=cancellation_token,
+                json_output=json_output,
+                **kwargs,
+            )
+        except Exception as e:
+            print(f"DEBUG: Error during model_client.create AFTER printing payload: {type(e).__name__} - {e}")
+            raise
 
 # Helper function to resolve environment variable placeholders
 def resolve_env_placeholder(value: str) -> str:
@@ -73,6 +155,19 @@ def load_rich_theme(base_path: Path) -> Theme:
         return Theme(theme_config)
     return Theme({})
 
+def styled_input(prompt_message: str, console: Console) -> str:
+    """
+    Display a styled prompt using Rich console and capture input using prompt_toolkit
+    for proper readline support (cursor movement, history, etc.)
+    """
+    # Extract the text content from Rich markup for plain input prompt
+    import re
+    # Remove Rich markup tags to get plain text
+    plain_prompt = re.sub(r'\[/?[^\]]*\]', '', prompt_message)
+    
+    # Use prompt_toolkit for proper multi-line editing support
+    return prompt(f"{plain_prompt} ").strip()
+
 async def run_search_pipeline(query_team: BaseGroupChat, literature_search_tool: LiteratureSearchTool, original_query: str, console: Console):
     all_dois = set()
     all_refined_queries = []
@@ -80,76 +175,47 @@ async def run_search_pipeline(query_team: BaseGroupChat, literature_search_tool:
     # 2. Call the query_team (GroupChat) to clarify ambiguities and expand the query
     console.print(f"[secondary]Initiating research query with GroupChat:[/secondary] [highlight]'{original_query}'[/highlight]")
     
-    MAX_CLARIFICATION_TURNS = 3
-    clarification_turn_count = 0
     refined_queries_str = ""
     
     try:
+        # Single run call; clarifications will be handled internally by query_refiner using its new tool
         team_result = await query_team.run(task=original_query)
+        console.print(f"[debug]Team run completed. Messages: {team_result.messages}[/debug]")
 
-        while clarification_turn_count < MAX_CLARIFICATION_TURNS:
-            # 1) Did it ask for clarification?
-            stub_events = [
-                m for m in team_result.messages
-                if isinstance(m, ToolCallRequestEvent)
-                and m.content and m.content[0].name == "clarify_query"
-            ]
-            
-            if stub_events:
-                clarification_turn_count += 1
-                fcall = stub_events[-1].content[0]
-                params = json.loads(fcall.arguments)
-                question = params.get("content", "Could you clarify?")
-                answer = console.input(f"{question} ")
-
-                await query_team.reset()
-                team_result = await query_team.run(task=answer)
-                continue # Continue loop for next turn or JSON check
-            else:
-                # If no clarification asked, check for JSON output
-                json_message = None
-                for m in team_result.messages:
-                    if hasattr(m, "content") and isinstance(m.content, str) and m.content.strip().startswith("["):
-                        json_message = m.content
-                        break
-                
-                if json_message:
-                    refined_queries_str = json_message
-                    break # Exit loop if JSON found
-                else:
-                    # If no stub and no JSON, abort loop
-                    console.print("[yellow]Query team did not ask for clarification or provide JSON. Aborting clarification loop.[/yellow]")
-                    break
-
-        # After the loop, try to get the refined queries string
-        if not refined_queries_str and team_result.messages and isinstance(team_result.messages, list) and len(team_result.messages) > 0:
-            last_message = team_result.messages[-1]
-            if hasattr(last_message, 'content'):
-                refined_queries_str = last_message.content
-            else:
-                console.print(f"[red]Warning: Query team returned unexpected message format: {last_message}[/red]")
+        # Extract refined_queries_str from the last message of query_refiner
+        # The query_refiner, with reflect_on_tool_use=True, should output a TextMessage with the JSON.
+        if team_result.messages and isinstance(team_result.messages, list) and len(team_result.messages) > 0:
+            for msg in reversed(team_result.messages):
+                if msg.source == "query_refiner" and (isinstance(msg, TextMessage) or isinstance(msg, ToolCallSummaryMessage)):
+                    if hasattr(msg, "content") and isinstance(msg.content, str):
+                        # Attempt to find a JSON code block
+                        code_block_pattern = re.compile(r"```(?:json|python|text)?\n(.*?)\n```", re.DOTALL)
+                        match = code_block_pattern.search(msg.content)
+                        if match:
+                            extracted_json_content = match.group(1).strip()
+                            # Verify if this extracted content is indeed a JSON array
+                            if extracted_json_content.startswith("[") and extracted_json_content.endswith("]"):
+                                refined_queries_str = extracted_json_content # Store only the JSON part
+                                console.print(f"[debug]refined_queries_str set from {msg.type} by {msg.source} (extracted from code block): {refined_queries_str}[/debug]")
+                                break
+                        elif msg.content.strip().startswith("[") and msg.content.strip().endswith("]"): 
+                            # Fallback for plain JSON string without markdown fences
+                            refined_queries_str = msg.content.strip()
+                            console.print(f"[debug]refined_queries_str set from {msg.type} by {msg.source} (plain JSON string): {refined_queries_str}[/debug]")
+                            break
         
+        if not refined_queries_str:
+            console.print(f"[red]Warning: Could not find valid JSON refined_queries_str from query_refiner in team_result.messages. Last relevant message from query_refiner: {next((m for m in reversed(team_result.messages) if m.source == 'query_refiner'), 'No message from query_refiner')}[/red]")
+
+        console.print(f"[debug]Attempting to parse refined_queries_str: {refined_queries_str}[/debug]")
         refined_query_objects = []
         if refined_queries_str:
             # Attempt to parse the refined queries.
+            # The refined_queries_str should now be just the JSON array string.
             # The agent is expected to return a JSON array of objects with 'pubmed_query' and 'general_query' fields.
             try:
-                # Extract content from markdown code blocks first
-                code_block_pattern = re.compile(r"```(?:json|python|text)?\n(.*?)\n```", re.DOTALL)
-                extracted_json_str = ""
-                for block in code_block_pattern.findall(refined_queries_str):
-                    try:
-                        # Try to load as JSON. If successful, this is our block.
-                        json.loads(block)
-                        extracted_json_str = block
-                        break
-                    except json.JSONDecodeError:
-                        continue
-
-                if not extracted_json_str:
-                    raise ValueError("No valid JSON code block found in agent's response.")
-
-                refined_query_objects = json.loads(extracted_json_str)
+                # refined_queries_str is already the extracted JSON string or plain JSON
+                refined_query_objects = json.loads(refined_queries_str)
                 if not isinstance(refined_query_objects, list):
                     raise ValueError("Agent did not return a JSON array.")
                 
@@ -198,7 +264,7 @@ async def run_search_pipeline(query_team: BaseGroupChat, literature_search_tool:
             
             console.print(f"[secondary]Calling search_literature with:[/secondary]")
             console.print(f"  [highlight]PubMed Query: '{pubmed_q}'[/highlight]")
-            console.print(f"  [highlight]General Query: '{general_q}'[/highlight]")
+            console.print(f"  [highlight]General Query: '{general_q}'[/highlight]") # Fixed variable name here
             
             search_output = await literature_search_tool.run(
                 args=SearchLiteratureParams(pubmed_query=pubmed_q, general_query=general_q),
@@ -231,9 +297,9 @@ async def run_search_pipeline(query_team: BaseGroupChat, literature_search_tool:
     
     return output_data
 
-def main():
+async def main():
     """
-    Main function to load configurations, instantiate agents, and run the search pipeline.
+    Main asynchronous function to load configurations, instantiate agents, and run the search pipeline.
     """
     parser = argparse.ArgumentParser(description="Run the literature search pipeline.")
     args = parser.parse_args()
@@ -249,14 +315,11 @@ def main():
     console = Console(theme=custom_theme)
 
     # 1. Load .env, config/agents.yaml & config/settings.yaml
-    console.print(f"[primary]Attempting to load .env file from: {env_file_path}[/primary]")
     if env_file_path.exists():
-        console.print(f"[primary].env file found at: {env_file_path}[/primary]")
         dotenv_loaded = load_dotenv(dotenv_path=env_file_path, override=True)
-        console.print(f"[primary]load_dotenv result: {dotenv_loaded}[/primary]")
     else:
-        console.print(f"[yellow].env file NOT found at: {env_file_path}[/yellow]")
-        dotenv_loaded = False
+        pass # console.print(f"[yellow].env file NOT found at: {env_file_path}[/yellow]")
+        # dotenv_loaded = False
 
     if not agents_file_path.exists():
         console.print(f"[red]Error: Agents configuration file not found at {agents_file_path}[/red]")
@@ -267,9 +330,8 @@ def main():
 
     with open(agents_file_path, "r") as f:
         agents_config_list = yaml.safe_load(f)
-        console.print(f"[primary]Agents loaded (raw from YAML): {agents_config_list}[/primary]")
-
-
+        # console.print(f"[primary]Agents loaded (raw from YAML): {agents_config_list}[/primary]")
+        
     with open(settings_file_path, "r") as f:
         settings_config = yaml.safe_load(f)
 
@@ -280,7 +342,7 @@ def main():
     if agents_config_list:
         for agent_config_original in agents_config_list:
             if not isinstance(agent_config_original, dict) or "name" not in agent_config_original:
-                console.print(f"[yellow]Skipping invalid agent configuration: {agent_config_original}[/yellow]")
+                # console.print(f"[yellow]Skipping invalid agent configuration: {agent_config_original}[/yellow]")
                 continue
 
             agent_name = agent_config_original.get('name', 'Unknown')
@@ -305,8 +367,8 @@ def main():
 
                 # Instantiate OpenAIChatCompletionClient
                 try:
-                    model_client_instance = OpenAIChatCompletionClient(**model_client_config_dict)
-                    console.print(f"  [primary]Manually instantiated model_client for {agent_name}.[/primary]")
+                    model_client_instance = DebugOpenAIChatCompletionClient(**model_client_config_dict) # Use Debug Client
+                    # console.print(f"  [primary]Manually instantiated model_client for {agent_name}.[/primary]")
                 except Exception as e:
                     console.print(f"[red]Error instantiating model_client for {agent_name}: {e}[/red]")
                     continue # Skip this agent if model_client fails
@@ -319,14 +381,30 @@ def main():
                 if agent_name == "user_proxy":
                     component = UserProxyAgent(**filtered_agent_config_params)
                 elif agent_name == "query_refiner":
+                    # Define the actual clarifier tool function here, so it has access to 'console'
+                    async def actual_clarifier_tool_func(content: str) -> str:
+                        # 'content' will be the question from the query_refiner's tool call
+                        loop = asyncio.get_event_loop()
+                        # 'console' is the Rich Console instance from the outer scope (main)
+                        answer = await loop.run_in_executor(None, styled_input, f"{content}", console)
+                        console.print(f"[debug]User answer via actual_clarifier_tool_func: {answer}[/debug]")
+                        return answer
+
+                    clarify_tool_for_agent = FunctionTool(
+                        name="clarify_query", # Must match the name used in query_refiner's prompts/system_message
+                        func=actual_clarifier_tool_func,
+                        description="Ask a plain-language follow-up to the user to clarify their query. The 'content' parameter should be the question you want to ask the user.",
+                        strict=True, 
+                    )
+
                     component = AssistantAgent(
                         name="query_refiner",
                         model_client=model_client_instance,
-                        tools=[clarify_tool],            # our stub
+                        tools=[clarify_tool_for_agent], # Use the new tool
                         description=agent_config_params.get("description"),
                         system_message=agent_config_params.get("system_message"),
-                        reflect_on_tool_use=False,
-                        tool_call_summary_format="{result}",
+                        reflect_on_tool_use=True, # IMPORTANT: Set to True for reflection
+                        tool_call_summary_format="{result}", # This will be used by the reflection step if needed
                     )
                     
                 elif agent_name == "query_team":
@@ -358,7 +436,8 @@ def main():
                 elif agent_name == "search_literature":
                     component = LiteratureSearchTool(**filtered_agent_config_params) # Also filter for tools
                 else:
-                    console.print(f"[yellow]Warning: Unhandled component type for {agent_name}. Skipping.[/yellow]")
+                    # console.print(f"[yellow]Warning: Unhandled component type for {agent_name}. Skipping.[/yellow]")
+                    pass
 
                 if component:
                     agents[agent_name] = component
@@ -373,9 +452,9 @@ def main():
             console.print("[red]query_refiner never loaded; check your instantiation logic[/red]")
         else:
             # The list of Handoff configs lives in a private `_handoffs` attr:
-            console.print(f"[debug] query_refiner._handoffs = {refiner._handoffs!r}")
+            pass # console.print(f"[debug] query_refiner._handoffs = {refiner._handoffs!r}")
             # And any FunctionTools or other tools show up under `_tool_configs`:
-            console.print(f"[debug] query_refiner._tool_configs = {getattr(refiner, '_tool_configs', None)!r}")
+            pass # console.print(f"[debug] query_refiner._tool_configs = {getattr(refiner, '_tool_configs', None)!r}")
 
             
     else:
@@ -394,13 +473,15 @@ def main():
     console.print("[bold blue]──────────────────────────────────────────────────────────────[/bold blue]\n")
 
     # 1. Read a free-text search query from the user.
-    original_query = console.input("[primary]What would you like to research?[/primary] ")
+    # Run styled_input in a separate thread to avoid blocking the asyncio event loop
+    loop = asyncio.get_event_loop()
+    original_query = await loop.run_in_executor(None, styled_input, "[primary]What would you like to research?[/primary]", console)
     if not original_query:
-        console.print("[yellow]No query entered. Exiting.[/yellow]")
+        # console.print("[yellow]No query entered. Exiting.[/yellow]")
         return
 
-    asyncio.run(run_search_pipeline(query_team, literature_search_tool, original_query, console))
+    await run_search_pipeline(query_team, literature_search_tool, original_query, console)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

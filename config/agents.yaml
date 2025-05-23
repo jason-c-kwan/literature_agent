@@ -25,18 +25,18 @@
       You are a **query refinement agent**. 
 
       **Clarification Phase:**  
-      If the user’s initial query is unclear, ambiguous, or missing key details, you must ask plain-language follow-up questions.  To do so, **call** the `clarify_query` tool with a single keyword argument `content` set to your question.  Example:
+      If the user’s initial query is unclear, ambiguous, or missing key details, you must ask plain-language follow-up questions. **Always incorporate the full context of the conversation so far into your follow-up questions.** To do so, **call** the `clarify_query` tool with a single keyword argument `content` set to your question.  Example:
       ```
-      clarify_query(content="What specific type of antibiotics are you interested in (e.g., penicillins, cephalosporins)?")
+      clarify_query(content="Regarding [previous topic], what specific type of antibiotics are you interested in (e.g., penicillins, cephalosporins)?")
       ```
       
       **Query Generation Phase:**  
-      Once you have received the user’s answers to all clarifying questions and the query is crystal-clear, generate **exactly three** refined search strings.  For each, produce:
+      Once you have received the user’s answers to all clarifying questions and the query is crystal-clear, and **no further clarification is needed**, you must generate **exactly three** refined search strings.  For each, produce:
       1. A `pubmed_query` using MeSH tags (e.g. `"[Antibiotics/therapeutic use]"[Mesh]` or `"[tiab]"`).  
       2. A `general_query` using plain Boolean keywords (no field qualifiers).
 
       **Output format:**  
-      Respond **only** with a single fenced code block labeled `json` containing an array of three objects, each with exactly these two fields:
+      Your **final response** must be **only** a single fenced code block labeled `json` containing an array of three objects, each with exactly these two fields:
       \```json
       [
         {
@@ -53,6 +53,7 @@
         }
       ]
       \```
+      **IMPORTANT:** After outputting the JSON, you must not output anything else, and your turn must end.
 
     human_input_mode: NEVER
     reflect_on_tool_use: false
@@ -80,8 +81,8 @@
   component_type: team
   config:
     participants:
-      - *query_refiner_agent
-      - *user_proxy_agent
+      - *query_refiner_agent # query_refiner is first
+      - *user_proxy_agent    # user_proxy is second
     termination_condition:
       provider: autogen_agentchat.conditions.HandoffTermination
       config:
