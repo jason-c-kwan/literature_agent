@@ -323,11 +323,23 @@ async def run_search_pipeline(query_team: BaseGroupChat, literature_search_tool:
                 if 'relevance_score' not in article:
                     article['relevance_score'] = "N/A (Triage Error)"
 
+    # NEW: Filter triaged articles by relevance score
+    highly_relevant_articles = []
+    if triaged_articles_with_scores:
+        console.print(f"[secondary]Filtering triaged articles for relevance scores 4 or 5...[/secondary]")
+        for article in triaged_articles_with_scores:
+            score = article.get('relevance_score')
+            # Ensure score is an integer and is 4 or 5
+            if isinstance(score, int) and score in [4, 5]:
+                highly_relevant_articles.append(article)
+        console.print(f"[info]Found {len(highly_relevant_articles)} articles with relevance score 4 or 5 out of {len(triaged_articles_with_scores)} triaged articles.[/info]")
+    else:
+        console.print(f"[secondary]No triaged articles to filter.[/secondary]")
 
     output_data = {
         "query": original_query,
         "refined_queries": all_refined_queries,
-        "triaged_articles": triaged_articles_with_scores
+        "triaged_articles": highly_relevant_articles # MODIFIED: Use filtered list
     }
     
     # Create workspace directory if it doesn't exist
@@ -339,7 +351,8 @@ async def run_search_pipeline(query_team: BaseGroupChat, literature_search_tool:
         json.dump(output_data, f, indent=2)
     
     console.print(f"[primary]Search and triage pipeline completed. Results saved to {output_file_path}[/primary]")
-    console.print(f"[secondary]Total unique articles processed and saved:[/secondary] [highlight]{len(triaged_articles_with_scores)}[/highlight]")
+    # MODIFIED: Update count and message
+    console.print(f"[secondary]Total unique articles (relevance 4 or 5) saved:[/secondary] [highlight]{len(highly_relevant_articles)}[/highlight]")
     
     return output_data
 
