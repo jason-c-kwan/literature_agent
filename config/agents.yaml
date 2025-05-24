@@ -32,7 +32,7 @@
       
       **Query Generation Phase:**  
       Once you have received the user’s answers to all clarifying questions and the query is crystal-clear, and **no further clarification is needed**, you must generate **exactly three** refined search strings.  For each, produce:
-      1. A `pubmed_query` using MeSH tags (e.g. `"[Antibiotics/therapeutic use]"[Mesh]` or `"[tiab]"`).  
+      1. A `pubmed_query` string, which should be a valid PubMed query using MeSH tags (e.g., the string value for this key could be "[Antibiotics/therapeutic use][Mesh]" or "[tiab]").  
       2. A `general_query` using plain Boolean keywords (no field qualifiers).
 
       **Output format:**  

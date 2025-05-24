@@ -34,6 +34,7 @@ from autogen_agentchat.messages import ToolCallRequestEvent, TextMessage, ToolCa
 from autogen_core.tools import FunctionTool
 # clarifier_stub and its FunctionTool definition will be replaced by actual_clarifier_tool_func
 # and its FunctionTool definition within the main() function, as it needs access to 'console'.
+from tools.triage import TriageAgent # Added for TriageAgent type hint
 
 
 class DebugOpenAIChatCompletionClient(OpenAIChatCompletionClient):
@@ -168,92 +169,91 @@ def styled_input(prompt_message: str, console: Console) -> str:
     # Use prompt_toolkit for proper multi-line editing support
     return prompt(f"{plain_prompt} ").strip()
 
-async def run_search_pipeline(query_team: BaseGroupChat, literature_search_tool: LiteratureSearchTool, original_query: str, console: Console):
-    all_dois = set()
+async def run_search_pipeline(query_team: BaseGroupChat, literature_search_tool: LiteratureSearchTool, triage_agent: TriageAgent, original_query: str, console: Console):
+    all_articles_data = []
+    processed_dois_for_articles = set()
     all_refined_queries = []
-
-    # 2. Call the query_team (GroupChat) to clarify ambiguities and expand the query
+    
+    MAX_REFINEMENT_ATTEMPTS = 3
+    refinement_attempts = 0
+    refined_query_objects = []
+    
     console.print(f"[secondary]Initiating research query with GroupChat:[/secondary] [highlight]'{original_query}'[/highlight]")
     
-    refined_queries_str = ""
-    
-    try:
-        # Single run call; clarifications will be handled internally by query_refiner using its new tool
-        team_result = await query_team.run(task=original_query)
-        console.print(f"[debug]Team run completed. Messages: {team_result.messages}[/debug]")
+    try: # OUTER TRY BLOCK
+        # Query Refinement Loop
+        while refinement_attempts < MAX_REFINEMENT_ATTEMPTS:
+            refinement_attempts += 1
+            console.print(f"[info]Query refinement attempt {refinement_attempts}/{MAX_REFINEMENT_ATTEMPTS}...[/info]")
+            
+            task_for_refiner = original_query
+            if refinement_attempts > 1 and 'last_refined_queries_str' in locals() and last_refined_queries_str:
+                task_for_refiner = (
+                    f"The previous attempt to generate refined queries resulted in a JSON parsing error. "
+                    f"The problematic output was: \n```json\n{last_refined_queries_str}\n```\n"
+                    f"Please ensure your output is a valid JSON array of three objects, each with 'pubmed_query' and 'general_query' string fields. "
+                    f"The original query was: '{original_query}'"
+                )
 
-        # Extract refined_queries_str from the last message of query_refiner
-        # The query_refiner, with reflect_on_tool_use=True, should output a TextMessage with the JSON.
-        if team_result.messages and isinstance(team_result.messages, list) and len(team_result.messages) > 0:
-            for msg in reversed(team_result.messages):
-                if msg.source == "query_refiner" and (isinstance(msg, TextMessage) or isinstance(msg, ToolCallSummaryMessage)):
-                    if hasattr(msg, "content") and isinstance(msg.content, str):
-                        # Attempt to find a JSON code block
-                        code_block_pattern = re.compile(r"```(?:json|python|text)?\n(.*?)\n```", re.DOTALL)
-                        match = code_block_pattern.search(msg.content)
-                        if match:
-                            extracted_json_content = match.group(1).strip()
-                            # Verify if this extracted content is indeed a JSON array
-                            if extracted_json_content.startswith("[") and extracted_json_content.endswith("]"):
-                                refined_queries_str = extracted_json_content # Store only the JSON part
-                                console.print(f"[debug]refined_queries_str set from {msg.type} by {msg.source} (extracted from code block): {refined_queries_str}[/debug]")
-                                break
-                        elif msg.content.strip().startswith("[") and msg.content.strip().endswith("]"): 
-                            # Fallback for plain JSON string without markdown fences
-                            refined_queries_str = msg.content.strip()
-                            console.print(f"[debug]refined_queries_str set from {msg.type} by {msg.source} (plain JSON string): {refined_queries_str}[/debug]")
-                            break
-        
-        if not refined_queries_str:
-            console.print(f"[red]Warning: Could not find valid JSON refined_queries_str from query_refiner in team_result.messages. Last relevant message from query_refiner: {next((m for m in reversed(team_result.messages) if m.source == 'query_refiner'), 'No message from query_refiner')}[/red]")
+            refined_queries_str = "" 
+            try: # INNER TRY for team_result and parsing
+                team_result = await query_team.run(task=task_for_refiner)
+                console.print(f"[debug]Team run completed (attempt {refinement_attempts}). Messages: {team_result.messages}[/debug]")
 
-        console.print(f"[debug]Attempting to parse refined_queries_str: {refined_queries_str}[/debug]")
-        refined_query_objects = []
-        if refined_queries_str:
-            # Attempt to parse the refined queries.
-            # The refined_queries_str should now be just the JSON array string.
-            # The agent is expected to return a JSON array of objects with 'pubmed_query' and 'general_query' fields.
-            try:
-                # refined_queries_str is already the extracted JSON string or plain JSON
-                refined_query_objects = json.loads(refined_queries_str)
-                if not isinstance(refined_query_objects, list):
+                if team_result.messages and isinstance(team_result.messages, list) and len(team_result.messages) > 0:
+                    for msg in reversed(team_result.messages):
+                        if msg.source == "query_refiner" and (isinstance(msg, TextMessage) or isinstance(msg, ToolCallSummaryMessage)):
+                            if hasattr(msg, "content") and isinstance(msg.content, str):
+                                code_block_pattern = re.compile(r"```(?:json|python|text)?\n(.*?)\n```", re.DOTALL)
+                                match = code_block_pattern.search(msg.content)
+                                if match:
+                                    refined_queries_str = match.group(1).strip()
+                                    break
+                                elif msg.content.strip().startswith("[") and msg.content.strip().endswith("]"):
+                                    refined_queries_str = msg.content.strip()
+                                    break
+                
+                last_refined_queries_str = refined_queries_str
+
+                if not refined_queries_str:
+                    console.print(f"[red]Query refiner did not produce a parsable output string on attempt {refinement_attempts}.[/red]")
+                    if refinement_attempts == MAX_REFINEMENT_ATTEMPTS:
+                        console.print(f"[red]Max refinement attempts reached. No output from query refiner.[/red]")
+                    continue 
+
+                console.print(f"[debug]Attempting to parse refined_queries_str (attempt {refinement_attempts}): {refined_queries_str}[/debug]")
+                
+                parsed_json = json.loads(refined_queries_str)
+                if not isinstance(parsed_json, list):
                     raise ValueError("Agent did not return a JSON array.")
-                
-                # Ensure each object has 'pubmed_query' and 'general_query'
-                for obj in refined_query_objects:
-                    if not isinstance(obj, dict) or "pubmed_query" not in obj or "general_query" not in obj:
-                        raise ValueError("Each object in the JSON array must have 'pubmed_query' and 'general_query' fields.")
+                if not all(isinstance(obj, dict) and "pubmed_query" in obj and "general_query" in obj for obj in parsed_json):
+                    raise ValueError("Each object in the JSON array must have 'pubmed_query' and 'general_query' fields.")
+                if len(parsed_json) != 3:
+                     console.print(f"[yellow]Warning: Expected 3 refined query objects, but got {len(parsed_json)} on attempt {refinement_attempts}. Using as is.[/yellow]")
 
-                # The query_refiner is specified to return exactly 3 JSON objects.
-                if len(refined_query_objects) != 3:
-                    console.print(f"[yellow]Warning: Expected 3 refined query objects, but got {len(refined_query_objects)}.[/yellow]")
+                refined_query_objects = parsed_json
+                console.print(f"[success]Successfully parsed refined queries on attempt {refinement_attempts}.[/success]")
+                break 
                 
-            except (json.JSONDecodeError, ValueError) as e:
-                console.print(f"[red]Error parsing Query-RefinerAgent output: {e}. Raw output: {refined_queries_str}[/red]")
-                console.print("[yellow]Attempting fallback parsing (may not be accurate).[/yellow]")
-                # Fallback parsing if JSON parsing fails (less robust, but prevents crash)
+            except (json.JSONDecodeError, ValueError) as e_parse:
+                console.print(f"[red]Error parsing Query-RefinerAgent output on attempt {refinement_attempts}: {e_parse}. Raw output: {refined_queries_str}[/red]")
+                refined_query_objects = [] 
+                if refinement_attempts == MAX_REFINEMENT_ATTEMPTS:
+                    console.print(f"[red]Max refinement attempts reached. Could not parse refined queries.[/red]")
+            except Exception as e_team_run: 
+                console.print(f"[red]Unexpected error during query_team.run or parsing on attempt {refinement_attempts}: {e_team_run}[/red]")
                 refined_query_objects = []
-                lines = [line.strip() for line in refined_queries_str.split('\n') if line.strip()]
-                for line in lines:
-                    if "pubmed_query" in line or "general_query" in line:
-                        match_pubmed = re.search(r"pubmed_query:\s*['\"](.*?)['\"]", line)
-                        match_general = re.search(r"general_query:\s*['\"](.*?)['\"]", line)
-                        
-                        pq = match_pubmed.group(1) if match_pubmed else ""
-                        gq = match_general.group(1) if match_general else ""
-                        
-                        if pq or gq:
-                            refined_query_objects.append({"pubmed_query": pq, "general_query": gq})
-                
-                if not refined_query_objects:
-                    refined_query_objects.append({"pubmed_query": "", "general_query": ""})
-                # If fallback yields more than 3, take the first 3. If less, use what we have.
-                refined_query_objects = refined_query_objects[:3] 
+                if refinement_attempts == MAX_REFINEMENT_ATTEMPTS:
+                    console.print(f"[red]Max refinement attempts reached due to unexpected error.[/red]")
+        
+        if not refined_query_objects: # If loop finished without break (i.e. all attempts failed)
+            console.print("[yellow]Falling back: Using original query as general query due to refinement failure.[/yellow]")
+            refined_query_objects = [{"pubmed_query": "", "general_query": original_query if original_query else ""}]
 
-        console.print(f"[secondary]Refined Query Objects from Query Team:[/secondary] {refined_query_objects}")
-        all_refined_queries.extend([obj["general_query"] for obj in refined_query_objects])
+        console.print(f"[secondary]Using Refined Query Objects:[/secondary] {refined_query_objects}")
+        all_refined_queries.extend([obj.get("general_query", "") for obj in refined_query_objects])
 
-        # 3. For each refined query object, call the `search_literature` tool
+        # Literature Search Loop (still within the outer try block)
         for j, query_obj in enumerate(refined_query_objects):
             pubmed_q = query_obj.get("pubmed_query", "")
             general_q = query_obj.get("general_query", "")
@@ -264,7 +264,7 @@ async def run_search_pipeline(query_team: BaseGroupChat, literature_search_tool:
             
             console.print(f"[secondary]Calling search_literature with:[/secondary]")
             console.print(f"  [highlight]PubMed Query: '{pubmed_q}'[/highlight]")
-            console.print(f"  [highlight]General Query: '{general_q}'[/highlight]") # Fixed variable name here
+            console.print(f"  [highlight]General Query: '{general_q}'[/highlight]")
             
             search_output = await literature_search_tool.run(
                 args=SearchLiteratureParams(pubmed_query=pubmed_q, general_query=general_q),
@@ -273,27 +273,73 @@ async def run_search_pipeline(query_team: BaseGroupChat, literature_search_tool:
             
             search_results_data = search_output.get("data", [])
             
-            # 4. Extract the DOIs from all results
             for record in search_results_data:
-                if 'doi' in record and record['doi']:
-                    all_dois.add(record['doi'])
-    except Exception as e:
-        console.print(f"[red]Error during query refinement or search: {e}[/red]")
+                # Ensure record is a dictionary and 'doi' exists
+                if isinstance(record, dict):
+                    doi_val = record.get('doi')
+                    # Ensure doi_val is a string and not empty before adding to set and checking membership
+                    if isinstance(doi_val, str) and doi_val.strip():
+                        if doi_val not in processed_dois_for_articles:
+                            all_articles_data.append(record)
+                            processed_dois_for_articles.add(doi_val)
+                    elif doi_val is None: # Handle articles with no DOI (add them if not otherwise identifiable as duplicate)
+                        # This part is tricky without another unique ID. For now, let's assume if DOI is None, we add it.
+                        # A more robust solution might involve checking title/authors if DOI is None.
+                        # However, the current logic relies on DOI for deduplication.
+                        # If we simply add all records with None DOI, we might get duplicates if other sources provide the same article without DOI.
+                        # For now, let's stick to DOI-based deduplication. If DOI is None, it won't be added to processed_dois_for_articles
+                        # and won't be processed by this specific 'if' block for deduplication.
+                        # A simpler approach for now: if it has a DOI, deduplicate. If not, add it.
+                        # This might lead to duplicates if an article appears from two sources, one with DOI and one without.
+                        # The current structure of processed_dois_for_articles is for DOIs.
+                        # Let's refine: only add if DOI is present and unique.
+                        pass # Articles without a valid string DOI won't be added via this DOI-based deduplication.
+                            # This means all_articles_data will only contain articles that had a valid, unique DOI.
+                else:
+                    console.print(f"[yellow]Warning: search_results_data contained a non-dictionary item: {type(record)}[/yellow]")
 
-    unique_dois = sorted(list(all_dois))
+    except Exception as e: # OUTER EXCEPT, correctly aligned with the OUTER TRY
+        console.print(f"[red]Error during the main query refinement or search process: {e}[/red]")
+        # Ensure all_articles_data is initialized if an error occurs before search loop
+        # or if we want to proceed with empty/partially filled data for triage.
+        # For now, if an error happens here, triage will likely operate on an empty list.
+
+    # 5. Triage all collected articles
+    triaged_articles_with_scores = []
+    if all_articles_data:
+        console.print(f"[secondary]Triaging {len(all_articles_data)} unique articles...[/secondary]")
+        try:
+            triaged_articles_with_scores = await triage_agent.triage_articles_async(
+                articles=all_articles_data,
+                user_query=original_query
+            )
+            console.print(f"[secondary]Triage complete. {len(triaged_articles_with_scores)} articles passed filters and were scored.[/secondary]")
+        except Exception as e:
+            console.print(f"[red]Error during article triage: {e}[/red]")
+            # Fallback to using all_articles_data if triage fails, but without scores
+            triaged_articles_with_scores = all_articles_data 
+            # Add a note that scores are missing if triage failed
+            for article in triaged_articles_with_scores:
+                if 'relevance_score' not in article:
+                    article['relevance_score'] = "N/A (Triage Error)"
+
 
     output_data = {
         "query": original_query,
         "refined_queries": all_refined_queries,
-        "dois": unique_dois
+        "triaged_articles": triaged_articles_with_scores
     }
     
-    output_file_path = Path("dois.json")
+    # Create workspace directory if it doesn't exist
+    workspace_dir = Path("workspace")
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    output_file_path = workspace_dir / "triage_results.json"
+
     with open(output_file_path, "w") as f:
         json.dump(output_data, f, indent=2)
     
-    console.print(f"[primary]Search pipeline completed. Results saved to {output_file_path}[/primary]")
-    console.print(f"[secondary]Total unique DOIs found:[/secondary] [highlight]{len(unique_dois)}[/highlight]")
+    console.print(f"[primary]Search and triage pipeline completed. Results saved to {output_file_path}[/primary]")
+    console.print(f"[secondary]Total unique articles processed and saved:[/secondary] [highlight]{len(triaged_articles_with_scores)}[/highlight]")
     
     return output_data
 
@@ -467,6 +513,14 @@ async def main():
         console.print("[red]Error: 'query_team' not found or failed to load.[/red]")
         return
     
+    triage_agent_instance = agents.get("triage")
+    if not triage_agent_instance:
+        console.print("[red]Error: 'triage' agent not found or failed to load.[/red]")
+        return
+    if not isinstance(triage_agent_instance, TriageAgent):
+        console.print(f"[red]Error: 'triage' agent is not an instance of TriageAgent. Got {type(triage_agent_instance)}[/red]")
+        return
+
     # Friendly Rich-styled header
     console.print("\n[bold blue]──────────────────────────────────────────────────────────────[/bold blue]")
     console.print("[bold blue]                 Literature Search Assistant                [/bold blue]")
@@ -480,7 +534,7 @@ async def main():
         # console.print("[yellow]No query entered. Exiting.[/yellow]")
         return
 
-    await run_search_pipeline(query_team, literature_search_tool, original_query, console)
+    await run_search_pipeline(query_team, literature_search_tool, triage_agent_instance, original_query, console)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import os
 import time
 from typing import List, Dict, Any, Optional, TypedDict, Type
 import httpx
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from Bio import Entrez
@@ -51,6 +52,10 @@ class SearchResult(TypedDict, total=True):
     journal: Optional[str]
     url: Optional[str]
     source_api: str
+    # Fields for TriageAgent
+    sjr_percentile: Optional[float]
+    oa_status: Optional[str]
+    citation_count: Optional[int]
 
 
 class AsyncSearchClient:
@@ -115,56 +120,106 @@ class AsyncSearchClient:
                     retmax=str(max_results),
                     usehistory="y"
                 )
-                search_results = Entrez.read(handle)
+                search_results_handle = Entrez.read(handle) # Renamed for clarity
                 handle.close()
-                ids = search_results["IdList"]
+                ids = search_results_handle["IdList"]
 
                 if not ids:
                     return []
 
-                summary_handle = await self._run_sync_in_thread(
-                    Entrez.esummary,
+                # Fetch full records to get abstracts
+                fetch_handle = await self._run_sync_in_thread(
+                    Entrez.efetch,
                     db="pubmed",
-                    id=",".join(ids)
+                    id=ids,
+                    rettype="abstract", # Changed from esummary
+                    retmode="xml"      # XML is easier to parse for abstracts
                 )
-                summaries = Entrez.read(summary_handle)
-                summary_handle.close()
+                articles_xml = Entrez.read(fetch_handle)
+                fetch_handle.close()
 
-                for summary in summaries:
-                    title = summary.get("Title", summary.get("ArticleTitle", "N/A"))
-                    pmid = summary.get("Id", "")
-                    doi = summary.get("DOI", "")
-                    article_ids = summary.get("ArticleIds", {})
-                    if not doi and isinstance(article_ids, dict):
-                        doi = article_ids.get("doi", "")
-
-                    authors = [author['Name'] for author in summary.get("AuthorList", []) if 'Name' in author]
-                    pub_date_str = summary.get("PubDate", "")
-                    year = None
-                    if pub_date_str and isinstance(pub_date_str, str):
-                        parts = pub_date_str.split()
-                        if parts and parts[0].isdigit() and len(parts[0]) == 4:
-                            year = int(parts[0])
-                        elif pub_date_str.isdigit() and len(pub_date_str) == 4:
-                             year = int(pub_date_str)
-
-                    journal = summary.get("Source", "")
+                for article_xml in articles_xml.get('PubmedArticle', []):
+                    medline_citation = article_xml.get('MedlineCitation', {})
+                    article_info = medline_citation.get('Article', {})
                     
+                    pmid = str(medline_citation.get('PMID', ''))
+                    title = article_info.get('ArticleTitle', 'N/A')
+                    
+                    abstract_parts = article_info.get('Abstract', {}).get('AbstractText', [])
+                    abstract = ""
+                    if isinstance(abstract_parts, list):
+                        abstract = "\n".join([part for part in abstract_parts if isinstance(part, str)])
+                    elif isinstance(abstract_parts, str): # Sometimes it's just a string
+                        abstract = abstract_parts
+                    
+                    authors_list = article_info.get('AuthorList', [])
+                    authors = []
+                    if isinstance(authors_list, list):
+                        for author_entry in authors_list:
+                            if isinstance(author_entry, dict):
+                                last_name = author_entry.get('LastName', '')
+                                fore_name = author_entry.get('ForeName', '')
+                                if last_name and fore_name:
+                                    authors.append(f"{fore_name} {last_name}")
+                                elif last_name:
+                                    authors.append(last_name)
+
+                    journal_info = article_info.get('Journal', {})
+                    journal_title = journal_info.get('Title', '')
+                    pub_date_info = journal_info.get('JournalIssue', {}).get('PubDate', {})
+                    year = pub_date_info.get('Year')
+                    if year and isinstance(year, str) and year.isdigit():
+                        year = int(year)
+                    else: # Fallback if Year is not directly available or not a string
+                        medline_date = pub_date_info.get('MedlineDate', '') # e.g., "2023" or "2023 Spring"
+                        if isinstance(medline_date, str) and len(medline_date) >= 4 and medline_date[:4].isdigit():
+                            year = int(medline_date[:4])
+                        else:
+                            year = None
+
+                    doi = None
+                    pmcid = None
+                    article_ids_list = medline_citation.get('Article', {}).get('ELocationID', []) # ELocationID can be a list
+                    if not isinstance(article_ids_list, list): # Handle cases where it might not be a list
+                        article_ids_list = [article_ids_list] if article_ids_list else []
+
+                    for aid in article_ids_list:
+                        if hasattr(aid, 'attributes') and aid.attributes.get('EIdType') == 'doi':
+                            doi = str(aid)
+                        # PMCID might be elsewhere or not consistently in ELocationID
+                    
+                    # Attempt to get DOI and PMCID from PubmedData/ArticleIdList as fallback
+                    pubmed_data = article_xml.get('PubmedData', {})
+                    if pubmed_data:
+                        id_list = pubmed_data.get('ArticleIdList', [])
+                        for article_id_obj in id_list:
+                            if hasattr(article_id_obj, 'attributes'):
+                                id_type = article_id_obj.attributes.get('IdType')
+                                if id_type == 'doi' and not doi:
+                                    doi = str(article_id_obj)
+                                elif id_type == 'pmc':
+                                    pmcid = str(article_id_obj)
+
+
                     result_item: SearchResult = {
                         "title": title,
                         "authors": authors,
-                        "doi": doi if doi else None,
+                        "doi": doi,
                         "pmid": pmid,
+                        "pmcid": pmcid,
                         "year": year,
-                        "journal": journal,
-                        "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else None,
-                        "source_api": "PubMed"
+                        "abstract": abstract if abstract else None,
+                        "journal": journal_title,
+                        "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else (f"https://doi.org/{doi}" if doi else None),
+                        "source_api": "PubMed",
+                        "sjr_percentile": None, # Not available from this PubMed fetch
+                        "oa_status": None,      # Not available from this PubMed fetch
+                        "citation_count": None  # Not available from this PubMed fetch
                     }
                     results.append(result_item)
-
             except Exception as e:
                 print(f"PubMed search error: {e}")
-        end_time = time.time()
+        end_time = time.time() # This should be outside the async with block if it measures the whole thing
         print(f"PubMed search took {end_time - start_time:.2f} seconds")
         return results
 
@@ -207,7 +262,10 @@ class AsyncSearchClient:
                         "abstract": abstract,
                         "journal": journal,
                         "url": url,
-                        "source_api": "EuropePMC"
+                        "source_api": "EuropePMC",
+                        "sjr_percentile": None, # Placeholder
+                        "oa_status": None,      # Placeholder
+                        "citation_count": None  # Placeholder (though EPMC might have it)
                     }
                     results.append(result_item)
             except Exception as e:
@@ -226,50 +284,53 @@ class AsyncSearchClient:
                     self.s2.search_paper,
                     query,
                     limit=max_results,
-                    fields=['title', 'authors', 'year', 'journal', 'abstract', 'url', 'venue', 'publicationDate', 'externalIds']
+                    fields=['title', 'authors', 'year', 'journal', 'abstract', 'url', 'venue', 'publicationDate', 'externalIds', 'citationCount'] # Added citationCount
                 )
                 print(f"Semantic Scholar: Finished search for '{query}'. Processing results...")
                 
-                print("DEBUG: Starting iteration over Semantic Scholar raw_results.")
                 item_count = 0
-                for item in raw_results:
+                for item in raw_results: # raw_results is already a list from s2.search_paper
                     if item_count >= max_results:
-                        print(f"DEBUG: Reached max_results ({max_results}) for Semantic Scholar. Breaking loop.")
                         break
                     item_count += 1
-                    print(f"DEBUG: Processing Semantic Scholar item {item_count}...")
-                    try:
-                        title = item.title
-                        authors = [author['name'] for author in item.authors] if item.authors else []
-                        year = item.year
-                        journal_info = item.journal if item.journal else {}
-                        journal_name = journal_info.get('name') if isinstance(journal_info, dict) else None
-                        
-                        external_ids = item.externalIds if item.externalIds else {}
-                        doi = external_ids.get('DOI')
-                        pmid = external_ids.get('PubMed')
-                        pmcid = external_ids.get('PubMedCentral')
-                        
-                        abstract = item.abstract
-                        url = item.url
+                    
+                    # Use attribute access for Semantic Scholar Paper object
+                    title = item.title if hasattr(item, 'title') else None
+                    authors = [author['name'] for author in item.authors if isinstance(author, dict) and 'name' in author] if hasattr(item, 'authors') and item.authors else []
+                    year = item.year if hasattr(item, 'year') else None
+                    
+                    journal_name = None
+                    if hasattr(item, 'journal') and item.journal:
+                        if isinstance(item.journal, dict):
+                            journal_name = item.journal.get('name')
+                        elif isinstance(item.journal, str): # sometimes it might be just a string
+                            journal_name = item.journal
 
-                        result_item: SearchResult = {
-                            "title": title,
-                            "authors": authors,
-                            "doi": doi,
-                            "pmid": pmid,
-                            "pmcid": pmcid,
-                            "year": year,
-                            "abstract": abstract,
-                            "journal": journal_name,
-                            "url": url,
-                            "source_api": "SemanticScholar"
-                        }
-                        results.append(result_item)
-                        print(f"DEBUG: Successfully processed Semantic Scholar item {item_count}.")
-                    except Exception as item_e:
-                        print(f"Semantic Scholar item processing error for item {item_count}: {item_e}")
-                print(f"DEBUG: Finished iteration over Semantic Scholar raw_results. Processed {item_count} items.")
+                    external_ids = item.externalIds if hasattr(item, 'externalIds') and item.externalIds else {}
+                    doi = external_ids.get('DOI')
+                    pmid = external_ids.get('PubMed')
+                    pmcid = external_ids.get('PubMedCentral')
+                    
+                    abstract = item.abstract if hasattr(item, 'abstract') else None
+                    url = item.url if hasattr(item, 'url') else None
+                    citation_count = item.citationCount if hasattr(item, 'citationCount') else None
+
+                    result_item: SearchResult = {
+                        "title": title,
+                        "authors": authors,
+                        "doi": doi,
+                        "pmid": pmid,
+                        "pmcid": pmcid,
+                        "year": year,
+                        "abstract": abstract,
+                        "journal": journal_name,
+                        "url": url,
+                        "source_api": "SemanticScholar",
+                        "sjr_percentile": None, 
+                        "oa_status": None,      
+                        "citation_count": citation_count
+                    }
+                    results.append(result_item)
             except Exception as e:
                 print(f"Semantic Scholar search error: {e}")
         end_time = time.time()
@@ -315,6 +376,8 @@ class AsyncSearchClient:
                     journal = journal_list[0] if journal_list else None
                     
                     url = item.get("URL")
+                    citation_count = item.get('is-referenced-by-count')
+
 
                     result_item: SearchResult = {
                         "title": title,
@@ -323,7 +386,11 @@ class AsyncSearchClient:
                         "year": year,
                         "journal": journal,
                         "url": url,
-                        "source_api": "CrossRef"
+                        "source_api": "CrossRef",
+                        "sjr_percentile": None, 
+                        "oa_status": None,      
+                        "citation_count": citation_count,
+                        "abstract": None # CrossRef sample doesn't usually provide abstracts
                     }
                     results.append(result_item)
             except Exception as e:
@@ -344,73 +411,89 @@ class AsyncSearchClient:
             tasks.append(self.search_crossref(general_query, max_results_per_source))
 
         all_source_results = await asyncio.gather(*tasks)
-        print("DEBUG: All source searches completed.")
-
+        
         flat_results: List[SearchResult] = []
-        print("DEBUG: Starting to flatten results.")
         for source_result_list in all_source_results:
-            if source_result_list:
+            if source_result_list: # Ensure it's not None
                 flat_results.extend(source_result_list)
-        print(f"DEBUG: flat_results created with {len(flat_results)} items.")
 
         if not flat_results:
-            print("DEBUG: No flat_results, returning empty DataFrame.")
             return pd.DataFrame()
 
         df = pd.DataFrame(flat_results)
-        print(f"DEBUG: DataFrame created with {len(df)} rows.")
 
         if 'doi' in df.columns:
-            print("DEBUG: Normalizing DOIs.")
-            df['doi_norm'] = df['doi'].str.lower().str.replace("https://doi.org/", "", regex=False).str.strip()
+            # Ensure doi_norm is created safely, handling potential all-NA cases for astype(str)
+            df['doi_norm'] = df['doi'].apply(lambda x: str(x).lower().replace("https://doi.org/", "").strip() if pd.notna(x) and x != '' else pd.NA)
         else:
-            df['doi_norm'] = None
-        print("DEBUG: DOI normalization complete.")
+            df['doi_norm'] = pd.NA
+        
+        if 'pmid' in df.columns:
+            df['pmid_str'] = df['pmid'].apply(lambda x: str(x) if pd.notna(x) and x != '' else pd.NA)
+        else:
+            df['pmid_str'] = pd.NA
 
-        df_with_doi_present = df[df['doi_norm'].notna()].copy()
-        df_no_doi_present = df[df['doi_norm'].isna()].copy()
-
-        df_with_doi_deduped = pd.DataFrame(columns=df.columns)
+        # Create boolean masks for filtering
+        # A DOI is considered present if doi_norm is not NA (it won't be an empty string due to above .apply)
+        mask_doi_present = df['doi_norm'].notna()
+        
+        df_with_doi_present = df[mask_doi_present].copy()
+        df_no_doi_present = df[~mask_doi_present].copy()
+        
+        df_with_doi_deduped = pd.DataFrame()
         if not df_with_doi_present.empty:
+            # Prioritize records with abstracts when multiple exist for the same DOI
+            df_with_doi_present['has_abstract'] = df_with_doi_present['abstract'].notna() & (df_with_doi_present['abstract'] != '')
             df_with_doi_present = df_with_doi_present.sort_values(
-                by=['doi_norm', 'year', 'pmid'], 
-                ascending=[True, False, True], 
+                by=['doi_norm', 'has_abstract', 'year', 'pmid_str'], 
+                ascending=[True, False, False, True], # True for has_abstract means non-None first
                 na_position='last'
             )
             df_with_doi_deduped = df_with_doi_present.drop_duplicates(subset=['doi_norm'], keep='first')
+            df_with_doi_deduped = df_with_doi_deduped.drop(columns=['has_abstract'], errors='ignore')
 
-        df_no_doi_deduped = pd.DataFrame(columns=df.columns)
+
+        df_no_doi_deduped = pd.DataFrame()
         if not df_no_doi_present.empty:
+            df_no_doi_present['has_abstract'] = df_no_doi_present['abstract'].notna() & (df_no_doi_present['abstract'] != '')
             df_no_doi_present = df_no_doi_present.sort_values(
-                by=['pmid', 'year'], 
-                ascending=[True, False], 
+                by=['title', 'has_abstract', 'year', 'pmid_str'], # Use title for deduplication if no DOI
+                ascending=[True, False, False, True], 
                 na_position='last'
             )
-            df_no_doi_deduped = df_no_doi_present.drop_duplicates(subset=['pmid'], keep='first')
-        
-        df = pd.concat([df_with_doi_deduped, df_no_doi_deduped])
+            # For no-DOI records, be more conservative:
+            # If pmid_str column exists and has any non-NA values, use pmid_str for deduplication.
+            # Otherwise, use title and year.
+            use_pmid_for_no_doi_dedup = False
+            if 'pmid_str' in df_no_doi_present.columns and df_no_doi_present['pmid_str'].notna().any():
+                use_pmid_for_no_doi_dedup = True
+            
+            subset_for_no_doi = ['pmid_str'] if use_pmid_for_no_doi_dedup else ['title', 'year']
+            df_no_doi_deduped = df_no_doi_present.drop_duplicates(subset=subset_for_no_doi, keep='first')
+            df_no_doi_deduped = df_no_doi_deduped.drop(columns=['has_abstract'], errors='ignore')
 
-        df.drop(columns=['doi_norm'], inplace=True, errors='ignore')
-        if 'pmid' in df.columns: # Only drop pmid_norm if pmid column exists
-            df.drop(columns=['pmid'], inplace=True, errors='ignore') # pmid is not a temporary column, but we don't need it for final output
-
-        df = df.sort_values(by=['source_api', 'year'], ascending=[True, False])
         
+        df_final = pd.concat([df_with_doi_deduped, df_no_doi_deduped], ignore_index=True)
+
+        # Ensure 'doi_norm' and 'pmid_str' are dropped if they exist
+        cols_to_drop = [col for col in ['doi_norm', 'pmid_str'] if col in df_final.columns]
+        if cols_to_drop:
+            df_final.drop(columns=cols_to_drop, inplace=True)
+        
+        # Ensure all expected columns are present
         expected_df_cols = list(SearchResult.__annotations__.keys())
-
         for col in expected_df_cols:
-            if col not in df.columns:
-                df[col] = pd.NA
+            if col not in df_final.columns:
+                df_final[col] = pd.NA # Use pandas NA
         
-        current_cols_ordered = [col for col in expected_df_cols if col in df.columns]
-        other_cols = [col for col in df.columns if col not in current_cols_ordered]
-        df = df[current_cols_ordered + other_cols]
-
-        df = df.reset_index(drop=True)
+        # Reorder columns to match SearchResult TypedDict
+        df_final = df_final[expected_df_cols]
+        
+        df_final = df_final.sort_values(by=['year', 'title'], ascending=[False, True], na_position='last').reset_index(drop=True)
 
         end_time = time.time()
-        print(f"Overall search_all took {end_time - start_time:.2f} seconds")
-        return df
+        print(f"Overall search_all took {end_time - start_time:.2f} seconds. Found {len(df_final)} unique articles.")
+        return df_final
 
 
 class SearchOutput(TypedDict):
@@ -426,20 +509,46 @@ async def _async_search_literature(pubmed_query: str, general_query: str,
     async with AsyncSearchClient() as client:
         df = await client.search_all(pubmed_query, general_query, max_results_per_source)
     
-    # Prepare the 'data' field
     data_records = []
-    for _, row in df.iterrows():
-        record = {
-            "doi": row.get("doi"),
-            "title": row.get("title"),
-            "abstract": row.get("abstract")
-        }
-        data_records.append(record)
+    if not df.empty:
+        for _, row in df.iterrows():
+            record = {}
+            for key, key_type in SearchResult.__annotations__.items():
+                val = row.get(key)
+                
+                is_val_scalar_na = False
+                if isinstance(val, (np.ndarray, pd.Series)):
+                    # If val is an array or Series, it's not a single NA value.
+                    is_val_scalar_na = False 
+                elif isinstance(val, list): # Check for list before pd.isna
+                    # If val is a list, it's not a single NA value.
+                    is_val_scalar_na = False
+                elif pd.isna(val): # Now val is confirmed not to be ndarray, Series, or list
+                    is_val_scalar_na = True
+                # else: val is not NA, and not array/series/list. is_val_scalar_na remains False.
 
-    # Prepare the 'meta' field
+                if is_val_scalar_na:
+                    record[key] = None
+                elif isinstance(val, (list, tuple)):
+                    record[key] = list(val)
+                elif isinstance(val, np.ndarray): # Handle numpy arrays explicitly
+                    record[key] = val.tolist() # Convert numpy array to python list
+                elif isinstance(val, pd.Series): # Handle pandas series explicitly
+                    record[key] = val.tolist() # Convert pandas series to python list
+                elif isinstance(val, (int, float, str, bool)):
+                    record[key] = val
+                else: 
+                    try:
+                        # For other types, try to convert to string.
+                        record[key] = str(val) if val is not None else None
+                    except: 
+                        record[key] = val # Fallback
+            data_records.append(record)
+
     meta_info = {
-        "total_hits": len(df), # Total hits after deduplication and sorting
-        "query": general_query,
+        "total_hits": len(data_records), 
+        "query_pubmed": pubmed_query,
+        "query_general": general_query,
         "timestamp": pd.Timestamp.now(tz='UTC').isoformat()
     }
 
@@ -470,8 +579,11 @@ def search_literature(pubmed_query: str, general_query: str,
     if loop and loop.is_running():
         import nest_asyncio
         nest_asyncio.apply()
-        task = loop.create_task(_async_search_literature(pubmed_query, general_query, max_results_per_source))
-        return loop.run_until_complete(task)
+        # Ensure the task is awaited if called from an already running loop context
+        # This part might need adjustment based on how it's integrated into a larger async app
+        future = asyncio.ensure_future(_async_search_literature(pubmed_query, general_query, max_results_per_source))
+        return loop.run_until_complete(future) # This might be problematic if loop is already run_until_complete
+                                              # Consider returning the future/task for the caller to await if in async context
     else:
         return asyncio.run(_async_search_literature(pubmed_query, general_query, max_results_per_source))
 
@@ -484,7 +596,7 @@ class LiteratureSearchToolInstanceConfig(BaseModel):
     pass
 
 class LiteratureSearchTool(
-    BaseTool[SearchLiteratureParams, SearchOutput], # Changed return type here
+    BaseTool[SearchLiteratureParams, SearchOutput], 
     Component[LiteratureSearchToolInstanceConfig]
 ):
     component_config_schema: Type[LiteratureSearchToolInstanceConfig] = LiteratureSearchToolInstanceConfig
@@ -492,7 +604,7 @@ class LiteratureSearchTool(
     def __init__(self):
         super().__init__(
             args_type=SearchLiteratureParams,
-            return_type=SearchOutput, # Changed return type here
+            return_type=SearchOutput, 
             name="search_literature",
             description="High-throughput literature search across PubMed, Europe PMC, Semantic Scholar and Crossref."
         )
@@ -505,17 +617,27 @@ class LiteratureSearchTool(
         return LiteratureSearchToolInstanceConfig()
 
     async def run(self, args: SearchLiteratureParams, cancellation_token: Any) -> SearchOutput:
-        return search_literature(args.pubmed_query, args.general_query, args.max_results_per_source)
+        # The search_literature function is synchronous, but this tool's run method is async.
+        # We need to run the synchronous search_literature in a thread to avoid blocking the event loop.
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, 
+            search_literature, 
+            args.pubmed_query, 
+            args.general_query, 
+            args.max_results_per_source
+        )
 
 __all__ = ["search_literature", "LiteratureSearchTool", "SearchLiteratureParams"]
 
 if __name__ == "__main__":
-    import sys, rich
+    import sys
+    import rich 
+    import argparse 
+
     if os.name == 'nt':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
-    # Example usage for testing:
-    # python -m tools.search --pubmed "CRISPR[Mesh]" --general "CRISPR gene editing"
     parser = argparse.ArgumentParser(description="Test the literature search tool.")
     parser.add_argument("--pubmed", type=str, default="metagenomics[Mesh]", help="PubMed/EuropePMC query.")
     parser.add_argument("--general", type=str, default="metagenomics", help="General query for other APIs.")
@@ -524,5 +646,12 @@ if __name__ == "__main__":
 
     print(f"Searching PubMed/EuropePMC for: {args.pubmed}")
     print(f"Searching general APIs for: {args.general}")
-    df = search_literature(args.pubmed, args.general, args.max_results)
-    rich.print(df.head())
+    
+    # search_literature is synchronous, so we call it directly
+    search_output_dict = search_literature(args.pubmed, args.general, args.max_results)
+    
+    if search_output_dict and search_output_dict.get('data'):
+        df = pd.DataFrame(search_output_dict['data'])
+        rich.print(df.head())
+    else:
+        rich.print("[bold red]No data returned from search_literature.[/bold red]")

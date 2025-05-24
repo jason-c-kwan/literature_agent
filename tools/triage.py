@@ -121,7 +121,8 @@ class TriageAgent(AssistantAgent):
             # Open Access Filter
             oa_status = article.get('oa_status')
             accepted_oa_statuses = self.oa_statuses_accepted if isinstance(self.oa_statuses_accepted, list) else []
-            if oa_status not in accepted_oa_statuses:
+            # Only apply filter if oa_status is present and not in accepted list. If oa_status is None, article passes this filter.
+            if oa_status is not None and oa_status not in accepted_oa_statuses:
                 continue
 
             # Age-Normalized Citation Count Filter
