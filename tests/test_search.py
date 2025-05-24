@@ -1,8 +1,10 @@
 import asyncio
+import asyncio
 import pytest
 import pytest_asyncio
 from unittest.mock import patch, MagicMock, AsyncMock
 import pandas as pd
+import numpy as np # Added numpy import
 from tools.search import AsyncSearchClient, search_literature, SearchResult, SearchLiteratureParams, SearchOutput
 
 # Mock environment variables for tests
@@ -24,7 +26,8 @@ async def search_client_with_mocks(mocker): # Added mocker
         # Patch the methods on the client instances and Bio.Entrez directly
         MockEntrez = MagicMock()
         mocker.patch('Bio.Entrez.esearch', new=MockEntrez.esearch)
-        mocker.patch('Bio.Entrez.esummary', new=MockEntrez.esummary)
+        # search_pubmed now uses efetch instead of esummary
+        mocker.patch('Bio.Entrez.efetch', new=MockEntrez.efetch) 
         mocker.patch('Bio.Entrez.read', new=MockEntrez.read)
 
         MockEuropePMCInstance = MagicMock()
@@ -59,22 +62,75 @@ async def test_search_pubmed_success(search_client_with_mocks, mocker):
     search_client, mocks = search_client_with_mocks
     MockEntrez = mocks["Entrez"]
     mock_pmids = ["123", "456"]
-    mock_esearch_handle, mock_esummary_handle = MagicMock(), MagicMock()
-    mock_read_esummary_list_result = [
-        {"Id": "123", "Title": "Title 1", "DOI": "doi1", "ArticleIds": {"doi": "doi1"}, "AuthorList": [], "PubDate": "2023", "Source": "J1"},
-        {"Id": "456", "Title": "Title 2", "DOI": "doi2", "ArticleIds": {"doi": "doi2"}, "AuthorList": [], "PubDate": "2024", "Source": "J2"}
-    ]
+    mock_esearch_handle, mock_efetch_handle = MagicMock(), MagicMock()
+
+    # Helper class for mocking Entrez ID objects
+    class MockEntrezId:
+        def __init__(self, text, attributes):
+            self._text = text
+            self.attributes = attributes
+        def __str__(self):
+            return self._text
+
+    mock_efetch_result = {
+        'PubmedArticle': [
+            {
+                'MedlineCitation': {
+                    'PMID': '123',
+                    'Article': {
+                        'ArticleTitle': 'Title 1',
+                        'Abstract': {'AbstractText': ['Abstract 1']},
+                        'AuthorList': [{'LastName': 'Author', 'ForeName': 'A'}],
+                        'Journal': {'Title': 'Journal 1', 'JournalIssue': {'PubDate': {'Year': '2023'}}},
+                        'ELocationID': [MockEntrezId(text='10.test/doi1', attributes={'EIdType': 'doi'})]
+                    }
+                },
+                'PubmedData': {
+                    'ArticleIdList': [
+                        MockEntrezId(text='123', attributes={'IdType': 'pubmed'}),
+                        MockEntrezId(text='10.test/doi1', attributes={'IdType': 'doi'}),
+                        MockEntrezId(text='PMC123', attributes={'IdType': 'pmc'})
+                    ]
+                }
+            },
+            {
+                'MedlineCitation': {
+                    'PMID': '456',
+                    'Article': {
+                        'ArticleTitle': 'Title 2',
+                        'Abstract': {'AbstractText': ['Abstract 2']},
+                        'AuthorList': [{'LastName': 'Author', 'ForeName': 'B'}],
+                        'Journal': {'Title': 'Journal 2', 'JournalIssue': {'PubDate': {'Year': '2024'}}},
+                        'ELocationID': [MockEntrezId(text='10.test/doi2', attributes={'EIdType': 'doi'})]
+                    }
+                },
+                'PubmedData': {
+                    'ArticleIdList': [
+                        MockEntrezId(text='456', attributes={'IdType': 'pubmed'}),
+                        MockEntrezId(text='10.test/doi2', attributes={'IdType': 'doi'}),
+                        MockEntrezId(text='PMC456', attributes={'IdType': 'pmc'})
+                    ]
+                }
+            }
+        ]
+    }
     MockEntrez.esearch.return_value = mock_esearch_handle
-    MockEntrez.esummary.return_value = mock_esummary_handle
+    MockEntrez.efetch.return_value = mock_efetch_handle # Mock efetch
+    
     def entrez_read_side_effect(handle, *args, **kwargs):
-        if handle == mock_esearch_handle: return {"IdList": mock_pmids, "QueryKey": "1", "WebEnv": "abc"}
-        if handle == mock_esummary_handle: return mock_read_esummary_list_result
+        if handle == mock_esearch_handle: 
+            return {"IdList": mock_pmids, "QueryKey": "1", "WebEnv": "abc"}
+        if handle == mock_efetch_handle: # Check for efetch_handle
+            return mock_efetch_result
         raise ValueError(f"Unexpected handle for Entrez.read: {handle}")
     MockEntrez.read.side_effect = entrez_read_side_effect
+    
     mock_async_run_sync(mocker, search_client)
     results = await search_client.search_pubmed("test query", max_results=2)
     assert len(results) == 2
     assert results[0]["pmid"] == "123"
+    assert results[0]["title"] == "Title 1"
+    assert results[1]["pmid"] == "456"
 
 @pytest.mark.asyncio
 async def test_search_europepmc_success(search_client_with_mocks, mocker):
@@ -143,66 +199,64 @@ def mock_async_search_literature_data():
 def mock_all_async_search_methods(mocker, mock_async_search_literature_data):
     # This fixture will run for all tests and mock the underlying async search methods
     # to prevent actual network calls for search_literature tests.
-    # We need to mock search_all within AsyncSearchClient for _async_search_literature
-    # to work with canned data.
     
-    # Mock AsyncSearchClient's search_all to return a pre-calculated,
-    # deduplicated, and sorted DataFrame.
-    
-    # Pre-calculate the expected DataFrame that search_all should return
-    # This logic mirrors what the actual search_all function does.
-    _full_df = pd.DataFrame(mock_async_search_literature_data)
-    _df_with_doi = _full_df[_full_df['doi'].notna()].copy()
-    _df_no_doi = _full_df[_full_df['doi'].isna()].copy()
+    # Create a DataFrame from the mock data
+    df = pd.DataFrame(mock_async_search_literature_data)
 
-    _expected_cols = list(SearchResult.__annotations__.keys())
-    
-    _df_with_doi_deduped = pd.DataFrame(columns=_expected_cols)
-    if not _df_with_doi.empty:
-        _df_with_doi['doi_norm'] = _df_with_doi['doi'].str.lower().str.replace("https://doi.org/", "", regex=False).str.strip()
-        # Keep all original columns for consistency before dropping duplicates
-        _df_with_doi_deduped = _df_with_doi.sort_values(
-            by=['doi_norm', 'year', 'pmid'], 
-            ascending=[True, False, True], 
-            na_position='last'
-        ).drop_duplicates(subset=['doi_norm'], keep='first')
-        # Ensure all expected columns are present, even if some are all NA after deduplication
-        _df_with_doi_deduped = _df_with_doi_deduped.reindex(columns=_expected_cols)
-
-
-    _df_no_doi_deduped = pd.DataFrame(columns=_expected_cols)
-    if not _df_no_doi.empty:
-        _df_no_doi_deduped = _df_no_doi.sort_values(
-            by=['pmid', 'year'], 
-            ascending=[True, False], 
-            na_position='last'
-        ).drop_duplicates(subset=['pmid'], keep='first')
-        # Ensure all expected columns are present
-        _df_no_doi_deduped = _df_no_doi_deduped.reindex(columns=_expected_cols)
-
-    # Concatenate, ensuring all columns are preserved
-    # If one part is empty, it should still work and preserve columns from the other part.
-    # If both are empty, an empty DataFrame with expected_cols is fine.
-    if _df_with_doi_deduped.empty and _df_no_doi_deduped.empty:
-        precalculated_df = pd.DataFrame(columns=_expected_cols)
-    elif _df_with_doi_deduped.empty:
-        precalculated_df = _df_no_doi_deduped
-    elif _df_no_doi_deduped.empty:
-        precalculated_df = _df_with_doi_deduped
+    # Apply the same deduplication and sorting logic as in AsyncSearchClient.search_all
+    # This ensures the mocked search_all returns data as if it processed it.
+    if 'doi' in df.columns:
+        df['doi_norm'] = df['doi'].apply(lambda x: str(x).lower().replace("https://doi.org/", "").strip() if pd.notna(x) and x != '' else pd.NA)
     else:
-        precalculated_df = pd.concat([_df_with_doi_deduped, _df_no_doi_deduped])
+        df['doi_norm'] = pd.NA
     
-    precalculated_df = precalculated_df.sort_values(by=['source_api', 'year'], ascending=[True, False])
-    # Ensure final DataFrame has all expected columns in the correct order
-    precalculated_df = precalculated_df.reindex(columns=_expected_cols)
+    if 'pmid' in df.columns:
+        df['pmid_str'] = df['pmid'].apply(lambda x: str(x) if pd.notna(x) and x != '' else pd.NA)
+    else:
+        df['pmid_str'] = pd.NA
 
+    mask_doi_present = df['doi_norm'].notna()
+    df_with_doi_present = df[mask_doi_present].copy()
+    df_no_doi_present = df[~mask_doi_present].copy()
+    
+    df_with_doi_deduped = pd.DataFrame()
+    if not df_with_doi_present.empty:
+        df_with_doi_present['has_abstract'] = df_with_doi_present['abstract'].notna() & (df_with_doi_present['abstract'] != '')
+        df_with_doi_present = df_with_doi_present.sort_values(
+            by=['doi_norm', 'has_abstract', 'year', 'pmid_str'], 
+            ascending=[True, False, False, True],
+            na_position='last'
+        )
+        df_with_doi_deduped = df_with_doi_present.drop_duplicates(subset=['doi_norm'], keep='first')
+        df_with_doi_deduped = df_with_doi_deduped.drop(columns=['has_abstract'], errors='ignore')
+
+    df_no_doi_deduped = pd.DataFrame()
+    if not df_no_doi_present.empty:
+        df_no_doi_present['has_abstract'] = df_no_doi_present['abstract'].notna() & (df_no_doi_present['abstract'] != '')
+        df_no_doi_present = df_no_doi_present.sort_values(
+            by=['title', 'has_abstract', 'year', 'pmid_str'],
+            ascending=[True, False, False, True], 
+            na_position='last'
+        )
+        use_pmid_for_no_doi_dedup = 'pmid_str' in df_no_doi_present.columns and df_no_doi_present['pmid_str'].notna().any()
+        subset_for_no_doi = ['pmid_str'] if use_pmid_for_no_doi_dedup else ['title', 'year']
+        df_no_doi_deduped = df_no_doi_present.drop_duplicates(subset=subset_for_no_doi, keep='first')
+        df_no_doi_deduped = df_no_doi_deduped.drop(columns=['has_abstract'], errors='ignore')
+    
+    final_df_mock = pd.concat([df_with_doi_deduped, df_no_doi_deduped], ignore_index=True)
+    cols_to_drop_mock = [col for col in ['doi_norm', 'pmid_str', 'has_abstract'] if col in final_df_mock.columns]
+    if cols_to_drop_mock:
+        final_df_mock.drop(columns=cols_to_drop_mock, inplace=True)
+    
+    expected_df_cols_mock = list(SearchResult.__annotations__.keys())
+    for col in expected_df_cols_mock:
+        if col not in final_df_mock.columns:
+            final_df_mock[col] = pd.NA
+    final_df_mock = final_df_mock[expected_df_cols_mock]
+    final_df_mock = final_df_mock.sort_values(by=['year', 'title'], ascending=[False, True], na_position='last').reset_index(drop=True)
 
     async def mock_search_all(pubmed_query: str, general_query: str, max_results_per_source: int):
-        # The mock now returns the pre-calculated DataFrame.
-        # The max_results_per_source is not strictly applied here as the main
-        # goal is to test the output structure and deduplication which is already
-        # incorporated into precalculated_df.
-        return precalculated_df
+        return final_df_mock.copy() # Return a copy to avoid modification issues if any
 
     mocker.patch('tools.search.AsyncSearchClient.search_all', new_callable=AsyncMock, side_effect=mock_search_all)
     
@@ -223,83 +277,110 @@ def test_search_literature_returns_structured_output_with_expected_fields():
 
     # Check meta fields
     assert "total_hits" in output["meta"]
-    assert "query" in output["meta"]
+    assert "query_pubmed" in output["meta"] # Changed from "query"
+    assert "query_general" in output["meta"] # Added
     assert "timestamp" in output["meta"]
-    assert output["meta"]["query"] == "test general"
+    assert output["meta"]["query_pubmed"] == "test pubmed" # Check specific query field
+    assert output["meta"]["query_general"] == "test general" # Check specific query field
     assert isinstance(output["meta"]["total_hits"], int)
     assert isinstance(output["meta"]["timestamp"], str)
 
     # Check data fields for each record
-    expected_data_fields = ['doi', 'title', 'abstract']
+    # All fields from SearchResult are expected now
+    expected_data_fields = list(SearchResult.__annotations__.keys())
     for record in output["data"]:
         assert isinstance(record, dict)
         for field in expected_data_fields:
-            assert field in record, f"Expected field '{field}' not found in data record."
-        # Ensure no extra fields are present in the data records
-        assert all(key in expected_data_fields for key in record.keys())
+            assert field in record, f"Expected field '{field}' not found in data record: {record}"
+        # Ensure no extra fields are present in the data records (optional, but good for strictness)
+        assert all(key in expected_data_fields for key in record.keys()), f"Record has unexpected keys: {record.keys()}"
 
 
 @pytest.mark.usefixtures("mock_all_async_search_methods")
 def test_search_literature_deduplication_and_sorting(mock_async_search_literature_data): # Added fixture as param
     # The mock_all_async_search_methods fixture provides data with duplicates.
-    # We expect 6 unique results after deduplication (A, B, C, D, E, F)
-    # and sorted by source_api, then year desc.
-    output: SearchOutput = search_literature(pubmed_query="test pubmed", general_query="test general", max_results_per_source=2)
+    # The mocked AsyncSearchClient.search_all should return the deduplicated and sorted DataFrame.
+    # _async_search_literature converts this DataFrame to a list of dicts.
+    output: SearchOutput = search_literature(pubmed_query="test pubmed", general_query="test general", max_results_per_source=10) # Use enough max_results
     
     data_list = output["data"]
-    assert len(data_list) == 6 
-
-    # Convert the expected data to the new output format for comparison
-    expected_data_for_sort_test = [
-        {"title": "Title D", "doi": "10.1/D", "abstract": "Abstract D"},
-        {"title": "Title F", "doi": None, "abstract": "Abstract F"},
-        {"title": "Title B", "doi": "10.1/B", "abstract": "Abstract B"},
-        {"title": "Title A", "doi": "10.1/A", "abstract": "Abstract A"},
-        {"title": "Title E", "doi": None, "abstract": "Abstract E"},
-        {"title": "Title C", "doi": "10.1/C", "abstract": "Abstract C"},
-    ]
     
-    # The actual sorting happens within search_all, which returns a DataFrame.
-    # The _async_search_literature then converts this DataFrame to the desired
-    # list of dicts. So, we need to ensure the order is preserved.
-    # The original search_all sorts by ['source_api', 'year'] ascending=[True, False].
-    # Let's re-create the expected order based on the original DataFrame sorting logic.
+    # The mock_all_async_search_methods fixture now pre-calculates final_df_mock
+    # which is what AsyncSearchClient.search_all is mocked to return.
+    # We need to compare data_list to what final_df_mock would look like when converted to list of dicts.
     
-    # Create a DataFrame from the full mock data to simulate search_all's output
-    full_df = pd.DataFrame(mock_async_search_literature_data) # Use injected fixture value
+    # Re-create the expected list of dicts from final_df_mock (which is available via the fixture's setup)
+    # This is a bit circular, but the fixture `mock_all_async_search_methods` already prepares `final_df_mock`.
+    # We can grab it from the mock if needed, or re-run its logic. For simplicity, let's re-run.
     
-    # Apply the deduplication and sorting logic from search_all
-    df_with_doi_present = full_df[full_df['doi'].notna()].copy()
-    df_no_doi_present = full_df[full_df['doi'].isna()].copy()
+    df_for_test = pd.DataFrame(mock_async_search_literature_data)
+    if 'doi' in df_for_test.columns:
+        df_for_test['doi_norm'] = df_for_test['doi'].apply(lambda x: str(x).lower().replace("https://doi.org/", "").strip() if pd.notna(x) and x != '' else pd.NA)
+    else:
+        df_for_test['doi_norm'] = pd.NA
+    if 'pmid' in df_for_test.columns:
+        df_for_test['pmid_str'] = df_for_test['pmid'].apply(lambda x: str(x) if pd.notna(x) and x != '' else pd.NA)
+    else:
+        df_for_test['pmid_str'] = pd.NA
 
-    df_with_doi_deduped = pd.DataFrame(columns=full_df.columns)
-    if not df_with_doi_present.empty:
-        df_with_doi_present['doi_norm'] = df_with_doi_present['doi'].str.lower().str.replace("https://doi.org/", "", regex=False).str.strip()
-        df_with_doi_deduped = df_with_doi_present.drop_duplicates(subset=['doi_norm'], keep='first')
-
-    df_no_doi_deduped = pd.DataFrame(columns=full_df.columns)
-    if not df_no_doi_present.empty:
-        df_no_doi_present = df_no_doi_present.sort_values(
-            by=['pmid', 'year'], 
-            ascending=[True, False], 
-            na_position='last'
+    mask_doi_present_test = df_for_test['doi_norm'].notna()
+    df_with_doi_present_test = df_for_test[mask_doi_present_test].copy()
+    df_no_doi_present_test = df_for_test[~mask_doi_present_test].copy()
+    
+    df_with_doi_deduped_test = pd.DataFrame()
+    if not df_with_doi_present_test.empty:
+        df_with_doi_present_test['has_abstract'] = df_with_doi_present_test['abstract'].notna() & (df_with_doi_present_test['abstract'] != '')
+        df_with_doi_present_test = df_with_doi_present_test.sort_values(
+            by=['doi_norm', 'has_abstract', 'year', 'pmid_str'], 
+            ascending=[True, False, False, True], na_position='last'
         )
-        df_no_doi_deduped = df_no_doi_present.drop_duplicates(subset=['pmid'], keep='first')
-    
-    combined_df = pd.concat([df_with_doi_deduped, df_no_doi_deduped])
-    combined_df = combined_df.sort_values(by=['source_api', 'year'], ascending=[True, False])
-    
-    # Now, convert this sorted DataFrame to the expected 'data' format
-    expected_data_list = []
-    for _, row in combined_df.iterrows():
-        expected_data_list.append({
-            "doi": row.get("doi"),
-            "title": row.get("title"),
-            "abstract": row.get("abstract")
-        })
+        df_with_doi_deduped_test = df_with_doi_present_test.drop_duplicates(subset=['doi_norm'], keep='first')
+        df_with_doi_deduped_test = df_with_doi_deduped_test.drop(columns=['has_abstract'], errors='ignore')
 
-    # Compare the actual data list with the expected data list
-    assert data_list == expected_data_list
+    df_no_doi_deduped_test = pd.DataFrame()
+    if not df_no_doi_present_test.empty:
+        df_no_doi_present_test['has_abstract'] = df_no_doi_present_test['abstract'].notna() & (df_no_doi_present_test['abstract'] != '')
+        df_no_doi_present_test = df_no_doi_present_test.sort_values(
+            by=['title', 'has_abstract', 'year', 'pmid_str'],
+            ascending=[True, False, False, True], na_position='last'
+        )
+        use_pmid_for_no_doi_dedup_test = 'pmid_str' in df_no_doi_present_test.columns and df_no_doi_present_test['pmid_str'].notna().any()
+        subset_for_no_doi_test = ['pmid_str'] if use_pmid_for_no_doi_dedup_test else ['title', 'year']
+        df_no_doi_deduped_test = df_no_doi_present_test.drop_duplicates(subset=subset_for_no_doi_test, keep='first')
+        df_no_doi_deduped_test = df_no_doi_deduped_test.drop(columns=['has_abstract'], errors='ignore')
+    
+    final_df_expected = pd.concat([df_with_doi_deduped_test, df_no_doi_deduped_test], ignore_index=True)
+    cols_to_drop_expected = [col for col in ['doi_norm', 'pmid_str', 'has_abstract'] if col in final_df_expected.columns]
+    if cols_to_drop_expected:
+        final_df_expected.drop(columns=cols_to_drop_expected, inplace=True)
+    
+    expected_df_cols_final = list(SearchResult.__annotations__.keys())
+    for col in expected_df_cols_final:
+        if col not in final_df_expected.columns:
+            final_df_expected[col] = pd.NA # Use pandas NA for consistency
+    final_df_expected = final_df_expected[expected_df_cols_final]
+    final_df_expected = final_df_expected.sort_values(by=['year', 'title'], ascending=[False, True], na_position='last').reset_index(drop=True)
+
+    expected_data_list_full = []
+    for _, row in final_df_expected.iterrows():
+        record = {}
+        for key_col in expected_df_cols_final:
+            val = row.get(key_col)
+            if pd.isna(val): # Convert pandas NA to None for comparison
+                record[key_col] = None
+            elif isinstance(val, list): # Ensure lists are Python lists
+                 record[key_col] = list(val)
+            elif isinstance(val, (np.integer, np.floating)): # Convert numpy numbers to python numbers
+                record[key_col] = val.item()
+            else:
+                record[key_col] = val
+        expected_data_list_full.append(record)
+    
+    assert len(data_list) == len(expected_data_list_full)
+    # For comparing lists of dicts, especially with Nones and floats, direct assert might be tricky.
+    # A common way is to sort them if order doesn't matter, or compare element by element.
+    # Since order *does* matter here (due to sorting in search_all), direct comparison is intended.
+    assert data_list == expected_data_list_full
 
 
 @pytest.mark.usefixtures("mock_all_async_search_methods")

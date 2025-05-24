@@ -1,7 +1,7 @@
 import requests
 import json
 
-def test_unpaywall(doi: str, email: str, timeout: float = 10.0):
+def query_unpaywall_for_doi(doi: str, email: str, timeout: float = 10.0):
     """
     Query Unpaywall for a given DOI and print the JSON response or error.
     """
@@ -19,4 +19,4 @@ def test_unpaywall(doi: str, email: str, timeout: float = 10.0):
 
 if __name__ == "__main__":
     # Replace with a known OA DOI and your email
-    test_unpaywall("10.1016/j.genrep.2025.102204", "jason.kwan@wisc.edu")
+    query_unpaywall_for_doi("10.1016/j.genrep.2025.102204", "jason.kwan@wisc.edu")

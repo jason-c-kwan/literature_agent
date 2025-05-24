@@ -143,10 +143,11 @@ class TriageAgent(AssistantAgent):
                         continue
                 except ValueError:
                     print(f"Warning: Invalid citation count ('{citations}') or year ('{pub_year_val}') for article '{title}'. Skipping citation filter.")
-                    pass # Changed from continue: if data is bad, skip this filter, don't drop article based on this error.
+                    # If data is bad for calculation, consider it as failing the filter.
+                    continue 
             elif citations is None or pub_year_val is None: # If data is missing for required calculation
-                # Changed from continue: if data is missing, skip this filter, don't drop article based on this.
-                pass 
+                # If data is missing for this filter, the article cannot pass it.
+                continue
                 
             triaged_articles.append(article)
 
