@@ -180,3 +180,81 @@
   provider: tools.search.LiteratureSearchTool
   component_type: tool
   config: {}
+
+# ─── FULL SCRAPER AGENT (New) ───────────────────────────────────
+- &full_scraper_agent
+  name: full_scraper_agent
+  provider: autogen_agentchat.agents.AssistantAgent
+  component_type: agent
+  config:
+    name: full_scraper_agent
+    description: |
+      An agent that scrapes web pages for PDF links or full HTML text.
+      It uses domain-specific rules, Playwright for JS rendering with proxy rotation,
+      and its LLM capabilities to analyze complex DOMs for PDF link extraction.
+      It prioritizes full HTML text if available and good quality, otherwise seeks a PDF.
+    system_message: |
+      You are a **Full Scraper Agent**. Your goal is to retrieve either the full text of an article as HTML or a direct link to its PDF from a given URL.
+
+      **Workflow:**
+      1.  You will be given a URL.
+      2.  Call the `advanced_scrape` tool with the URL. This tool will attempt several methods:
+          a. Direct HTTP GET to find full HTML text.
+          b. Direct HTTP GET/HEAD to find a direct PDF.
+          c. If necessary, use Playwright (headless browser with proxy) to render the page and:
+              i.  Attempt to extract full HTML text from the rendered page.
+              ii. Attempt to find/download a PDF (by intercepting downloads or finding links).
+      3.  The `advanced_scrape` tool will return one of:
+          - `HTMLResult(text="...", url="...")`: If good quality full HTML text is found.
+          - `FileResult(path="...", url="...")`: If a valid PDF is downloaded.
+          - `Failure(reason="...", status_code=...)`: If all attempts by the tool failed.
+
+      **Your LLM Analysis (if `advanced_scrape` returns Failure):**
+      4.  If the `advanced_scrape` tool returns a `Failure`, and you suspect a PDF might still be findable on a complex page:
+          a. You might have received some HTML content from the failed Playwright attempt (this needs to be passed by the tool or fetched again).
+          b. Analyze this HTML DOM content carefully. Look for non-standard PDF links, JavaScript-triggered downloads, or clues about how a PDF might be accessed.
+          c. If you identify a *new, specific, promising URL* that might be a PDF based on your DOM analysis:
+             Call the `fetch_specific_pdf_url` tool with this new URL. This tool will attempt to download and validate it.
+          d. If your analysis does not yield a new, specific PDF URL, or if `fetch_specific_pdf_url` also fails, then the process for this URL has failed.
+
+      **Output:**
+      - If successful (either from `advanced_scrape` or `fetch_specific_pdf_url`), your final response should clearly state whether you found HTML or a PDF, and provide the text (if HTML) or the file path (if PDF).
+      - If all attempts fail, state that you were unable to retrieve the content.
+      - Always reply with TERMINATE when your task for the given URL is complete (success or failure).
+
+    human_input_mode: NEVER
+    reflect_on_tool_use: true # Allow agent to reflect on tool results, esp. for LLM analysis step
+    tool_call_summary_format: "Tool {tool_name} result: {result}" # Customize if needed
+    tools:
+      - advanced_scrape_tool # Tool wrapping tools.advanced_scraper.scrape_with_fallback
+      - fetch_specific_pdf_url_tool # A simpler tool to fetch a direct PDF URL found by LLM
+    model_client:
+      provider: autogen_ext.models.openai.OpenAIChatCompletionClient # Assuming Gemini via OpenAI endpoint
+      config:
+        model:    "${GEMINI_MODEL:-gemini-1.5-flash-latest}" # Use a capable model for DOM analysis
+        base_url: "${OPENAI_API_BASE}"
+        api_key:  "${OPENAI_API_KEY}"
+        temperature: 0.1 # Low temperature for more deterministic analysis
+        parallel_tool_calls: false # Ensure sequential tool calls if needed for logic
+        model_info:
+          structured_output: false # Or true if you want structured JSON responses from LLM
+          vision: false
+          json_output: false # If not using structured_output
+          function_calling: true
+          family: "GEMINI_1_5_FLASH" # Or appropriate family
+
+# Tool definition for advanced_scrape_tool (to be implemented in Python and registered)
+# This is a conceptual placeholder for how autogen loads tools.
+# The actual tool registration happens in Python code.
+# - name: advanced_scrape_tool
+#   provider: tools.advanced_scraper.scrape_with_fallback # Path to the function
+#   component_type: tool
+#   config:
+#     description: "Scrapes a given URL using multiple methods (direct, Playwright) to find full HTML text or a PDF."
+#     # Parameters would be inferred from function signature
+
+# - name: fetch_specific_pdf_url_tool
+#   provider: # some_module.fetch_just_pdf (a simpler version of scrape_with_fallback for direct PDF URLs)
+#   component_type: tool
+#   config:
+#     description: "Attempts to download and validate a PDF from a specific URL, assuming it's a direct link."

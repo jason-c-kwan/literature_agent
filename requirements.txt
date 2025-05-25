@@ -23,6 +23,7 @@ pydantic
 ratelimit
 beautifulsoup4
 readability-lxml
+playwright
 
 # --- Project hygiene ---------------------------
 python-dotenv

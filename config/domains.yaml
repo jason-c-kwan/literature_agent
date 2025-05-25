@@ -1,0 +1,11 @@
+domains:
+  - domain: "example.com"
+    article_text:
+      css: ""        # e.g., "div#main-article"
+      xpath: ""
+    pdf_link:
+      css: ""        # e.g., "a.download-pdf"
+      xpath: ""
+    meta_pdf:
+      - ""           # e.g., "citation_pdf_url"
+    js_render: false
