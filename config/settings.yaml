@@ -14,3 +14,4 @@ triage:
     - gold
     - hybrid
     - green
+resolve_content_timeout: 15 # seconds

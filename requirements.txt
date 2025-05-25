@@ -21,12 +21,15 @@ xmltodict
 pandas 
 pydantic 
 ratelimit
+beautifulsoup4
+readability-lxml
 
 # --- Project hygiene ---------------------------
 python-dotenv
 pytest
 pytest-mock
 pytest-asyncio       # For testing asyncio code with pytest
+respx                # For mocking httpx responses
 rich                 # pretty CLI logs
 prompt_toolkit       # advanced input with proper readline support
 # (ruff, black, pre-commit go in dev-requirements.txt)

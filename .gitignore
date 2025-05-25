@@ -1,3 +1,5 @@
 .env
 literature_agent.egg-info/
 __pycache__/
+workspace/downloads/
+workspace
