@@ -8,6 +8,7 @@ semantic-kernel>=1.0.0
 chromadb>=0.4.24
 pymupdf4llm        
 markdownify>=0.11.6
+markdown             # For Markdown to HTML conversion
 tiktoken>=0.6.0
 
 # --- Tool utilities ----------------------------
