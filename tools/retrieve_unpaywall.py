@@ -4,9 +4,13 @@ import sys # Added for command-line arguments
 from typing import Dict, Optional, Any
 
 # Consider loading from a config or environment variable for flexibility
-UNPAYWALL_API_EMAIL = "jason.kwan@wisc.edu"
+UNPAYWALL_API_EMAIL = "jason.kwan@wisc.edu" # TODO: Load from .env or config
 
-async def get_unpaywall_oa_url(doi: str, email: str = UNPAYWALL_API_EMAIL) -> Optional[str]:
+async def get_unpaywall_oa_url(
+    doi: str, 
+    email: str = UNPAYWALL_API_EMAIL, 
+    session: Optional[aiohttp.ClientSession] = None
+) -> Optional[str]:
     """
     Fetches the Unpaywall record for a given DOI and returns the best OA URL found.
     Priority:
@@ -22,24 +26,30 @@ async def get_unpaywall_oa_url(doi: str, email: str = UNPAYWALL_API_EMAIL) -> Op
     api_url = f"https://api.unpaywall.org/v2/{doi}?email={email}"
     record: Optional[Dict[str, Any]] = None
 
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(api_url) as response:
-                response.raise_for_status()
-                if response.content_type == 'application/json':
-                    record = await response.json()
-                else:
-                    print(f"Error: Unexpected content type from Unpaywall API: {response.content_type} for DOI {doi}")
-                    return None
-        except aiohttp.ClientResponseError as e:
-            print(f"HTTP Error {e.status} fetching Unpaywall record for DOI {doi}: {e.message}")
-            return None
-        except aiohttp.ClientError as e:
-            print(f"ClientError fetching Unpaywall record for DOI {doi}: {e}")
-            return None
-        except Exception as e:
-            print(f"An unexpected error occurred while fetching Unpaywall record for DOI {doi}: {e}")
-            return None
+    provided_session = bool(session)
+    if not session:
+        session = aiohttp.ClientSession()
+
+    try:
+        async with session.get(api_url) as response:
+            response.raise_for_status()
+            if response.content_type == 'application/json':
+                record = await response.json()
+            else:
+                print(f"Error: Unexpected content type from Unpaywall API: {response.content_type} for DOI {doi}")
+                return None
+    except aiohttp.ClientResponseError as e:
+        print(f"HTTP Error {e.status} fetching Unpaywall record for DOI {doi}: {e.message}")
+        return None
+    except aiohttp.ClientError as e: # Includes connection errors, timeouts
+        print(f"ClientError fetching Unpaywall record for DOI {doi}: {e}")
+        return None
+    except Exception as e: # Catch-all for other unexpected errors
+        print(f"An unexpected error occurred while fetching Unpaywall record for DOI {doi}: {e}")
+        return None
+    finally:
+        if not provided_session and session:
+            await session.close()
     
     if not record:
         return None

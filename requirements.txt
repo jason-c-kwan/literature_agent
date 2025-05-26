@@ -25,6 +25,7 @@ ratelimit
 beautifulsoup4
 readability-lxml
 playwright
+aiohttp              # For asynchronous HTTP requests
 
 # --- Project hygiene ---------------------------
 python-dotenv
