@@ -17,7 +17,7 @@ import yaml
 from bs4 import BeautifulSoup
 from readability import Document  # readability-lxml
 import fitz  # PyMuPDF
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError, Download # Added Download
 
 # --- Configuration ---
 CONFIG_PATH_SETTINGS = "config/settings.yaml"
@@ -491,7 +491,31 @@ async def scrape_with_fallback(
                             else: # No substantial text extracted
                                 logger.info(f"Playwright: No substantial HTML text extracted from {final_url_after_redirects}.", extra={"url": final_url_after_redirects, "event_type": "playwright_html_no_extract"})
                         
-                        if not playwright_result:
+                        if not playwright_result: # If no auto-download or other early success
+                            page_content_lower = ""
+                            try:
+                                current_page_content = await page.content()
+                                page_content_lower = current_page_content.lower()
+                            except PlaywrightError as e_content:
+                                logger.warning(f"Playwright: Could not get page content from {final_url_after_redirects} to check for 'PDF': {e_content}", extra={"url":url, "final_url":final_url_after_redirects, "event_type":"playwright_get_content_for_pdf_check_error"})
+
+                            if direct_http_exception and "pdf" in page_content_lower: 
+                                logger.info(f"Playwright: Direct HTTP failed and 'pdf' found in page content of {final_url_after_redirects}. Attempting click_download_and_capture.", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_pdf_in_content_click_attempt"})
+                                
+                                pdf_bytes_captured = await click_download_and_capture(page)
+                                
+                                if pdf_bytes_captured:
+                                    logger.info(f"Playwright: Captured {len(pdf_bytes_captured)} bytes via click_download_and_capture for {final_url_after_redirects}.", extra={"url": url, "final_url": final_url_after_redirects, "bytes": len(pdf_bytes_captured), "event_type": "playwright_click_capture_success_bytes"})
+                                    click_capture_result = await _handle_pdf_download(pdf_bytes_captured, final_url_after_redirects, "playwright_click_capture")
+                                    if click_capture_result.type == "file":
+                                        playwright_result = click_capture_result 
+                                        logger.info(f"Playwright: Successfully processed PDF from click_download_and_capture for {final_url_after_redirects}.", extra={"url": url, "path": playwright_result.path, "event_type": "playwright_click_capture_processed_file"})
+                                    else: 
+                                        logger.warning(f"Playwright: PDF from click_download_and_capture for {final_url_after_redirects} was invalid or failed to save: {click_capture_result.reason}", extra={"url": url, "reason": click_capture_result.reason, "event_type": "playwright_click_capture_invalid_or_save_fail"})
+                                else:
+                                    logger.info(f"Playwright: click_download_and_capture did not return bytes for {final_url_after_redirects}.", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_click_capture_no_bytes"})
+                        
+                        if not playwright_result: # Re-check if click_download_and_capture succeeded
                             logger.info(f"Playwright: Attempting to find PDF links in DOM of {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_find_pdf_links_attempt"})
                             pdf_links = await page.query_selector_all("a[href$='.pdf'], a[href*='downloadSgArticle'], a[href*='pdfLink']")
                             if pdf_links:
@@ -559,6 +583,71 @@ async def scrape_with_fallback(
     # The "Semaphore released" and "Finished advanced scrape" logs are implicitly covered by exiting these blocks.
     # Or, if explicit end-of-function logging is desired, it should be outside the `async with semaphore` if it means the absolute end.
     # For now, the structure implies completion when a result is returned or the final Failure is returned.
+
+async def click_download_and_capture(page, timeout: int = 30000) -> Optional[bytes]:
+    logger.info(f"Attempting to click PDF download and capture for {page.url}", extra={"url": page.url, "event_type": "click_download_capture_start"})
+    # Common selectors for PDF download links/buttons
+    selectors = [
+        "a[href$='.pdf'][download]",
+        "button:has-text('Download PDF')",
+        "a:has-text('Download PDF')",
+        "a[href$='.pdf']",
+        "button[aria-label*='Download PDF']",
+        "a[aria-label*='Download PDF']",
+        "button:has-text('PDF')",
+        "a:has-text('PDF')",
+        "a[href*='downloadSgArticle']",
+        "a[href*='pdfLink']",
+        "button[id*='download']",
+        "a[id*='download']",
+        "input[type='submit'][value*='Download']",
+    ]
+
+    for i, selector in enumerate(selectors):
+        try:
+            logger.info(f"Trying selector ({i+1}/{len(selectors)}): '{selector}' on {page.url}", extra={"url": page.url, "selector": selector, "event_type": "click_download_selector_try"})
+            element = page.locator(selector).first
+            
+            if not await element.is_visible(timeout=2000) or not await element.is_enabled(timeout=2000):
+                logger.info(f"Selector '{selector}' found but not visible/enabled on {page.url}", extra={"url": page.url, "selector": selector, "event_type": "click_download_selector_not_interactive"})
+                continue
+
+            async with page.expect_download(timeout=timeout) as download_info:
+                logger.info(f"Expecting download after clicking '{selector}' on {page.url}", extra={"url": page.url, "selector": selector, "event_type": "click_download_expecting"})
+                await element.click(timeout=5000) 
+            
+            download = await download_info.value
+            
+            temp_file_path = await download.path()
+            if not temp_file_path:
+                logger.warning(f"Download via '{selector}' on {page.url} did not provide a file path.", extra={"url": page.url, "selector": selector, "event_type": "click_download_no_path"})
+                await download.delete()
+                continue
+
+            logger.info(f"Download triggered by '{selector}' on {page.url}, saved to temp path: {temp_file_path}", extra={"url": page.url, "selector": selector, "temp_path": temp_file_path, "event_type": "click_download_triggered"})
+            
+            pdf_bytes = None
+            try:
+                with open(temp_file_path, "rb") as f:
+                    pdf_bytes = f.read()
+            except Exception as e_read:
+                logger.error(f"Error reading downloaded file {temp_file_path} for {page.url}: {e_read}", exc_info=True, extra={"url": page.url, "path": temp_file_path, "event_type": "click_download_read_error"})
+                await download.delete()
+                return None
+
+            await download.delete()
+            logger.info(f"Successfully captured {len(pdf_bytes)} bytes from download triggered by '{selector}' on {page.url}", extra={"url": page.url, "selector": selector, "bytes_captured": len(pdf_bytes), "event_type": "click_download_capture_success"})
+            return pdf_bytes
+
+        except PlaywrightTimeoutError:
+            logger.warning(f"Timeout waiting for download or click with selector '{selector}' on {page.url}", extra={"url": page.url, "selector": selector, "event_type": "click_download_timeout"})
+        except PlaywrightError as e_pw_click:
+             logger.warning(f"Playwright error with selector '{selector}' on {page.url}: {str(e_pw_click)}", extra={"url": page.url, "selector": selector, "error": str(e_pw_click), "event_type": "click_download_playwright_error"})
+        except Exception as e:
+            logger.error(f"Unexpected error during click_download_and_capture with selector '{selector}' on {page.url}: {e}", exc_info=True, extra={"url": page.url, "selector": selector, "event_type": "click_download_unexpected_error"})
+    
+    logger.warning(f"Failed to click and capture download for {page.url} after trying all selectors.", extra={"url": page.url, "event_type": "click_download_all_selectors_failed"})
+    return None
 
 async def _run_nodejs_stealth_fetcher(url: str) -> ResolveResult:
     """

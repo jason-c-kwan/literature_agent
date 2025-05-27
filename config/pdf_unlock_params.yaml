@@ -1,0 +1,8 @@
+default:
+  - download=true
+  - download=1
+  - needAccess=true
+nejm.org:
+  - download=true
+tandfonline.com:
+  - needAccess=true
