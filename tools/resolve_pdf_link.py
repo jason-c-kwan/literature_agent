@@ -176,12 +176,18 @@ def is_html_potentially_paywalled(full_html_content: str) -> bool:
         return True
     return False
 
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+
 async def _make_request_with_retry(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> httpx.Response:
+    headers = kwargs.pop("headers", {})
+    if "User-Agent" not in headers:
+        headers["User-Agent"] = DEFAULT_USER_AGENT
+    
     for attempt in range(MAX_RETRIES + 1): 
         log_extra = {"url": url, "method": method, "attempt": attempt + 1, "max_retries": MAX_RETRIES}
         try:
             logger.info(f"Requesting {method} {url}, attempt {attempt + 1}", extra={**log_extra, "event_type": f"{method.lower()}_attempt"})
-            response = await client.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
+            response = await client.request(method, url, timeout=REQUEST_TIMEOUT, headers=headers, **kwargs)
             response.raise_for_status()
             logger.info(f"{method} request to {url} successful (status {response.status_code})", extra={**log_extra, "status_code": response.status_code, "event_type": f"{method.lower()}_success"})
             return response

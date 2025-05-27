@@ -19,3 +19,9 @@ resolve_max_retries: 3
 resolve_retry_backoff_factor: 0.5 # seconds
 resolve_retry_status_forcelist: [500, 502, 503, 504] # HTTP status codes to retry on
 resolve_per_domain_concurrency: 2 # Max concurrent requests per domain
+
+proxy_settings:
+  enabled: false # Set to true to enable proxies
+  proxies: # List of proxy URLs, e.g., ["http://user:pass@host:port"]
+    # - "http://your_proxy_url_1"
+    # - "http://your_proxy_url_2"

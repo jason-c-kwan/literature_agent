@@ -2,4 +2,6 @@
 literature_agent.egg-info/
 __pycache__/
 workspace/downloads/
-workspace
+workspace/
+tools/node_modules/
+tools/package-lock.json

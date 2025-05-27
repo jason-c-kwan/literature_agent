@@ -8,6 +8,7 @@ import datetime
 import os
 import logging
 import json
+import random # Added import
 from typing import Literal, NamedTuple, Union, Optional, List, Dict, Any
 from urllib.parse import urlparse
 
@@ -167,7 +168,6 @@ def is_pdf_content_valid(file_path: str) -> tuple[bool, str]:
                  return False, "PDF content suggests it's a placeholder or abstract-only."
             if len(text_lower_stripped) < 20: # Stricter check for single page
                 return False, f"Single-page PDF has very little text content (approx. {len(text_lower_stripped)} chars)."
-            # Add more checks if needed for single-page PDFs
         doc.close()
         return True, ""
     except Exception as e:
@@ -175,32 +175,30 @@ def is_pdf_content_valid(file_path: str) -> tuple[bool, str]:
         return False, f"Error checking PDF content: {e!s}"
 
 def is_html_potentially_paywalled(full_html_content: str) -> bool:
-    # This function can be enhanced based on common paywall patterns
     html_lower = full_html_content.lower()
     matches = 0
     for keyword in PAYWALL_KEYWORDS:
         if keyword in html_lower:
             matches +=1
-    # More specific checks
     if any(currency in html_lower for currency in ["£", "$", "€", "usd", "eur", "gbp"]) and matches >= 1:
         return True
-    if matches >= 2: # Two general keywords might indicate a paywall
+    if matches >= 2: 
         return True
-    if "access this article for" in html_lower and "buy this article" in html_lower: # Specific phrase combination
+    if "access this article for" in html_lower and "buy this article" in html_lower: 
         return True
     if "institutional login" in html_lower and ("subscribe" in html_lower or "purchase" in html_lower):
         return True
     return False
 
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+
 async def _make_request_with_retry(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> httpx.Response:
-    # This function is copied and adapted from resolve_pdf_link.py
-    # It should incorporate proxy selection if PROXY_SETTINGS["enabled"] is true.
-    # For now, placeholder for proxy logic.
-    
+    headers = kwargs.pop("headers", {})
+    if "User-Agent" not in headers:
+        headers["User-Agent"] = DEFAULT_USER_AGENT
+
     current_proxies = None
     if PROXY_SETTINGS.get("enabled") and PROXY_SETTINGS.get("proxies"):
-        # Basic round-robin or random selection for now.
-        # This needs to be more robust (e.g., per-request proxy, retry with new proxy)
         import random
         proxy_url = random.choice(PROXY_SETTINGS["proxies"])
         current_proxies = {"http://": proxy_url, "https://": proxy_url}
@@ -212,10 +210,10 @@ async def _make_request_with_retry(client: httpx.AsyncClient, method: str, url: 
         log_extra = {"url": url, "method": method, "attempt": attempt + 1, "max_retries": MAX_RETRIES}
         try:
             logger.info(f"Requesting {method} {url}, attempt {attempt + 1}", extra={**log_extra, "event_type": f"{method.lower()}_attempt"})
-            response = await effective_client.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
+            response = await effective_client.request(method, url, timeout=REQUEST_TIMEOUT, headers=headers, **kwargs)
             response.raise_for_status()
             logger.info(f"{method} request to {url} successful (status {response.status_code})", extra={**log_extra, "status_code": response.status_code, "event_type": f"{method.lower()}_success"})
-            if effective_client is not client: # Close the temporary client if one was created for proxy
+            if effective_client is not client: 
                 await effective_client.aclose()
             return response
         except httpx.HTTPStatusError as e:
@@ -229,21 +227,18 @@ async def _make_request_with_retry(client: httpx.AsyncClient, method: str, url: 
                 logger.error(f"{method} request to {url} failed with {e.response.status_code}, no more retries or non-retriable.", extra={**log_extra, "event_type": "request_failure_status"})
                 if effective_client is not client: await effective_client.aclose()
                 raise
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.ProxyError) as e: # Added ProxyError
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.ProxyError) as e: 
             log_extra["error"] = str(e)
             if attempt < MAX_RETRIES:
                 delay = RETRY_BACKOFF_FACTOR * (2 ** attempt)
                 logger.warning(f"{method} request to {url} failed with {type(e).__name__}, retrying in {delay:.2f}s...", extra={**log_extra, "delay": delay, "event_type": "retry_scheduled_network"})
                 await asyncio.sleep(delay)
-                # Potentially switch proxy here if proxy error
                 if isinstance(e, httpx.ProxyError) and PROXY_SETTINGS.get("enabled") and PROXY_SETTINGS.get("proxies"):
                     logger.warning(f"Proxy error with {current_proxies}. Attempting to switch proxy.", extra={"url": url, "event_type": "proxy_error_switch_attempt"})
-                    # Re-select proxy for next attempt (basic)
                     proxy_url = random.choice(PROXY_SETTINGS["proxies"])
                     current_proxies = {"http://": proxy_url, "https://": proxy_url}
-                    if effective_client is not client: await effective_client.aclose() # close old proxy client
+                    if effective_client is not client: await effective_client.aclose() 
                     effective_client = httpx.AsyncClient(follow_redirects=True, proxies=current_proxies)
-
             else:
                 logger.error(f"{method} request to {url} failed with {type(e).__name__}, no more retries.", extra={**log_extra, "event_type": "request_failure_network"})
                 if effective_client is not client: await effective_client.aclose()
@@ -251,9 +246,7 @@ async def _make_request_with_retry(client: httpx.AsyncClient, method: str, url: 
     if effective_client is not client: await effective_client.aclose()
     raise httpx.RequestError(f"Max retries ({MAX_RETRIES}) exceeded for {method} {url}")
 
-
 def _get_domain_rules(url: str) -> Optional[Dict[str, Any]]:
-    """Gets domain-specific parsing rules from domains_config."""
     parsed_url = urlparse(url)
     domain_to_match = parsed_url.netloc
     for rule in domains_config.get("domains", []):
@@ -262,10 +255,9 @@ def _get_domain_rules(url: str) -> Optional[Dict[str, Any]]:
     return None
 
 async def _extract_html_text(html_content: str, url: str) -> Optional[str]:
-    """Extracts main text content from HTML."""
     extracted_text = None
     try:
-        doc = Document(html_content) # readability-lxml
+        doc = Document(html_content) 
         main_content_html = doc.summary(html_partial=True)
         summary_soup = BeautifulSoup(main_content_html, "html.parser")
         current_extracted_text = summary_soup.get_text(separator="\\n", strip=True)
@@ -276,7 +268,6 @@ async def _extract_html_text(html_content: str, url: str) -> Optional[str]:
         logger.warning(f"Readability failed for {url}: {e!s}", extra={"url": url, "error": str(e), "event_type": "html_extract_readability_fail"})
 
     if not extracted_text or len(extracted_text) < MIN_HTML_CONTENT_LENGTH:
-        # Fallback to <article> tag if readability fails or yields short content
         soup = BeautifulSoup(html_content, "html.parser")
         article_tag = soup.find("article")
         if article_tag:
@@ -287,19 +278,16 @@ async def _extract_html_text(html_content: str, url: str) -> Optional[str]:
     return extracted_text
 
 async def _handle_pdf_download(response_content: bytes, url: str, source_description: str = "direct") -> ResolveResult:
-    """Saves and validates a PDF from bytes."""
     if not os.path.exists(DOWNLOADS_DIR):
         os.makedirs(DOWNLOADS_DIR)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f") # Added microseconds for uniqueness
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f") 
     url_part = "".join(c if c.isalnum() else "_" for c in urlparse(url).netloc[:30] + urlparse(url).path.replace('/', '_')[:30])
     file_name = f"{timestamp}_{url_part}.pdf"
     file_path = os.path.join(DOWNLOADS_DIR, file_name)
-
     try:
         with open(file_path, "wb") as f:
             f.write(response_content)
         logger.info(f"PDF (via {source_description}) downloaded to {file_path}", extra={"url": url, "path": file_path, "event_type": f"pdf_{source_description}_download_success"})
-
         is_valid, reason = is_pdf_content_valid(file_path)
         if not is_valid:
             logger.warning(f"Downloaded PDF (via {source_description}) {file_path} invalid: {reason}. Deleting.", extra={"url": url, "path": file_path, "reason": reason, "event_type": f"pdf_{source_description}_invalid"})
@@ -312,27 +300,12 @@ async def _handle_pdf_download(response_content: bytes, url: str, source_descrip
         logger.error(f"IOError saving PDF to {file_path}: {e}", extra={"url": url, "path": file_path, "event_type": "pdf_save_io_error"})
         return Failure(type="failure", reason=f"IOError saving PDF: {e}")
 
-
-# --- Main Public API ---
 async def scrape_with_fallback(
     url: str,
-    # Parameters to control behavior, potentially passed by the agent
-    attempt_playwright: bool = True, # Agent might set this to False if it wants to do LLM analysis first
-    playwright_page_content_for_llm: Optional[str] = None # If agent already got Playwright content
+    attempt_playwright: bool = True, 
+    playwright_page_content_for_llm: Optional[str] = None
 ) -> ResolveResult:
-    """
-    Attempts to scrape a URL for full text HTML or a PDF, with multiple fallbacks.
-    Order of operations:
-    1. Direct HTTP GET: Check for HTML full text.
-    2. Direct HTTP GET: Check for PDF content-type.
-    3. (If attempt_playwright is True) Playwright: Render page, check for HTML full text.
-    4. (If attempt_playwright is True) Playwright: Render page, check for PDF download/link.
-    5. LLM analysis (orchestrated by the calling Agent, not directly in this function but this
-       function should be callable in a way that supports the agent's workflow).
-    """
     logger.info(f"Starting advanced scrape for URL: {url}", extra={"url": url, "event_type": "scrape_start"})
-    
-    # Ensure downloads directory exists
     if not os.path.exists(DOWNLOADS_DIR):
         try:
             os.makedirs(DOWNLOADS_DIR)
@@ -341,118 +314,98 @@ async def scrape_with_fallback(
             logger.error(f"Could not create downloads directory {DOWNLOADS_DIR}: {e}", extra={"event_type": "dir_create_fail", "path": DOWNLOADS_DIR})
             return Failure(type="failure", reason=f"Cannot create download directory: {e}")
 
-    # Per-domain concurrency control
     semaphore = await get_domain_semaphore(url)
     logger.info(f"Attempting to acquire semaphore for domain of {url}", extra={"url": url, "domain": urlparse(url).netloc, "event_type": "semaphore_acquire_attempt"})
     
-    async with httpx.AsyncClient(follow_redirects=True) as client, semaphore:
+    async with semaphore:
         logger.info(f"Semaphore acquired for domain of {url}", extra={"url": url, "domain": urlparse(url).netloc, "event_type": "semaphore_acquired"})
-        final_url_after_redirects = url # Will be updated after requests
-
-        try:
-            # Step 1: Direct HTTP GET for HTML full text
-            logger.info(f"Attempting direct GET for HTML: {url}", extra={"url": url, "event_type": "direct_get_html_attempt"})
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            final_url_after_redirects = url 
+            direct_http_exception = None
+            
+            # --- Direct HTTP Attempts ---
             try:
-                get_response_html = await _make_request_with_retry(client, "GET", url, headers={"Accept": "text/html,*/*;q=0.8"})
-                final_url_after_redirects = str(get_response_html.url)
-                content_type_html = get_response_html.headers.get("content-type", "").lower()
+                logger.info(f"Attempting direct GET for HTML/PDF: {url}", extra={"url": url, "event_type": "direct_get_html_pdf_attempt"})
+                get_response = await _make_request_with_retry(client, "GET", url, headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"})
+                final_url_after_redirects = str(get_response.url)
+                content_type = get_response.headers.get("content-type", "").lower()
 
-                if "html" in content_type_html:
-                    html_content = get_response_html.text
+                if "html" in content_type:
+                    html_content = get_response.text
                     extracted_text = await _extract_html_text(html_content, final_url_after_redirects)
                     if extracted_text:
                         paywalled = is_html_potentially_paywalled(html_content)
-                        # Check length conditions from resolve_pdf_link
                         if len(extracted_text) >= MIN_CHARS_FOR_FULL_ARTICLE_OVERRIDE:
                             logger.info(f"Direct GET: Long HTML content from {final_url_after_redirects} overrides paywall flag.", extra={"url": final_url_after_redirects, "length": len(extracted_text), "event_type": "direct_html_long_override_paywall"})
                             return HTMLResult(type="html", text=extracted_text, url=final_url_after_redirects)
                         elif not paywalled and len(extracted_text) >= MIN_HTML_CONTENT_LENGTH:
-                             logger.info(f"Direct GET: Sufficient non-paywalled HTML from {final_url_after_redirects}.", extra={"url": final_url_after_redirects, "length": len(extracted_text), "event_type": "direct_html_sufficient_success"})
-                             return HTMLResult(type="html", text=extracted_text, url=final_url_after_redirects)
+                            logger.info(f"Direct GET: Sufficient non-paywalled HTML from {final_url_after_redirects}.", extra={"url": final_url_after_redirects, "length": len(extracted_text), "event_type": "direct_html_sufficient_success"})
+                            return HTMLResult(type="html", text=extracted_text, url=final_url_after_redirects)
                         elif paywalled:
                             logger.info(f"Direct GET: HTML from {final_url_after_redirects} is short or paywalled.", extra={"url": final_url_after_redirects, "length": len(extracted_text), "paywalled": paywalled, "event_type": "direct_html_paywalled_or_short"})
-                        # else: too short, continue
-                    else:
+                    else: 
                         logger.info(f"Direct GET: No substantial HTML text extracted from {final_url_after_redirects}.", extra={"url": final_url_after_redirects, "event_type": "direct_html_no_extract"})
-                else:
-                    logger.info(f"Direct GET: Content-Type for {final_url_after_redirects} is not HTML: {content_type_html}", extra={"url": final_url_after_redirects, "content_type": content_type_html, "event_type": "direct_get_not_html"})
+                
+                elif content_type.startswith("application/pdf"):
+                    logger.info(f"Direct GET indicates PDF for {final_url_after_redirects}. Downloading.", extra={"url": final_url_after_redirects, "event_type": "direct_get_pdf_detected"})
+                    pdf_dl_result = await _handle_pdf_download(get_response.content, final_url_after_redirects, "direct_get")
+                    if pdf_dl_result.type == "file":
+                        return pdf_dl_result 
+                    else: 
+                        logger.warning(f"Direct GET PDF download/validation failed for {final_url_after_redirects}: {pdf_dl_result.reason}", extra={"url":final_url_after_redirects, "reason":pdf_dl_result.reason, "event_type":"direct_get_pdf_fail_validation"})
+                
+                else: 
+                    logger.info(f"Direct GET: Content-Type for {final_url_after_redirects} is not HTML or PDF: {content_type}. Status: {get_response.status_code}", extra={"url": final_url_after_redirects, "content_type": content_type, "status_code": get_response.status_code, "event_type": "direct_get_not_html_or_pdf"})
+                    if get_response.status_code != 200:
+                         direct_http_exception = httpx.HTTPStatusError(f"Status {get_response.status_code} from direct GET", request=get_response.request, response=get_response)
+                         logger.warning(f"Direct GET for {url} resulted in status {get_response.status_code}.", extra={"url":url, "status_code":get_response.status_code, "event_type":"direct_get_non_200_status"})
 
-            except httpx.HTTPStatusError as e:
-                logger.warning(f"Direct GET for HTML for {url} failed with HTTP {e.response.status_code}", extra={"url": url, "status_code": e.response.status_code, "event_type": "direct_get_html_http_fail"})
-                # If 403/405, HEAD might also fail, but we try HEAD for PDF next anyway
-            except httpx.RequestError as e:
-                logger.warning(f"Direct GET for HTML for {url} failed with RequestError: {e}", extra={"url": url, "error": str(e), "event_type": "direct_get_html_request_fail"})
-                # Continue to PDF attempt
+            except httpx.HTTPStatusError as e_direct_status:
+                logger.warning(f"Direct GET for HTML/PDF for {url} failed with HTTP {e_direct_status.response.status_code}", extra={"url": url, "status_code": e_direct_status.response.status_code, "event_type": "direct_get_http_status_fail"})
+                direct_http_exception = e_direct_status 
+            except httpx.RequestError as e_direct_request:
+                logger.warning(f"Direct GET for HTML/PDF for {url} failed with RequestError: {e_direct_request}", extra={"url": url, "error": str(e_direct_request), "event_type": "direct_get_request_fail"})
+                direct_http_exception = e_direct_request
+            except Exception as e_unexpected_direct: 
+                logger.error(f"Unexpected error during direct HTTP phase for {url}: {e_unexpected_direct}", exc_info=True, extra={"url":url, "event_type":"direct_http_unexpected_error"})
+                direct_http_exception = e_unexpected_direct
 
-            # Step 2: Direct HEAD/GET for PDF
-            logger.info(f"Attempting direct HEAD/GET for PDF: {url}", extra={"url": url, "event_type": "direct_pdf_attempt"})
-            try:
-                head_response_pdf = await _make_request_with_retry(client, "HEAD", url, headers={"Accept": "application/pdf,*/*;q=0.8"})
-                final_url_after_redirects = str(head_response_pdf.url) # Update final_url
-                content_type_pdf_head = head_response_pdf.headers.get("content-type", "").lower()
-                if content_type_pdf_head.startswith("application/pdf"):
-                    logger.info(f"HEAD indicates PDF for {final_url_after_redirects}. Downloading with GET.", extra={"url": final_url_after_redirects, "event_type": "direct_head_pdf_detected"})
-                    pdf_get_response = await _make_request_with_retry(client, "GET", final_url_after_redirects) # Use final_url_after_redirects
-                    return await _handle_pdf_download(pdf_get_response.content, final_url_after_redirects, "direct_head_then_get")
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in [403, 405]: # HEAD not allowed, try GET directly for PDF
-                    logger.info(f"HEAD for PDF for {url} failed ({e.response.status_code}), trying direct GET for PDF.", extra={"url": url, "status_code": e.response.status_code, "event_type": "direct_head_pdf_fail_try_get"})
-                    try:
-                        get_response_pdf = await _make_request_with_retry(client, "GET", url, headers={"Accept": "application/pdf,*/*;q=0.8"})
-                        final_url_after_redirects = str(get_response_pdf.url)
-                        content_type_pdf_get = get_response_pdf.headers.get("content-type", "").lower()
-                        if content_type_pdf_get.startswith("application/pdf"):
-                            logger.info(f"Direct GET indicates PDF for {final_url_after_redirects}.", extra={"url": final_url_after_redirects, "event_type": "direct_get_pdf_detected"})
-                            return await _handle_pdf_download(get_response_pdf.content, final_url_after_redirects, "direct_get")
-                    except httpx.RequestError as e_get: # Includes HTTPStatusError
-                         logger.warning(f"Direct GET for PDF for {url} also failed: {e_get}", extra={"url": url, "error": str(e_get), "event_type": "direct_get_pdf_fail"})
-                else:
-                    logger.warning(f"HEAD for PDF for {url} failed: {e}", extra={"url": url, "error": str(e), "event_type": "direct_head_pdf_fail_other"})
-            except httpx.RequestError as e:
-                logger.warning(f"Direct PDF check for {url} failed with RequestError: {e}", extra={"url": url, "error": str(e), "event_type": "direct_pdf_request_fail"})
-
-
-            # Step 3 & 4: Playwright fallback (if enabled)
+            # --- Playwright Attempt ---
             if attempt_playwright:
-                logger.info(f"Attempting Playwright fallback for: {url}", extra={"url": url, "event_type": "playwright_attempt"})
-                # Placeholder for Playwright logic
-                # This will involve:
-                # from playwright.async_api import async_playwright
-                # async with async_playwright() as p:
-                #   browser = await p.chromium.launch(proxy=...)
-                #   page = await browser.new_page()
-                #   await page.goto(url)
-                #   rendered_html = await page.content()
-                #   Check rendered_html for full text (call _extract_html_text)
-                #   If HTML found and good, return HTMLResult
-                #   Else, look for PDF downloads/links
-                #     - page.on("download", handle_download_event)
-                #     - Search DOM for PDF links
-                #   await browser.close()
+                logger.info(f"Attempting Playwright fallback for: {url} (Direct HTTP exception was: {type(direct_http_exception).__name__ if direct_http_exception else 'None'})", 
+                            extra={"url": url, "direct_http_exception_type": type(direct_http_exception).__name__ if direct_http_exception else None, 
+                                   "direct_http_exception_details": str(direct_http_exception) if direct_http_exception else None, 
+                                   "event_type": "playwright_attempt_after_direct"})
+                
                 playwright_result: Optional[ResolveResult] = None
+                # Ensure random is available in this scope, even if imported globally.
+                # import random # This is already at the top of the file, should not be needed here.
+                                # The UnboundLocalError suggests it's not seen. Let's trust the global import for now.
                 try:
                     async with async_playwright() as p:
                         browser_args = []
-                        # Basic proxy integration for Playwright
                         playwright_proxy_config = None
                         if PROXY_SETTINGS.get("enabled") and PROXY_SETTINGS.get("proxies"):
-                            import random
-                            # Select a random proxy. More sophisticated selection could be added.
+                            # import random # Rely on global import
                             proxy_url_full = random.choice(PROXY_SETTINGS["proxies"])
                             parsed_proxy = urlparse(proxy_url_full)
-                            playwright_proxy_config = {
-                                "server": f"{parsed_proxy.scheme}://{parsed_proxy.hostname}:{parsed_proxy.port}",
-                            }
-                            if parsed_proxy.username:
-                                playwright_proxy_config["username"] = parsed_proxy.username
-                            if parsed_proxy.password:
-                                playwright_proxy_config["password"] = parsed_proxy.password
+                            playwright_proxy_config = { "server": f"{parsed_proxy.scheme}://{parsed_proxy.hostname}:{parsed_proxy.port}" }
+                            if parsed_proxy.username: playwright_proxy_config["username"] = parsed_proxy.username
+                            if parsed_proxy.password: playwright_proxy_config["password"] = parsed_proxy.password
                             logger.info(f"Playwright using proxy: {playwright_proxy_config['server']}", extra={"url": url, "event_type": "playwright_proxy_use"})
                         
                         browser = await p.chromium.launch(proxy=playwright_proxy_config, args=browser_args)
                         page = await browser.new_page()
+                        await page.set_viewport_size({"width": 1920, "height": 1080}) # Set viewport
                         
-                        # PDF download interception
+                        # Ensure random is available for the timeout call
+                        # This is belt-and-suspenders as it's imported globally
+                        # import random # Already globally imported, this line is not needed if global works.
+                                        # Given UnboundLocalError, let's ensure it's in scope if there's an odd issue.
+                                        # Re-evaluating: the global import should be sufficient.
+                                        # The error might stem from how asyncio tasks/scopes are handled.
+                                        # Forcing it into local scope for this call:
+                        
                         download_info = {"path": None, "url": None, "error": None}
 
                         async def handle_download(download):
@@ -461,35 +414,38 @@ async def scrape_with_fallback(
                                 if not suggested_filename.lower().endswith(".pdf"):
                                     logger.warning(f"Playwright download is not a PDF: {suggested_filename}", extra={"url": url, "filename": suggested_filename, "event_type": "playwright_download_not_pdf"})
                                     download_info["error"] = "Downloaded file not a PDF."
-                                    await download.cancel() # or delete() if already saved
+                                    await download.cancel()
                                     return
-
                                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                                 url_part = "".join(c if c.isalnum() else "_" for c in urlparse(url).netloc[:30] + urlparse(url).path.replace('/', '_')[:30])
                                 file_name = f"{timestamp}_{url_part}_playwright.pdf"
                                 save_path = os.path.join(DOWNLOADS_DIR, file_name)
                                 await download.save_as(save_path)
                                 download_info["path"] = save_path
-                                download_info["url"] = download.url # URL of the download
+                                download_info["url"] = download.url
                                 logger.info(f"Playwright download saved to {save_path}", extra={"url": url, "path": save_path, "download_url": download.url, "event_type": "playwright_download_saved"})
                             except Exception as e_download:
                                 logger.error(f"Error handling Playwright download: {e_download}", exc_info=True, extra={"url": url, "event_type": "playwright_download_handler_error"})
                                 download_info["error"] = str(e_download)
                             
                         page.on("download", handle_download)
-
+                        logger.info(f"Playwright: Navigating to {url}", extra={"url": url, "event_type": "playwright_goto_attempt"})
+                        pw_response_status = None
                         try:
-                            await page.goto(url, timeout=REQUEST_TIMEOUT * 1000 * 2, wait_until="networkidle") # Longer timeout for playwright, wait for network idle
-                            final_url_after_redirects = page.url # Update with Playwright's final URL
+                            pw_nav_response = await page.goto(url, timeout=REQUEST_TIMEOUT * 1000 * 2, wait_until="networkidle")
+                            # Use the globally imported random
+                            await page.wait_for_timeout(random.randint(2000, 5000)) 
+                            final_url_after_redirects = page.url
+                            pw_response_status = pw_nav_response.status if pw_nav_response else None
+                            logger.info(f"Playwright: Navigation to {final_url_after_redirects} completed with status {pw_response_status}", extra={"url": url, "final_url": final_url_after_redirects, "status": pw_response_status, "event_type": "playwright_goto_success"})
                         except PlaywrightTimeoutError:
-                            logger.warning(f"Playwright timed out navigating to {url}. Content might be partial.", extra={"url": url, "event_type": "playwright_nav_timeout"})
-                            # Continue with potentially partial content
+                            logger.warning(f"Playwright: Timed out navigating to {url}. Content might be partial.", extra={"url": url, "event_type": "playwright_nav_timeout"})
+                            final_url_after_redirects = page.url 
                         except PlaywrightError as e_goto:
-                            logger.error(f"Playwright navigation error for {url}: {e_goto}", exc_info=True, extra={"url": url, "event_type": "playwright_nav_error"})
+                            logger.error(f"Playwright: Navigation error for {url}: {e_goto}", exc_info=True, extra={"url": url, "event_type": "playwright_nav_error"})
                             await browser.close()
-                            return Failure(type="failure", reason=f"Playwright navigation error: {e_goto}")
+                            return Failure(type="failure", reason=f"Playwright navigation error: {e_goto}", status_code=getattr(e_goto, 'response_status', None))
 
-                        # Check if PDF was downloaded via event
                         if download_info["path"]:
                             is_valid, reason = is_pdf_content_valid(download_info["path"])
                             if is_valid:
@@ -499,16 +455,16 @@ async def scrape_with_fallback(
                                 logger.warning(f"Playwright auto-downloaded PDF invalid: {reason}. Deleting.", extra={"url": url, "path": download_info["path"], "reason": reason, "event_type": "playwright_autodownload_pdf_invalid"})
                                 try: os.remove(download_info["path"])
                                 except OSError: pass
-                                # Don't return failure yet, try extracting HTML or finding link
                         elif download_info["error"]:
                              logger.warning(f"Playwright download event error: {download_info['error']}", extra={"url": url, "event_type": "playwright_download_event_error"})
 
-
-                        if not playwright_result: # If PDF not auto-downloaded and valid
+                        if not playwright_result:
+                            logger.info(f"Playwright: Attempting to get page content from {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_get_content_attempt"})
                             rendered_html = await page.content()
-                            # Attempt 3a (Playwright): Extract HTML full text from rendered page
+                            logger.info(f"Playwright: Got page content, length {len(rendered_html)} chars from {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "content_length": len(rendered_html), "event_type": "playwright_get_content_success"})
                             extracted_text_playwright = await _extract_html_text(rendered_html, final_url_after_redirects)
                             if extracted_text_playwright:
+                                logger.info(f"Playwright: Extracted text length {len(extracted_text_playwright)} from {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "extracted_length": len(extracted_text_playwright), "event_type": "playwright_text_extraction_info"})
                                 paywalled_playwright = is_html_potentially_paywalled(rendered_html)
                                 if len(extracted_text_playwright) >= MIN_CHARS_FOR_FULL_ARTICLE_OVERRIDE:
                                     logger.info(f"Playwright: Long HTML content from {final_url_after_redirects} overrides paywall.", extra={"url": final_url_after_redirects, "length": len(extracted_text_playwright), "event_type": "playwright_html_long_override_paywall"})
@@ -517,61 +473,164 @@ async def scrape_with_fallback(
                                     logger.info(f"Playwright: Sufficient non-paywalled HTML from {final_url_after_redirects}.", extra={"url": final_url_after_redirects, "length": len(extracted_text_playwright), "event_type": "playwright_html_sufficient_success"})
                                     playwright_result = HTMLResult(type="html", text=extracted_text_playwright, url=final_url_after_redirects)
                                 else:
-                                    logger.info(f"Playwright: HTML from {final_url_after_redirects} is short or paywalled.", extra={"url": final_url_after_redirects, "length": len(extracted_text_playwright), "paywalled": paywalled_playwright, "event_type": "playwright_html_paywalled_or_short"})
+                                    logger.info(f"Playwright: HTML from {final_url_after_redirects} is short or paywalled. Paywalled: {paywalled_playwright}, Length: {len(extracted_text_playwright)}", extra={"url": final_url_after_redirects, "length": len(extracted_text_playwright), "paywalled": paywalled_playwright, "event_type": "playwright_html_paywalled_or_short"})
                             else:
                                 logger.info(f"Playwright: No substantial HTML text extracted from {final_url_after_redirects}.", extra={"url": final_url_after_redirects, "event_type": "playwright_html_no_extract"})
                         
-                        if not playwright_result: # If HTML not good, try finding PDF links in Playwright DOM
-                            # Attempt 3b (Playwright): Find PDF links in rendered DOM
-                            # This could reuse domain_rules or use generic selectors
-                            # For now, a simple search for <a> tags with .pdf href
-                            pdf_links = await page.query_selector_all("a[href$='.pdf']")
+                        if not playwright_result:
+                            logger.info(f"Playwright: Attempting to find PDF links in DOM of {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_find_pdf_links_attempt"})
+                            pdf_links = await page.query_selector_all("a[href$='.pdf'], a[href*='downloadSgArticle'], a[href*='pdfLink']")
                             if pdf_links:
-                                for link_element in pdf_links:
+                                logger.info(f"Playwright: Found {len(pdf_links)} potential PDF links in DOM of {final_url_after_redirects}.", extra={"url": url, "final_url": final_url_after_redirects, "count": len(pdf_links), "event_type": "playwright_found_pdf_links_count"})
+                                for i, link_element in enumerate(pdf_links):
                                     pdf_url_rel = await link_element.get_attribute("href")
                                     if pdf_url_rel:
                                         pdf_abs_url = urlparse(final_url_after_redirects)._replace(path=pdf_url_rel).geturl() if not pdf_url_rel.startswith(('http://', 'https://')) else pdf_url_rel
-                                        logger.info(f"Playwright found potential PDF link: {pdf_abs_url}", extra={"url": url, "pdf_link": pdf_abs_url, "event_type": "playwright_found_pdf_link"})
-                                        # Try to fetch this PDF link using httpx
+                                        logger.info(f"Playwright: Trying PDF link {i+1}/{len(pdf_links)}: {pdf_abs_url}", extra={"url": url, "pdf_link": pdf_abs_url, "event_type": "playwright_try_pdf_link"})
                                         try:
-                                            async with httpx.AsyncClient(follow_redirects=True) as pdf_client: # New client for this
+                                            async with httpx.AsyncClient(follow_redirects=True) as pdf_client:
                                                 pdf_response = await _make_request_with_retry(pdf_client, "GET", pdf_abs_url)
                                                 pdf_content_type = pdf_response.headers.get("content-type", "").lower()
                                                 if pdf_content_type.startswith("application/pdf"):
                                                     dl_result = await _handle_pdf_download(pdf_response.content, pdf_abs_url, "playwright_link_get")
                                                     if dl_result.type == "file":
                                                         playwright_result = dl_result
-                                                        break # Found a valid PDF
+                                                        logger.info(f"Playwright: Successfully downloaded PDF from link {pdf_abs_url}", extra={"url":url, "pdf_link":pdf_abs_url, "event_type":"playwright_pdf_link_download_success"})
+                                                        break 
+                                                else:
+                                                    logger.warning(f"Playwright: PDF link {pdf_abs_url} did not return PDF content-type: {pdf_content_type}", extra={"url":url, "pdf_link":pdf_abs_url, "content_type":pdf_content_type, "event_type":"playwright_pdf_link_wrong_content_type"})
                                         except Exception as e_fetch_link:
-                                            logger.warning(f"Playwright: Error fetching PDF link {pdf_abs_url}: {e_fetch_link}", extra={"url": url, "pdf_link": pdf_abs_url, "event_type": "playwright_fetch_pdf_link_error"})
+                                            logger.warning(f"Playwright: Error fetching PDF link {pdf_abs_url}: {e_fetch_link}", exc_info=True, extra={"url": url, "pdf_link": pdf_abs_url, "event_type": "playwright_fetch_pdf_link_error"})
+                            else:
+                                logger.info(f"Playwright: No PDF links found in DOM of {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_no_pdf_links_found"})
+                        
+                        logger.info(f"Playwright: Closing browser for {url}", extra={"url": url, "event_type": "playwright_browser_close"})
                         await browser.close()
                         if playwright_result:
                             return playwright_result
-                        
                 except PlaywrightError as e_pw:
                     logger.error(f"Playwright processing error for {url}: {e_pw}", exc_info=True, extra={"url": url, "event_type": "playwright_general_error"})
-                    # Fall through to general failure, or specific failure if desired
-                except Exception as e_pw_unhandled: # Catch any other unhandled playwright errors
+                except Exception as e_pw_unhandled:
                     logger.error(f"Unhandled Playwright exception for {url}: {e_pw_unhandled}", exc_info=True, extra={"url": url, "event_type": "playwright_unhandled_exception"})
+                
+                # If Python Playwright didn't get a result, try Node.js stealth fetcher
+                if not playwright_result:
+                    logger.info(f"Python Playwright failed for {url}, trying Node.js stealth fetcher.", extra={"url": url, "event_type": "nodejs_fallback_attempt"})
+                    nodejs_result = await _run_nodejs_stealth_fetcher(url)
+                    if nodejs_result.type == "html": # Assuming Node.js primarily returns HTML for now
+                        # Potentially re-validate or re-extract if needed, or trust Node.js output
+                        logger.info(f"Node.js stealth fetcher succeeded for {url}.", extra={"url": url, "final_url": nodejs_result.url, "event_type": "nodejs_fallback_success"})
+                        return nodejs_result
+                    else: # Node.js fetcher also failed or returned non-HTML
+                        logger.warning(f"Node.js stealth fetcher also failed for {url}. Reason: {nodejs_result.reason}", 
+                                       extra={"url": url, "reason": nodejs_result.reason, "event_type": "nodejs_fallback_failure"})
+                        # playwright_result remains None or the failure from Python's Playwright
 
+        # If all methods (direct HTTP, Python Playwright, and Node.js fetcher if attempted) failed:
+        logger.warning(f"All scraping attempts failed for {url} after trying direct, Python Playwright, and Node.js fetcher (if enabled).", 
+                       extra={"url": url, "event_type": "all_methods_failed_final", 
+                              "direct_http_exception": str(direct_http_exception) if direct_http_exception else "None"})
+        # Determine the most relevant status code if one was captured
+        final_status_code = None
+        if isinstance(direct_http_exception, httpx.HTTPStatusError):
+            final_status_code = direct_http_exception.response.status_code
+        # We could also try to get a status from Playwright failure if that was the last thing tried.
+        
+        return Failure(type="failure", 
+                       reason="All scraping attempts (direct HTTP, Playwright if enabled) failed to yield valid content.", 
+                       status_code=final_status_code)
 
-            # If all above fail, return a generic failure.
-            # The agent might take this failure and then try LLM analysis on any fetched content.
-            logger.warning(f"All direct and Playwright (if attempted) methods failed for {url}.", extra={"url": url, "event_type": "all_methods_failed"})
-            return Failure(type="failure", reason="All scraping attempts (direct HTTP, Playwright if enabled) failed to yield valid content.", status_code=None)
+    # `async with semaphore:` and `async with client:` will handle their own cleanup.
+    # The "Semaphore released" and "Finished advanced scrape" logs are implicitly covered by exiting these blocks.
+    # Or, if explicit end-of-function logging is desired, it should be outside the `async with semaphore` if it means the absolute end.
+    # For now, the structure implies completion when a result is returned or the final Failure is returned.
 
-        except httpx.HTTPStatusError as e_outer:
-            logger.error(f"Outer HTTP error for {url}: {e_outer.response.status_code}", extra={"url": url, "status_code": e_outer.response.status_code, "event_type": "scrape_http_status_error_final"})
-            return Failure(type="failure", reason=f"HTTP error: {e_outer.response.status_code} for URL: {url}", status_code=e_outer.response.status_code)
-        except httpx.RequestError as e_outer:
-            logger.error(f"Outer Request error for {url}: {e_outer!s}", extra={"url": url, "error": str(e_outer), "event_type": "scrape_request_error_final"})
-            return Failure(type="failure", reason=f"Request failed: {e_outer!s}")
-        except Exception as e_outer:
-            logger.critical(f"Unexpected error scraping {url}: {e_outer!s}", exc_info=True, extra={"url": url, "error": str(e_outer), "event_type": "scrape_unexpected_error"})
-            return Failure(type="failure", reason=f"An unexpected error occurred during scraping: {e_outer!s}")
-        finally:
-            logger.info(f"Semaphore released for domain of {url}", extra={"url": url, "domain": urlparse(url).netloc, "event_type": "semaphore_released"})
-            logger.info(f"Finished advanced scrape for URL: {url}", extra={"url": url, "event_type": "scrape_end"})
+async def _run_nodejs_stealth_fetcher(url: str) -> ResolveResult:
+    """
+    Runs the Node.js stealth_fetcher.js script as a subprocess.
+    """
+    script_path = os.path.join("tools", "stealth_fetcher.js") # Assumes script is in tools/ relative to project root
+    node_executable = "node" # Or specify full path if necessary, e.g., "/usr/local/bin/node"
+
+    # Check if Node.js script exists
+    if not os.path.exists(script_path):
+        logger.error(f"Node.js fetcher script not found at {script_path}", 
+                     extra={"url": url, "script_path": script_path, "event_type": "nodejs_script_not_found"})
+        return Failure(type="failure", reason=f"Node.js stealth_fetcher.js script not found at {script_path}.")
+
+    cmd = [node_executable, script_path, url]
+    logger.info(f"Running Node.js stealth fetcher for {url}: {' '.join(cmd)}", 
+                extra={"url": url, "command": " ".join(cmd), "event_type": "nodejs_fetch_start"})
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate() # Consider a timeout here as well
+
+        if process.returncode != 0:
+            stderr_str = stderr.decode('utf-8', errors='replace').strip() if stderr else "Unknown error"
+            logger.error(f"Node.js stealth fetcher for {url} exited with code {process.returncode}. Stderr: {stderr_str}", 
+                         extra={"url": url, "returncode": process.returncode, "stderr": stderr_str, "event_type": "nodejs_fetch_error_exit"})
+            try: # Try to parse stderr if it's our JSON error
+                error_data = json.loads(stderr_str)
+                message = error_data.get("message", stderr_str)
+                return Failure(type="failure", reason=f"Node.js script error: {message}")
+            except json.JSONDecodeError:
+                return Failure(type="failure", reason=f"Node.js script failed (code {process.returncode}): {stderr_str}")
+
+        stdout_str = stdout.decode('utf-8', errors='replace').strip() if stdout else ""
+        if not stdout_str:
+            logger.warning(f"Node.js stealth fetcher for {url} produced no stdout.", 
+                           extra={"url": url, "event_type": "nodejs_fetch_no_stdout"})
+            return Failure(type="failure", reason="Node.js script produced no output.")
+
+        try:
+            result_json = json.loads(stdout_str)
+            if result_json.get("status") == "success":
+                html_text = result_json.get("html")
+                final_url_from_node = result_json.get("final_url", url)
+                # The Node.js script provides 'html' (Readability's HTML) and 'main_text'
+                # We'll use the 'html' if it's substantial.
+                if html_text and len(html_text) >= MIN_HTML_CONTENT_LENGTH:
+                    logger.info(f"Node.js stealth fetcher success for {url}. HTML length: {len(html_text)}", 
+                                 extra={"url": url, "final_url": final_url_from_node, "length": len(html_text), "event_type": "nodejs_fetch_success"})
+                    # Here, we might want to re-run Python's _extract_html_text on the result_json.get("html")
+                    # if the Node.js readability output isn't exactly what we want, or trust it directly.
+                    # For now, let's return it as HTMLResult.
+                    return HTMLResult(type="html", text=html_text, url=final_url_from_node)
+                else:
+                    logger.warning(f"Node.js stealth fetcher for {url} returned success but HTML content was too short or missing.",
+                                   extra={"url":url, "length": len(html_text) if html_text else 0, "event_type": "nodejs_fetch_success_short_html"})
+                    return Failure(type="failure", reason="Node.js script returned success but content was too short.")
+            
+            elif result_json.get("status") == "error":
+                error_message = result_json.get('message', 'Unknown error from Node.js script')
+                logger.error(f"Node.js stealth fetcher for {url} reported an error: {error_message}", 
+                             extra={"url": url, "error_message": error_message, "event_type": "nodejs_fetch_script_reported_error"})
+                return Failure(type="failure", reason=f"Node.js script error: {error_message}")
+            else:
+                logger.error(f"Node.js stealth fetcher for {url} returned unknown JSON structure: {stdout_str[:200]}...",
+                             extra={"url":url, "output_snippet": stdout_str[:200], "event_type": "nodejs_fetch_unknown_json"})
+                return Failure(type="failure", reason="Node.js script returned unknown JSON structure.")
+
+        except json.JSONDecodeError:
+            logger.error(f"Failed to decode JSON from Node.js stealth fetcher for {url}. Output: {stdout_str[:200]}...",
+                         extra={"url": url, "output_snippet": stdout_str[:200], "event_type": "nodejs_fetch_json_decode_error"})
+            # Potentially, the output might be raw HTML if the Node.js script failed before stringifying
+            # For now, strict JSON parsing.
+            return Failure(type="failure", reason="Failed to decode JSON output from Node.js script.")
+
+    except FileNotFoundError: # For node executable itself
+        logger.critical(f"Node.js executable '{node_executable}' not found. Cannot run stealth fetcher.", 
+                        extra={"url": url, "node_executable": node_executable, "event_type": "nodejs_executable_not_found"})
+        return Failure(type="failure", reason=f"Node.js executable '{node_executable}' not found.")
+    except Exception as e:
+        logger.critical(f"Exception running Node.js stealth fetcher for {url}: {e}", exc_info=True, 
+                        extra={"url": url, "event_type": "nodejs_fetch_exception"})
+        return Failure(type="failure", reason=f"Exception running Node.js script: {e}")
 
 
 if __name__ == "__main__":
