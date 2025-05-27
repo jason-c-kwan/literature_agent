@@ -33,6 +33,7 @@ MIN_PDF_SIZE_KB = 10
 MIN_HTML_CONTENT_LENGTH = 200
 MIN_CHARS_FOR_FULL_ARTICLE_OVERRIDE = 7000 # from resolve_pdf_link.py
 DOWNLOADS_DIR = "workspace/downloads/advanced_scraper" # Separate download dir
+PLAYWRIGHT_NAV_TIMEOUT = 90000 # 90 seconds for Playwright navigation
 
 def load_yaml_config(path: str, default: Dict = None) -> Dict:
     """Loads a YAML configuration file."""
@@ -432,9 +433,9 @@ async def scrape_with_fallback(
                         logger.info(f"Playwright: Navigating to {url}", extra={"url": url, "event_type": "playwright_goto_attempt"})
                         pw_response_status = None
                         try:
-                            pw_nav_response = await page.goto(url, timeout=REQUEST_TIMEOUT * 1000 * 2, wait_until="networkidle")
+                            pw_nav_response = await page.goto(url, timeout=PLAYWRIGHT_NAV_TIMEOUT, wait_until="networkidle")
                             # Use the globally imported random
-                            await page.wait_for_timeout(random.randint(2000, 5000)) 
+                            await page.wait_for_timeout(random.randint(2000, 5000))
                             final_url_after_redirects = page.url
                             pw_response_status = pw_nav_response.status if pw_nav_response else None
                             logger.info(f"Playwright: Navigation to {final_url_after_redirects} completed with status {pw_response_status}", extra={"url": url, "final_url": final_url_after_redirects, "status": pw_response_status, "event_type": "playwright_goto_success"})
@@ -463,7 +464,17 @@ async def scrape_with_fallback(
                             rendered_html = await page.content()
                             logger.info(f"Playwright: Got page content, length {len(rendered_html)} chars from {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "content_length": len(rendered_html), "event_type": "playwright_get_content_success"})
                             extracted_text_playwright = await _extract_html_text(rendered_html, final_url_after_redirects)
+                            
+                            # Check for common verification/error messages
+                            is_verification_page = False
                             if extracted_text_playwright:
+                                verification_keywords = ["verify you are human", "enable javascript and cookies", "security of your connection", "waiting for response"]
+                                lc_extracted_text = extracted_text_playwright.lower()
+                                if any(keyword in lc_extracted_text for keyword in verification_keywords):
+                                    is_verification_page = True
+                                    logger.warning(f"Playwright: Detected verification page content for {final_url_after_redirects}.", extra={"url":url, "final_url":final_url_after_redirects, "event_type":"playwright_verification_page_detected"})
+
+                            if extracted_text_playwright and not is_verification_page:
                                 logger.info(f"Playwright: Extracted text length {len(extracted_text_playwright)} from {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "extracted_length": len(extracted_text_playwright), "event_type": "playwright_text_extraction_info"})
                                 paywalled_playwright = is_html_potentially_paywalled(rendered_html)
                                 if len(extracted_text_playwright) >= MIN_CHARS_FOR_FULL_ARTICLE_OVERRIDE:
@@ -472,9 +483,12 @@ async def scrape_with_fallback(
                                 elif not paywalled_playwright and len(extracted_text_playwright) >= MIN_HTML_CONTENT_LENGTH:
                                     logger.info(f"Playwright: Sufficient non-paywalled HTML from {final_url_after_redirects}.", extra={"url": final_url_after_redirects, "length": len(extracted_text_playwright), "event_type": "playwright_html_sufficient_success"})
                                     playwright_result = HTMLResult(type="html", text=extracted_text_playwright, url=final_url_after_redirects)
-                                else:
-                                    logger.info(f"Playwright: HTML from {final_url_after_redirects} is short or paywalled. Paywalled: {paywalled_playwright}, Length: {len(extracted_text_playwright)}", extra={"url": final_url_after_redirects, "length": len(extracted_text_playwright), "paywalled": paywalled_playwright, "event_type": "playwright_html_paywalled_or_short"})
-                            else:
+                                else: # Short or paywalled
+                                    logger.info(f"Playwright: HTML from {final_url_after_redirects} is short or paywalled (or was verification page). Paywalled: {paywalled_playwright}, Length: {len(extracted_text_playwright)}", extra={"url": final_url_after_redirects, "length": len(extracted_text_playwright), "paywalled": paywalled_playwright, "event_type": "playwright_html_short_or_paywalled"})
+                            elif is_verification_page:
+                                # Already logged, playwright_result remains None to allow fallback
+                                pass
+                            else: # No substantial text extracted
                                 logger.info(f"Playwright: No substantial HTML text extracted from {final_url_after_redirects}.", extra={"url": final_url_after_redirects, "event_type": "playwright_html_no_extract"})
                         
                         if not playwright_result:
@@ -517,18 +531,19 @@ async def scrape_with_fallback(
                 if not playwright_result:
                     logger.info(f"Python Playwright failed for {url}, trying Node.js stealth fetcher.", extra={"url": url, "event_type": "nodejs_fallback_attempt"})
                     nodejs_result = await _run_nodejs_stealth_fetcher(url)
-                    if nodejs_result.type == "html": # Assuming Node.js primarily returns HTML for now
-                        # Potentially re-validate or re-extract if needed, or trust Node.js output
-                        logger.info(f"Node.js stealth fetcher succeeded for {url}.", extra={"url": url, "final_url": nodejs_result.url, "event_type": "nodejs_fallback_success"})
-                        return nodejs_result
-                    else: # Node.js fetcher also failed or returned non-HTML
+                    # _run_nodejs_stealth_fetcher now returns FileResult, HTMLResult, or Failure
+                    if nodejs_result.type == "file" or nodejs_result.type == "html":
+                        logger.info(f"Node.js stealth fetcher succeeded for {url} with type: {nodejs_result.type}.", 
+                                    extra={"url": url, "result_type": nodejs_result.type, "event_type": "nodejs_fallback_success"})
+                        return nodejs_result # This could be FileResult or HTMLResult
+                    else: # Node.js fetcher also failed
                         logger.warning(f"Node.js stealth fetcher also failed for {url}. Reason: {nodejs_result.reason}", 
                                        extra={"url": url, "reason": nodejs_result.reason, "event_type": "nodejs_fallback_failure"})
-                        # playwright_result remains None or the failure from Python's Playwright
+                        # playwright_result remains None or the failure from Python's Playwright, so overall failure.
 
         # If all methods (direct HTTP, Python Playwright, and Node.js fetcher if attempted) failed:
-        logger.warning(f"All scraping attempts failed for {url} after trying direct, Python Playwright, and Node.js fetcher (if enabled).", 
-                       extra={"url": url, "event_type": "all_methods_failed_final", 
+        logger.warning(f"All scraping attempts failed for {url} after trying direct, Python Playwright, and Node.js fetcher (if enabled).",
+                       extra={"url": url, "event_type": "all_methods_failed_final",
                               "direct_http_exception": str(direct_http_exception) if direct_http_exception else "None"})
         # Determine the most relevant status code if one was captured
         final_status_code = None
@@ -549,14 +564,24 @@ async def _run_nodejs_stealth_fetcher(url: str) -> ResolveResult:
     """
     Runs the Node.js stealth_fetcher.js script as a subprocess.
     """
-    script_path = os.path.join("tools", "stealth_fetcher.js") # Assumes script is in tools/ relative to project root
-    node_executable = "node" # Or specify full path if necessary, e.g., "/usr/local/bin/node"
+    script_path = os.path.join("tools", "stealth_fetcher.js")
+    node_executable = "node"
 
-    # Check if Node.js script exists
     if not os.path.exists(script_path):
         logger.error(f"Node.js fetcher script not found at {script_path}", 
                      extra={"url": url, "script_path": script_path, "event_type": "nodejs_script_not_found"})
         return Failure(type="failure", reason=f"Node.js stealth_fetcher.js script not found at {script_path}.")
+
+    # Ensure the download directory for Node.js script exists (it creates it, but good to be sure)
+    # The Node.js script now creates 'workspace/downloads/stealth_dl/'
+    node_dl_dir = os.path.join(os.getcwd(), "workspace", "downloads", "stealth_dl")
+    if not os.path.exists(node_dl_dir):
+        try:
+            os.makedirs(node_dl_dir, exist_ok=True)
+        except OSError as e:
+            logger.error(f"Could not create Node.js download directory {node_dl_dir}: {e}", 
+                         extra={"event_type": "dir_create_fail_node_dl", "path": node_dl_dir})
+            # Non-fatal, as Node.js script might still succeed with HTML or PDF URL
 
     cmd = [node_executable, script_path, url]
     logger.info(f"Running Node.js stealth fetcher for {url}: {' '.join(cmd)}", 
@@ -568,13 +593,25 @@ async def _run_nodejs_stealth_fetcher(url: str) -> ResolveResult:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await process.communicate() # Consider a timeout here as well
+        # Increased timeout for Node.js script execution, as Playwright can be slow
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120.0) # 2 minutes timeout
+        except asyncio.TimeoutError:
+            logger.error(f"Node.js stealth fetcher for {url} timed out after 120s.",
+                         extra={"url": url, "event_type": "nodejs_fetch_timeout"})
+            try:
+                process.kill()
+                await process.wait() # Ensure process is cleaned up
+            except Exception as e_kill:
+                logger.error(f"Error killing timed-out Node.js process: {e_kill}", extra={"url":url, "event_type":"nodejs_kill_error"})
+            return Failure(type="failure", reason="Node.js script execution timed out.")
+
 
         if process.returncode != 0:
             stderr_str = stderr.decode('utf-8', errors='replace').strip() if stderr else "Unknown error"
             logger.error(f"Node.js stealth fetcher for {url} exited with code {process.returncode}. Stderr: {stderr_str}", 
                          extra={"url": url, "returncode": process.returncode, "stderr": stderr_str, "event_type": "nodejs_fetch_error_exit"})
-            try: # Try to parse stderr if it's our JSON error
+            try:
                 error_data = json.loads(stderr_str)
                 message = error_data.get("message", stderr_str)
                 return Failure(type="failure", reason=f"Node.js script error: {message}")
@@ -589,38 +626,94 @@ async def _run_nodejs_stealth_fetcher(url: str) -> ResolveResult:
 
         try:
             result_json = json.loads(stdout_str)
-            if result_json.get("status") == "success":
-                html_text = result_json.get("html")
-                final_url_from_node = result_json.get("final_url", url)
-                # The Node.js script provides 'html' (Readability's HTML) and 'main_text'
-                # We'll use the 'html' if it's substantial.
-                if html_text and len(html_text) >= MIN_HTML_CONTENT_LENGTH:
-                    logger.info(f"Node.js stealth fetcher success for {url}. HTML length: {len(html_text)}", 
-                                 extra={"url": url, "final_url": final_url_from_node, "length": len(html_text), "event_type": "nodejs_fetch_success"})
-                    # Here, we might want to re-run Python's _extract_html_text on the result_json.get("html")
-                    # if the Node.js readability output isn't exactly what we want, or trust it directly.
-                    # For now, let's return it as HTMLResult.
-                    return HTMLResult(type="html", text=html_text, url=final_url_from_node)
+            status = result_json.get("status")
+            final_url_from_node = result_json.get("final_url", url)
+
+            if status == "pdf_downloaded":
+                pdf_path = result_json.get("path")
+                if pdf_path and os.path.exists(pdf_path):
+                    # Validate the PDF downloaded by Node.js
+                    is_valid, reason = is_pdf_content_valid(pdf_path)
+                    if is_valid:
+                        logger.info(f"Node.js stealth fetcher downloaded a valid PDF: {pdf_path}", 
+                                     extra={"url": url, "path": pdf_path, "event_type": "nodejs_pdf_downloaded_valid"})
+                        return FileResult(type="file", path=pdf_path, url=final_url_from_node)
+                    else:
+                        logger.warning(f"Node.js downloaded PDF {pdf_path} is invalid: {reason}. Deleting.", 
+                                       extra={"url": url, "path": pdf_path, "reason": reason, "event_type": "nodejs_pdf_downloaded_invalid"})
+                        try: os.remove(pdf_path)
+                        except OSError as e_del: logger.error(f"Error deleting invalid PDF from Node.js: {e_del}", extra={"path":pdf_path})
+                        return Failure(type="failure", reason=f"Node.js downloaded PDF was invalid: {reason}")
                 else:
-                    logger.warning(f"Node.js stealth fetcher for {url} returned success but HTML content was too short or missing.",
-                                   extra={"url":url, "length": len(html_text) if html_text else 0, "event_type": "nodejs_fetch_success_short_html"})
-                    return Failure(type="failure", reason="Node.js script returned success but content was too short.")
+                    logger.error(f"Node.js reported PDF downloaded but path missing or invalid: {pdf_path}",
+                                 extra={"url":url, "path":pdf_path, "event_type":"nodejs_pdf_path_error"})
+                    return Failure(type="failure", reason="Node.js reported PDF download but path was invalid.")
+
+            elif status == "success_pdf_url":
+                pdf_direct_url = result_json.get("pdf_url")
+                if pdf_direct_url:
+                    logger.info(f"Node.js returned a direct PDF URL: {pdf_direct_url}. Attempting download.",
+                                 extra={"url": url, "pdf_url": pdf_direct_url, "event_type": "nodejs_pdf_url_provided_attempt_dl"})
+                    # Use httpx to download this URL (leverages existing retry, proxy logic if _make_request_with_retry is adapted or similar is used)
+                    async with httpx.AsyncClient(follow_redirects=True, timeout=REQUEST_TIMEOUT * 2) as pdf_client: # Longer timeout for PDF download
+                        try:
+                            # Re-use _make_request_with_retry for robustness
+                            pdf_response = await _make_request_with_retry(pdf_client, "GET", pdf_direct_url, headers={"Accept": "application/pdf,*/*"})
+                            # _handle_pdf_download will save, validate, and return FileResult or Failure
+                            return await _handle_pdf_download(pdf_response.content, pdf_direct_url, "nodejs_pdf_url_download")
+                        except Exception as e_dl:
+                            logger.error(f"Failed to download PDF from URL provided by Node.js ({pdf_direct_url}): {e_dl}",
+                                         exc_info=True, extra={"url":url, "pdf_url":pdf_direct_url, "event_type":"nodejs_pdf_url_download_fail"})
+                            return Failure(type="failure", reason=f"Failed to download PDF from Node.js-provided URL: {e_dl}")
+                else:
+                    logger.error(f"Node.js reported success_pdf_url but no pdf_url provided.",
+                                 extra={"url":url, "event_type":"nodejs_pdf_url_missing"})
+                    return Failure(type="failure", reason="Node.js reported success_pdf_url but pdf_url was missing.")
+
+            elif status == "success": # HTML content
+                html_text = result_json.get("html")
+                # The Node.js script already uses Readability. We can trust its 'html' output
+                # or re-process 'main_text' if preferred.
+                # For now, use the 'html' (which is Readability's processed HTML)
+                if html_text and len(html_text) >= MIN_HTML_CONTENT_LENGTH: # Check length again
+                    logger.info(f"Node.js stealth fetcher success (HTML). Length: {len(html_text)}", 
+                                 extra={"url": url, "final_url": final_url_from_node, "length": len(html_text), "event_type": "nodejs_fetch_success_html"})
+                    # Pass the already processed HTML (from Node's Readability)
+                    # The HTMLResult expects the *extracted text*, not raw HTML.
+                    # We should use _extract_html_text on the html_text from Node.js
+                    # to be consistent with how other HTML is processed.
+                    extracted_node_html = await _extract_html_text(html_text, final_url_from_node)
+                    if extracted_node_html:
+                         return HTMLResult(type="html", text=extracted_node_html, url=final_url_from_node)
+                    else:
+                        failure_reason = "Node.js HTML content failed Python-side extraction."
+                        if result_json.get("source") == "nodejs_stealth_fetcher_buffer_fail_html" and result_json.get("message"):
+                            failure_reason += f" (Node.js buffer error: {result_json.get('message')})"
+                        logger.warning(f"Node.js HTML content for {url} could not be further extracted by Python's _extract_html_text. Reason: {failure_reason}",
+                                       extra={"url":url, "event_type":"nodejs_html_python_extract_fail", "node_message": result_json.get("message")})
+                        return Failure(type="failure", reason=failure_reason)
+
+                else: # HTML too short or missing
+                    failure_reason = "Node.js script returned success (HTML) but content was too short."
+                    if result_json.get("source") == "nodejs_stealth_fetcher_buffer_fail_html" and result_json.get("message"):
+                        failure_reason += f" (Node.js buffer error: {result_json.get('message')})"
+                    logger.warning(f"Node.js stealth fetcher for {url} returned success (HTML) but content was too short or missing. Reason: {failure_reason}",
+                                   extra={"url":url, "length": len(html_text) if html_text else 0, "event_type": "nodejs_fetch_success_short_html", "node_message": result_json.get("message")})
+                    return Failure(type="failure", reason=failure_reason)
             
-            elif result_json.get("status") == "error":
+            elif status == "error":
                 error_message = result_json.get('message', 'Unknown error from Node.js script')
                 logger.error(f"Node.js stealth fetcher for {url} reported an error: {error_message}", 
                              extra={"url": url, "error_message": error_message, "event_type": "nodejs_fetch_script_reported_error"})
                 return Failure(type="failure", reason=f"Node.js script error: {error_message}")
-            else:
-                logger.error(f"Node.js stealth fetcher for {url} returned unknown JSON structure: {stdout_str[:200]}...",
-                             extra={"url":url, "output_snippet": stdout_str[:200], "event_type": "nodejs_fetch_unknown_json"})
-                return Failure(type="failure", reason="Node.js script returned unknown JSON structure.")
+            else: # Unknown status
+                logger.error(f"Node.js stealth fetcher for {url} returned unknown JSON status: {status}. Output: {stdout_str[:200]}...",
+                             extra={"url":url, "status": status, "output_snippet": stdout_str[:200], "event_type": "nodejs_fetch_unknown_json_status"})
+                return Failure(type="failure", reason=f"Node.js script returned unknown status: {status}")
 
         except json.JSONDecodeError:
             logger.error(f"Failed to decode JSON from Node.js stealth fetcher for {url}. Output: {stdout_str[:200]}...",
                          extra={"url": url, "output_snippet": stdout_str[:200], "event_type": "nodejs_fetch_json_decode_error"})
-            # Potentially, the output might be raw HTML if the Node.js script failed before stringifying
-            # For now, strict JSON parsing.
             return Failure(type="failure", reason="Failed to decode JSON output from Node.js script.")
 
     except FileNotFoundError: # For node executable itself
@@ -634,106 +727,9 @@ async def _run_nodejs_stealth_fetcher(url: str) -> ResolveResult:
 
 
 if __name__ == "__main__":
-    async def fetch_specific_pdf_url(url: str) -> ResolveResult:
-        """
-        Attempts to download and validate a PDF from a specific URL,
-        assuming it's a direct link to a PDF.
-        """
-        logger.info(f"Attempting to fetch specific PDF URL: {url}", extra={"url": url, "event_type": "fetch_specific_pdf_attempt"})
-        
-        if not os.path.exists(DOWNLOADS_DIR):
-            try:
-                os.makedirs(DOWNLOADS_DIR)
-            except OSError as e:
-                logger.error(f"Could not create downloads directory {DOWNLOADS_DIR} for specific PDF: {e}", extra={"event_type": "dir_create_fail_specific_pdf", "path": DOWNLOADS_DIR})
-                return Failure(type="failure", reason=f"Cannot create download directory for specific PDF: {e}")
-
-        semaphore = await get_domain_semaphore(url)
-        async with httpx.AsyncClient(follow_redirects=True) as client, semaphore:
-            try:
-                logger.info(f"Fetching specific PDF GET: {url}", extra={"url": url, "event_type": "specific_pdf_get_attempt"})
-                # Use a more specific Accept header if we are sure it's a PDF
-                get_response = await _make_request_with_retry(client, "GET", url, headers={"Accept": "application/pdf,application/octet-stream,*/*;q=0.8"})
-                final_url = str(get_response.url)
-                content_type = get_response.headers.get("content-type", "").lower()
-
-                # Check content type, but also try to save if it looks like PDF data even if type is generic
-                if content_type.startswith("application/pdf") or \
-                   (content_type.startswith("application/octet-stream") and url.lower().endswith(".pdf")):
-                    logger.info(f"Specific PDF URL GET indicates PDF for {final_url} (Content-Type: {content_type}).", extra={"url": final_url, "content_type": content_type, "event_type": "specific_pdf_get_detected"})
-                    return await _handle_pdf_download(get_response.content, final_url, "specific_url_get")
-                else:
-                    # Try saving anyway if the URL ends with .pdf, as content-type might be wrong
-                    if url.lower().endswith(".pdf"):
-                        logger.warning(f"Content-Type for specific PDF URL {final_url} is '{content_type}', but URL ends with .pdf. Attempting to save.", extra={"url": final_url, "content_type": content_type, "event_type": "specific_pdf_suspicious_content_type_save_attempt"})
-                        return await _handle_pdf_download(get_response.content, final_url, "specific_url_suspicious_get")
-                    
-                    logger.warning(f"Specific PDF URL {final_url} did not return PDF content-type: {content_type}", extra={"url": final_url, "content_type": content_type, "event_type": "specific_pdf_not_pdf_content_type"})
-                    return Failure(type="failure", reason=f"URL did not yield PDF content (Content-Type: {content_type})", status_code=get_response.status_code)
-
-            except httpx.HTTPStatusError as e:
-                logger.error(f"HTTP error fetching specific PDF URL {url}: {e.response.status_code}", extra={"url": url, "status_code": e.response.status_code, "event_type": "specific_pdf_http_error"})
-                return Failure(type="failure", reason=f"HTTP error {e.response.status_code} for specific PDF URL: {url}", status_code=e.response.status_code)
-            except httpx.RequestError as e:
-                logger.error(f"Request error fetching specific PDF URL {url}: {e!s}", extra={"url": url, "error": str(e), "event_type": "specific_pdf_request_error"})
-                return Failure(type="failure", reason=f"Request failed for specific PDF URL: {e!s}")
-            except Exception as e:
-                logger.critical(f"Unexpected error fetching specific PDF URL {url}: {e!s}", exc_info=True, extra={"url": url, "error": str(e), "event_type": "specific_pdf_unexpected_error"})
-                return Failure(type="failure", reason=f"Unexpected error for specific PDF URL: {e!s}")
-
-
-async def fetch_specific_pdf_url(url: str) -> ResolveResult:
-    """
-    Attempts to download and validate a PDF from a specific URL,
-    assuming it's a direct link to a PDF.
-    """
-    logger.info(f"Attempting to fetch specific PDF URL: {url}", extra={"url": url, "event_type": "fetch_specific_pdf_attempt"})
-    
-    if not os.path.exists(DOWNLOADS_DIR):
-        try:
-            os.makedirs(DOWNLOADS_DIR)
-        except OSError as e:
-            logger.error(f"Could not create downloads directory {DOWNLOADS_DIR} for specific PDF: {e}", extra={"event_type": "dir_create_fail_specific_pdf", "path": DOWNLOADS_DIR})
-            return Failure(type="failure", reason=f"Cannot create download directory for specific PDF: {e}")
-
-    semaphore = await get_domain_semaphore(url)
-    async with httpx.AsyncClient(follow_redirects=True) as client, semaphore:
-        try:
-            logger.info(f"Fetching specific PDF GET: {url}", extra={"url": url, "event_type": "specific_pdf_get_attempt"})
-            # Use a more specific Accept header if we are sure it's a PDF
-            get_response = await _make_request_with_retry(client, "GET", url, headers={"Accept": "application/pdf,application/octet-stream,*/*;q=0.8"})
-            final_url = str(get_response.url)
-            content_type = get_response.headers.get("content-type", "").lower()
-
-            # Check content type, but also try to save if it looks like PDF data even if type is generic
-            if content_type.startswith("application/pdf") or \
-               (content_type.startswith("application/octet-stream") and url.lower().endswith(".pdf")):
-                logger.info(f"Specific PDF URL GET indicates PDF for {final_url} (Content-Type: {content_type}).", extra={"url": final_url, "content_type": content_type, "event_type": "specific_pdf_get_detected"})
-                return await _handle_pdf_download(get_response.content, final_url, "specific_url_get")
-            else:
-                # Try saving anyway if the URL ends with .pdf, as content-type might be wrong
-                if url.lower().endswith(".pdf"):
-                    logger.warning(f"Content-Type for specific PDF URL {final_url} is '{content_type}', but URL ends with .pdf. Attempting to save.", extra={"url": final_url, "content_type": content_type, "event_type": "specific_pdf_suspicious_content_type_save_attempt"})
-                    return await _handle_pdf_download(get_response.content, final_url, "specific_url_suspicious_get")
-                
-                logger.warning(f"Specific PDF URL {final_url} did not return PDF content-type: {content_type}", extra={"url": final_url, "content_type": content_type, "event_type": "specific_pdf_not_pdf_content_type"})
-                return Failure(type="failure", reason=f"URL did not yield PDF content (Content-Type: {content_type})", status_code=get_response.status_code)
-
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error fetching specific PDF URL {url}: {e.response.status_code}", extra={"url": url, "status_code": e.response.status_code, "event_type": "specific_pdf_http_error"})
-            return Failure(type="failure", reason=f"HTTP error {e.response.status_code} for specific PDF URL: {url}", status_code=e.response.status_code)
-        except httpx.RequestError as e:
-            logger.error(f"Request error fetching specific PDF URL {url}: {e!s}", extra={"url": url, "error": str(e), "event_type": "specific_pdf_request_error"})
-            return Failure(type="failure", reason=f"Request failed for specific PDF URL: {e!s}")
-        except Exception as e:
-            logger.critical(f"Unexpected error fetching specific PDF URL {url}: {e!s}", exc_info=True, extra={"url": url, "error": str(e), "event_type": "specific_pdf_unexpected_error"})
-            return Failure(type="failure", reason=f"Unexpected error for specific PDF URL: {e!s}")
-
-
-if __name__ == "__main__":
     async def main_test():
         # Configure logger for local testing if not already configured by autogen
-        if not logger.handlers or not isinstance(logger.handlers[0].formatter, JsonFormatter):
+        if not logger.handlers or not isinstance(logger.handlers[0].formatter, JsonFormatter): # type: ignore
             logger.handlers.clear() # Clear any existing handlers
             console_handler = logging.StreamHandler()
             console_handler.setFormatter(JsonFormatter())
