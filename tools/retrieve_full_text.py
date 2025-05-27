@@ -5,6 +5,11 @@ import os
 import sys # Added import for sys module
 from typing import List, Dict, Any, Optional, Tuple
 
+# Ensure the project root is in sys.path for sibling imports like 'consts'
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import aiohttp
 import httpx
 from tenacity import retry, stop_after_attempt, wait_random_exponential, before_sleep_log, retry_if_exception_type

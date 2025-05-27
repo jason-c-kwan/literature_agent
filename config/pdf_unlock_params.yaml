@@ -6,3 +6,8 @@ nejm.org:
   - download=true
 tandfonline.com:
   - needAccess=true
+
+block_head:
+  - pubs.acs.org
+  - nejm.org
+  - onlinelibrary.wiley.com

@@ -19,6 +19,8 @@ from readability import Document  # readability-lxml
 import fitz  # PyMuPDF
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError, Download # Added Download
 
+from consts.http_headers import DEFAULT_HEADERS # Added import
+
 # --- Configuration ---
 CONFIG_PATH_SETTINGS = "config/settings.yaml"
 CONFIG_PATH_DOMAINS = "config/domains.yaml"
@@ -33,7 +35,7 @@ MIN_PDF_SIZE_KB = 10
 MIN_HTML_CONTENT_LENGTH = 200
 MIN_CHARS_FOR_FULL_ARTICLE_OVERRIDE = 7000 # from resolve_pdf_link.py
 DOWNLOADS_DIR = "workspace/downloads/advanced_scraper" # Separate download dir
-PLAYWRIGHT_NAV_TIMEOUT = 90000 # 90 seconds for Playwright navigation
+PLAYWRIGHT_NAV_TIMEOUT = 120000 # 120 seconds for Playwright navigation (Increased)
 
 def load_yaml_config(path: str, default: Dict = None) -> Dict:
     """Loads a YAML configuration file."""
@@ -191,13 +193,17 @@ def is_html_potentially_paywalled(full_html_content: str) -> bool:
         return True
     return False
 
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+DEFAULT_USER_AGENT = DEFAULT_HEADERS["User-Agent"] # Use from consts
 
 async def _make_request_with_retry(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> httpx.Response:
-    headers = kwargs.pop("headers", {})
-    if "User-Agent" not in headers:
-        headers["User-Agent"] = DEFAULT_USER_AGENT
+    # Start with DEFAULT_HEADERS, then layer specific headers from kwargs, then ensure User-Agent
+    request_specific_headers = kwargs.pop("headers", {})
+    final_headers = {**DEFAULT_HEADERS, **request_specific_headers}
 
+    # Ensure User-Agent is present, defaulting to DEFAULT_USER_AGENT (which is from DEFAULT_HEADERS)
+    if "User-Agent" not in final_headers:
+        final_headers["User-Agent"] = DEFAULT_USER_AGENT
+    
     current_proxies = None
     if PROXY_SETTINGS.get("enabled") and PROXY_SETTINGS.get("proxies"):
         import random
@@ -210,8 +216,8 @@ async def _make_request_with_retry(client: httpx.AsyncClient, method: str, url: 
     for attempt in range(MAX_RETRIES + 1):
         log_extra = {"url": url, "method": method, "attempt": attempt + 1, "max_retries": MAX_RETRIES}
         try:
-            logger.info(f"Requesting {method} {url}, attempt {attempt + 1}", extra={**log_extra, "event_type": f"{method.lower()}_attempt"})
-            response = await effective_client.request(method, url, timeout=REQUEST_TIMEOUT, headers=headers, **kwargs)
+            logger.info(f"Requesting {method} {url}, attempt {attempt + 1}", extra={**log_extra, "headers_sent": final_headers, "event_type": f"{method.lower()}_attempt"})
+            response = await effective_client.request(method, url, timeout=REQUEST_TIMEOUT, headers=final_headers, **kwargs)
             response.raise_for_status()
             logger.info(f"{method} request to {url} successful (status {response.status_code})", extra={**log_extra, "status_code": response.status_code, "event_type": f"{method.lower()}_success"})
             if effective_client is not client: 
@@ -433,14 +439,82 @@ async def scrape_with_fallback(
                         logger.info(f"Playwright: Navigating to {url}", extra={"url": url, "event_type": "playwright_goto_attempt"})
                         pw_response_status = None
                         try:
-                            pw_nav_response = await page.goto(url, timeout=PLAYWRIGHT_NAV_TIMEOUT, wait_until="networkidle")
-                            # Use the globally imported random
-                            await page.wait_for_timeout(random.randint(2000, 5000))
+                            pw_nav_response = await page.goto(url, timeout=PLAYWRIGHT_NAV_TIMEOUT, wait_until="load") # Changed to 'load' for initial check
                             final_url_after_redirects = page.url
                             pw_response_status = pw_nav_response.status if pw_nav_response else None
-                            logger.info(f"Playwright: Navigation to {final_url_after_redirects} completed with status {pw_response_status}", extra={"url": url, "final_url": final_url_after_redirects, "status": pw_response_status, "event_type": "playwright_goto_success"})
+                            logger.info(f"Playwright: Initial navigation to {final_url_after_redirects} completed with status {pw_response_status}", extra={"url": url, "final_url": final_url_after_redirects, "status": pw_response_status, "event_type": "playwright_goto_initial_success"})
+
+                            # Cloudflare check
+                            page_content_for_cf_check = await page.content()
+                            cf_challenge_present = "cf-chl" in page_content_for_cf_check.lower()
+                            # More robust selector for verify button
+                            verify_button_selector = 'iframe[src*="challenges.cloudflare.com"]' # Check for iframe first
+                            
+                            # Check for iframe containing the challenge
+                            iframe_element = await page.query_selector(verify_button_selector)
+                            if iframe_element:
+                                logger.info(f"Playwright: Cloudflare iframe detected on {final_url_after_redirects}. Attempting to click verify inside iframe.", extra={"url":url, "event_type":"cloudflare_iframe_detected"})
+                                try:
+                                    frame = await iframe_element.content_frame()
+                                    if frame:
+                                        # Common selectors within Cloudflare iframe
+                                        cf_button_selectors_in_iframe = [
+                                            "input[type='button'][value*='Verify']",
+                                            "button:has-text('Verify you are human')",
+                                            "input[type='checkbox']", # Sometimes it's just a checkbox
+                                            "#challenge-stage span.mark" # Another common pattern
+                                        ]
+                                        clicked_in_iframe = False
+                                        for sel in cf_button_selectors_in_iframe:
+                                            verify_button_in_iframe = frame.locator(sel).first
+                                            if await verify_button_in_iframe.is_visible(timeout=5000):
+                                                await verify_button_in_iframe.click(timeout=5000)
+                                                logger.info(f"Playwright: Clicked Cloudflare verify button (selector: {sel}) inside iframe for {final_url_after_redirects}.", extra={"url":url, "selector": sel, "event_type":"cloudflare_verify_clicked_iframe"})
+                                                await page.wait_for_load_state("networkidle", timeout=60000) # Wait for verification to complete
+                                                logger.info(f"Playwright: Network idle after Cloudflare iframe verify click for {final_url_after_redirects}.", extra={"url":url, "event_type":"cloudflare_network_idle_after_iframe_verify"})
+                                                final_url_after_redirects = page.url # Update final URL
+                                                clicked_in_iframe = True
+                                                break
+                                        if not clicked_in_iframe:
+                                            logger.warning(f"Playwright: Cloudflare iframe detected, but no known verify button found/clicked for {final_url_after_redirects}.", extra={"url":url, "event_type":"cloudflare_iframe_verify_button_not_found"})
+                                    else:
+                                        logger.warning(f"Playwright: Could not get content frame for Cloudflare iframe on {final_url_after_redirects}.", extra={"url":url, "event_type":"cloudflare_iframe_no_content_frame"})
+                                except Exception as e_cf_iframe:
+                                    logger.warning(f"Playwright: Error interacting with Cloudflare iframe for {final_url_after_redirects}: {e_cf_iframe}", exc_info=True, extra={"url":url, "event_type":"cloudflare_iframe_interaction_error"})
+                            elif cf_challenge_present: # Fallback to direct button click if no iframe or iframe interaction failed
+                                logger.info(f"Playwright: Cloudflare challenge detected (cf-chl in content) on {final_url_after_redirects}. Looking for verify button.", extra={"url":url, "event_type":"cloudflare_challenge_detected_direct"})
+                                direct_verify_selectors = [
+                                    "button:has-text('Verify you are human')",
+                                    "button:has-text('Verify')",
+                                    "input[type='button'][value*='Verify']"
+                                ]
+                                clicked_direct_button = False
+                                for sel in direct_verify_selectors:
+                                    verify_button = page.locator(sel).first
+                                    if await verify_button.is_visible(timeout=5000):
+                                        await verify_button.click(timeout=5000)
+                                        logger.info(f"Playwright: Clicked direct Cloudflare verify button (selector: {sel}) for {final_url_after_redirects}.", extra={"url":url, "selector": sel, "event_type":"cloudflare_verify_clicked_direct"})
+                                        await page.wait_for_load_state("networkidle", timeout=60000)
+                                        logger.info(f"Playwright: Network idle after direct Cloudflare verify click for {final_url_after_redirects}.", extra={"url":url, "event_type":"cloudflare_network_idle_after_direct_verify"})
+                                        final_url_after_redirects = page.url # Update final URL
+                                        clicked_direct_button = True
+                                        break
+                                if not clicked_direct_button:
+                                     logger.warning(f"Playwright: Cloudflare challenge detected, but no direct verify button found/clicked for {final_url_after_redirects}.", extra={"url":url, "event_type":"cloudflare_direct_verify_button_not_found"})
+                            
+                            # Final wait for network idle if not already done by CF logic, or if CF logic was skipped
+                            if not iframe_element and not cf_challenge_present: # If no CF was detected
+                                await page.wait_for_load_state("networkidle", timeout=PLAYWRIGHT_NAV_TIMEOUT / 2) # Use half of nav timeout
+                                logger.info(f"Playwright: Standard network idle wait for {final_url_after_redirects}.", extra={"url":url, "event_type":"playwright_standard_network_idle"})
+
+                            # Use the globally imported random
+                            await page.wait_for_timeout(random.randint(2000, 5000)) # General post-load delay
+                            final_url_after_redirects = page.url # Update final URL again after all waits
+                            # Re-fetch status if navigation happened due to CF
+                            if pw_nav_response: pw_response_status = pw_nav_response.status 
+
                         except PlaywrightTimeoutError:
-                            logger.warning(f"Playwright: Timed out navigating to {url}. Content might be partial.", extra={"url": url, "event_type": "playwright_nav_timeout"})
+                            logger.warning(f"Playwright: Timed out navigating or waiting for state for {url}. Content might be partial.", extra={"url": url, "event_type": "playwright_nav_timeout_or_wait_fail"})
                             final_url_after_redirects = page.url 
                         except PlaywrightError as e_goto:
                             logger.error(f"Playwright: Navigation error for {url}: {e_goto}", exc_info=True, extra={"url": url, "event_type": "playwright_nav_error"})
