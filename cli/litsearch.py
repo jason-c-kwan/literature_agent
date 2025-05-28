@@ -11,7 +11,7 @@ from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_agentchat.base import TerminationCondition
 from tools.search import LiteratureSearchTool, SearchLiteratureParams
-from typing import Sequence, Any, Optional, List, Union, Type # Added for DebugClient
+from typing import Sequence, Any, Optional, List, Union, Type, Dict # Added Dict
 from pydantic import BaseModel # Added for DebugClient
 from tools.triage import TriageAgent
 from tools.ranking import RankerAgent
@@ -169,7 +169,15 @@ def styled_input(prompt_message: str, console: Console) -> str:
     # Use prompt_toolkit for proper multi-line editing support
     return prompt(f"{plain_prompt} ").strip()
 
-async def run_search_pipeline(query_team: BaseGroupChat, literature_search_tool: LiteratureSearchTool, triage_agent: TriageAgent, original_query: str, console: Console):
+async def run_search_pipeline(
+    query_team: BaseGroupChat, 
+    literature_search_tool: LiteratureSearchTool, 
+    triage_agent: TriageAgent, 
+    original_query: str, 
+    console: Console,
+    settings_config: Dict[str, Any], # Added to access settings
+    cli_args: argparse.Namespace # Added to access parsed CLI args
+):
     all_articles_data = []
     processed_dois_for_articles = set()
     all_refined_queries = []
@@ -180,6 +188,25 @@ async def run_search_pipeline(query_team: BaseGroupChat, literature_search_tool:
     
     console.print(f"[secondary]Initiating research query with GroupChat:[/secondary] [highlight]'{original_query}'[/highlight]")
     
+    # Determine publication types to use
+    final_publication_types_to_use = []
+    if cli_args.pub_types: # CLI flag is provided
+        final_publication_types_to_use = [s.strip().lower() for s in cli_args.pub_types.split(',') if s.strip()]
+        console.print(f"[info]Using publication types from CLI: {final_publication_types_to_use}[/info]")
+    else: # CLI flag not provided, use default from settings
+        default_pub_types_from_settings = settings_config.get('search_settings', {}).get('default_publication_types', [])
+        if default_pub_types_from_settings: # Ensure it's a list and clean
+             final_publication_types_to_use = [str(s).strip().lower() for s in default_pub_types_from_settings if str(s).strip()]
+             console.print(f"[info]Using default publication types from settings: {final_publication_types_to_use}[/info]")
+        else:
+            console.print(f"[info]No publication type filter applied (neither CLI nor settings default provided).[/info]")
+
+    # Determine max_results_per_source
+    default_max_results = settings_config.get('search_settings', {}).get('default_max_results_per_source', 50)
+    # Potentially add a CLI flag for max_results here if desired in future, to override settings
+    max_results_to_use = default_max_results
+    console.print(f"[info]Using max results per source: {max_results_to_use}[/info]")
+
     try: # OUTER TRY BLOCK
         # Query Refinement Loop
         while refinement_attempts < MAX_REFINEMENT_ATTEMPTS:
@@ -266,8 +293,14 @@ async def run_search_pipeline(query_team: BaseGroupChat, literature_search_tool:
             console.print(f"  [highlight]PubMed Query: '{pubmed_q}'[/highlight]")
             console.print(f"  [highlight]General Query: '{general_q}'[/highlight]")
             
+            search_params = SearchLiteratureParams(
+                pubmed_query=pubmed_q,
+                general_query=general_q,
+                max_results_per_source=max_results_to_use,
+                publication_types=final_publication_types_to_use if final_publication_types_to_use else None
+            )
             search_output = await literature_search_tool.run(
-                args=SearchLiteratureParams(pubmed_query=pubmed_q, general_query=general_q),
+                args=search_params,
                 cancellation_token=CancellationToken()
             )
             
@@ -361,6 +394,13 @@ async def main():
     Main asynchronous function to load configurations, instantiate agents, and run the search pipeline.
     """
     parser = argparse.ArgumentParser(description="Run the literature search pipeline.")
+    parser.add_argument(
+        "--pub-types", "-t", 
+        type=str, 
+        default=None, 
+        help="Comma-separated list of publication types (e.g., research,review). Overrides settings.yaml default."
+    )
+    # Add other CLI arguments here if needed, e.g., for query, max_results_override
     args = parser.parse_args()
 
     base_path = Path(".").resolve()
@@ -393,10 +433,14 @@ async def main():
         
     with open(settings_file_path, "r") as f:
         settings_config = yaml.safe_load(f)
+        if settings_config is None: settings_config = {} # Ensure it's a dict
 
     # 2. Manually instantiate agents and teams
     agents = {}
     query_team = None # Initialize query_team to None
+    
+    # Extract publication_type_mappings from settings_config for LiteratureSearchTool
+    publication_type_mappings_from_settings = settings_config.get('publication_type_mappings', {})
 
     if agents_config_list:
         for agent_config_original in agents_config_list:
@@ -493,7 +537,11 @@ async def main():
                     # Wrap config in StubConfig
                     component = ExporterAgent(cfg=StubConfig(**filtered_agent_config_params)) # Changed to pass StubConfig
                 elif agent_name == "search_literature":
-                    component = LiteratureSearchTool(**filtered_agent_config_params) # Also filter for tools
+                    # Pass mappings to LiteratureSearchTool constructor
+                    component = LiteratureSearchTool(
+                        publication_type_mappings=publication_type_mappings_from_settings,
+                        **filtered_agent_config_params
+                    )
                 else:
                     # console.print(f"[yellow]Warning: Unhandled component type for {agent_name}. Skipping.[/yellow]")
                     pass
@@ -520,7 +568,16 @@ async def main():
         console.print("[yellow]Warning: agents_config_list is empty or None.[/yellow]")
         return
 
-    literature_search_tool = LiteratureSearchTool()
+    # Retrieve the instantiated LiteratureSearchTool from agents dict
+    literature_search_tool_instance = agents.get("search_literature")
+    if not literature_search_tool_instance:
+        # Fallback if not defined in agents.yaml, though it should be
+        console.print("[yellow]Warning: LiteratureSearchTool not found in agents.yaml, instantiating with mappings.[/yellow]")
+        literature_search_tool_instance = LiteratureSearchTool(publication_type_mappings=publication_type_mappings_from_settings)
+    elif not isinstance(literature_search_tool_instance, LiteratureSearchTool):
+        console.print(f"[red]Error: 'search_literature' component is not an instance of LiteratureSearchTool. Got {type(literature_search_tool_instance)}[/red]")
+        return
+
 
     if not query_team:
         console.print("[red]Error: 'query_team' not found or failed to load.[/red]")
@@ -547,7 +604,15 @@ async def main():
         # console.print("[yellow]No query entered. Exiting.[/yellow]")
         return
 
-    await run_search_pipeline(query_team, literature_search_tool, triage_agent_instance, original_query, console)
+    await run_search_pipeline(
+        query_team, 
+        literature_search_tool_instance, # Use the instance from agents dict
+        triage_agent_instance, 
+        original_query, 
+        console,
+        settings_config, # Pass loaded settings
+        args # Pass parsed CLI args
+    )
 
 
 if __name__ == "__main__":

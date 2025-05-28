@@ -59,12 +59,13 @@ class SearchResult(TypedDict, total=True):
 
 
 class AsyncSearchClient:
-    def __init__(self, loop: Optional[asyncio.AbstractEventLoop] = None):
+    def __init__(self, publication_type_mappings: Optional[Dict[str, Dict[str, str]]] = None, loop: Optional[asyncio.AbstractEventLoop] = None):
         self.client = httpx.AsyncClient(timeout=30.0)
         self.email = API_EMAIL
         self.pubmed_api_key = PUBMED_API_KEY
         self.semantic_scholar_api_key = SEMANTIC_SCHOLAR_API_KEY
         self.crossref_mailto = CROSSREF_MAILTO
+        self.publication_type_mappings = publication_type_mappings if publication_type_mappings else {}
 
         if not self.email:
             raise ValueError("API_EMAIL must be set in the .env file.")
@@ -73,8 +74,9 @@ class AsyncSearchClient:
         pubmed_rps = 2 if self.pubmed_api_key else 1
         self.pubmed_semaphore = asyncio.Semaphore(pubmed_rps)
         self.europepmc_semaphore = asyncio.Semaphore(5)
-        self.semanticscholar_semaphore = asyncio.Semaphore(1)
-        self.crossref_semaphore = asyncio.Semaphore(50)
+        self.semanticscholar_semaphore = asyncio.Semaphore(1) # S2 rate limits are strict
+        self.crossref_semaphore = asyncio.Semaphore(50) # CrossRef is more permissive
+        self.openalex_semaphore = asyncio.Semaphore(10) # OpenAlex polite pool limit
         
         Entrez.email = self.email
         if self.pubmed_api_key:
@@ -108,19 +110,31 @@ class AsyncSearchClient:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
-    async def search_pubmed(self, query: str, max_results: int = 20) -> List[SearchResult]:
+    async def search_pubmed(self, query: str, max_results: int = 20, publication_types: Optional[List[str]] = None) -> List[SearchResult]:
         start_time = time.time()
         results: List[SearchResult] = []
+        
+        final_query = query
+        if publication_types and self.publication_type_mappings:
+            filters = []
+            for pub_type_key in publication_types: # e.g., "research", "review"
+                api_specific_value = self.publication_type_mappings.get(pub_type_key, {}).get("pubmed")
+                if api_specific_value:
+                    filters.append(api_specific_value) # Already includes "[Publication Type]"
+            if filters:
+                filter_term = " OR ".join(filters)
+                final_query = f"({query}) AND ({filter_term})"
+        
         async with self.pubmed_semaphore:
             try:
                 handle = await self._run_sync_in_thread(
                     Entrez.esearch,
                     db="pubmed",
-                    term=query,
+                    term=final_query,
                     retmax=str(max_results),
                     usehistory="y"
                 )
-                search_results_handle = Entrez.read(handle) # Renamed for clarity
+                search_results_handle = Entrez.read(handle) 
                 handle.close()
                 ids = search_results_handle["IdList"]
 
@@ -220,20 +234,42 @@ class AsyncSearchClient:
             except Exception as e:
                 print(f"PubMed search error: {e}")
         end_time = time.time() # This should be outside the async with block if it measures the whole thing
-        print(f"PubMed search took {end_time - start_time:.2f} seconds")
+        print(f"PubMed search took {end_time - start_time:.2f} seconds for query: {final_query}")
         return results
 
-    async def search_europepmc(self, query: str, max_results: int = 20) -> List[SearchResult]:
+    async def search_europepmc(self, query: str, max_results: int = 20, publication_types: Optional[List[str]] = None) -> List[SearchResult]:
         start_time = time.time()
         results: List[SearchResult] = []
+
+        final_query = query
+        if publication_types and self.publication_type_mappings:
+            filters = []
+            for pub_type_key in publication_types:
+                api_specific_value = self.publication_type_mappings.get(pub_type_key, {}).get("europepmc")
+                if api_specific_value: # e.g., "PUB_TYPE:\"journal-article\""
+                    filters.append(api_specific_value)
+            if filters:
+                filter_term = " OR ".join(filters)
+                final_query = f"({query}) AND ({filter_term})"
+        
         async with self.europepmc_semaphore:
             try:
+                # EuropePMC library might not support complex queries directly in `query` string for pagination.
+                # The library's search method takes a query string. We'll append our filter.
+                # The EuropePMC API itself supports pageSize. The library might handle it.
+                # For now, assume the library handles max_results or we fetch more and slice.
+                # The current library `europe_pmc` seems to fetch all and then we might slice.
+                # Let's assume it fetches enough and we can take max_results.
                 raw_results = await self._run_sync_in_thread(
-                    self.epmc.search,
-                    query
-                )
+                    self.epmc.search, # This method in the library might not directly support 'pageSize' or 'retmax'
+                    final_query 
+                ) # The library might fetch a default number of results.
                 
+                # Limit results if library doesn't do it.
+                processed_results = 0
                 for item in raw_results:
+                    if processed_results >= max_results:
+                        break
                     doi = getattr(item, 'doi', None)
                     pmid = getattr(item, 'pmid', None)
                     title = getattr(item, 'title', None)
@@ -268,32 +304,49 @@ class AsyncSearchClient:
                         "citation_count": None  # Placeholder (though EPMC might have it)
                     }
                     results.append(result_item)
+                    processed_results += 1
             except Exception as e:
                 print(f"EuropePMC search error: {e}")
         end_time = time.time()
-        print(f"EuropePMC search took {end_time - start_time:.2f} seconds")
+        print(f"EuropePMC search took {end_time - start_time:.2f} seconds for query: {final_query}")
         return results
 
-    async def search_semanticscholar(self, query: str, max_results: int = 20) -> List[SearchResult]:
+    async def search_semanticscholar(self, query: str, max_results: int = 20, publication_types: Optional[List[str]] = None) -> List[SearchResult]:
         start_time = time.time()
         results: List[SearchResult] = []
+        
+        s2_publication_types = []
+        if publication_types and self.publication_type_mappings:
+            for pub_type_key in publication_types:
+                api_specific_value = self.publication_type_mappings.get(pub_type_key, {}).get("semanticscholar")
+                if api_specific_value: # e.g., "JournalArticle", "Review"
+                    s2_publication_types.append(api_specific_value)
+        
+        # Fields to retrieve, ensure 'publicationTypes' is included if we need to post-filter (though API supports direct filter)
+        s2_fields = ['title', 'authors', 'year', 'journal', 'abstract', 'url', 'venue', 
+                     'publicationDate', 'externalIds', 'citationCount', 'publicationTypes']
+
         async with self.semanticscholar_semaphore:
             try:
-                print(f"Semantic Scholar: Starting search for '{query}' with limit {max_results}...")
-                raw_results = await self._run_sync_in_thread(
+                print(f"Semantic Scholar: Starting search for '{query}' with limit {max_results}, types: {s2_publication_types}...")
+                
+                # The `semanticscholar` library's `search_paper` method supports `publication_types` parameter directly.
+                # It expects a list of strings, e.g. ['JournalArticle', 'Review']
+                raw_results_iterable = await self._run_sync_in_thread(
                     self.s2.search_paper,
-                    query,
-                    limit=max_results,
-                    fields=['title', 'authors', 'year', 'journal', 'abstract', 'url', 'venue', 'publicationDate', 'externalIds', 'citationCount'] # Added citationCount
+                    query=query,
+                    limit=max_results, # The library handles pagination to get up to this limit
+                    fields=s2_fields,
+                    publication_types=s2_publication_types if s2_publication_types else None # Pass None if empty
                 )
+                # The result of search_paper is an iterator (SearchResult object from the library)
+                # We need to iterate it to get Paper objects.
+                
                 print(f"Semantic Scholar: Finished search for '{query}'. Processing results...")
                 
-                item_count = 0
-                for item in raw_results: # raw_results is already a list from s2.search_paper
-                    if item_count >= max_results:
-                        break
-                    item_count += 1
-                    
+                # The library's search_paper returns an iterator that handles pagination up to `limit`.
+                # So, we just iterate through what it gives us.
+                for item in raw_results_iterable: # item is a Paper object
                     # Use attribute access for Semantic Scholar Paper object
                     title = item.title if hasattr(item, 'title') else None
                     authors = [author['name'] for author in item.authors if isinstance(author, dict) and 'name' in author] if hasattr(item, 'authors') and item.authors else []
@@ -331,27 +384,74 @@ class AsyncSearchClient:
                         "citation_count": citation_count
                     }
                     results.append(result_item)
+                    if len(results) >= max_results: # Ensure we don't exceed max_results if library gives more
+                        break 
             except Exception as e:
                 print(f"Semantic Scholar search error: {e}")
         end_time = time.time()
-        print(f"Semantic Scholar search took {end_time - start_time:.2f} seconds")
+        print(f"Semantic Scholar search took {end_time - start_time:.2f} seconds for query: {query}, types: {s2_publication_types}")
         return results
 
-    async def search_crossref(self, query: str, max_results: int = 20) -> List[SearchResult]:
+    async def search_crossref(self, query: str, max_results: int = 20, publication_types: Optional[List[str]] = None) -> List[SearchResult]:
         if not self.cr:
             print("CrossRef client not initialized. Skipping CrossRef search.")
             return []
             
         start_time = time.time()
         results: List[SearchResult] = []
+        
+        crossref_filters = {}
+        if publication_types and self.publication_type_mappings:
+            mapped_types = []
+            for pub_type_key in publication_types:
+                api_specific_value = self.publication_type_mappings.get(pub_type_key, {}).get("crossref")
+                if api_specific_value: # e.g., "journal-article", "review-article"
+                    mapped_types.append(api_specific_value)
+            if mapped_types:
+                # For CrossRef, multiple type filters are usually comma-separated for the 'type' filter key
+                crossref_filters['type'] = ",".join(mapped_types)
+
         async with self.crossref_semaphore:
             try:
-                raw_results_iterable = await self._run_sync_in_thread(
-                    self.cr.query(bibliographic=query).sample,
-                    max_results
-                )
+                # The crossref library's query method takes a `filter` dict.
+                # Example: .query(bibliographic=query_str, filter={'type': 'journal-article'})
+                # The .sample(N) method then takes N samples from the query results.
                 
-                for item in raw_results_iterable:
+                query_builder = self.cr.query(bibliographic=query)
+                if crossref_filters:
+                    query_builder = query_builder.filter(**crossref_filters)
+                
+                # The .sample() method might not be ideal if we want the *most relevant* N results.
+                # .sample() gets a random sample.
+                # For more controlled fetching, one might use .sort('relevance').limit(max_results)
+                # However, the existing code uses .sample(). Let's stick to it for now but be aware.
+                # To get a list of items up to max_results, we can iterate the query_builder
+                # or use .sample() if that's the intended behavior.
+                # Let's try to iterate and limit.
+                
+                # raw_results_iterable = await self._run_sync_in_thread(
+                #     query_builder.sample, # .sample() might not respect sorting or give top N
+                #     max_results
+                # )
+                # Instead of sample, let's try to iterate with a limit.
+                # The crossref library query object is an iterator.
+                
+                # The library itself handles pagination if we iterate.
+                # We need to run the iteration part in a thread.
+                def fetch_crossref_items():
+                    items = []
+                    count = 0
+                    # The query_builder (WorksQuery object) is iterable.
+                    for item_data in query_builder: 
+                        items.append(item_data)
+                        count += 1
+                        if count >= max_results:
+                            break
+                    return items
+
+                raw_results_list = await self._run_sync_in_thread(fetch_crossref_items)
+
+                for item in raw_results_list: # Iterate over the collected list
                     if not isinstance(item, dict): continue
 
                     doi = item.get("DOI")
@@ -396,23 +496,133 @@ class AsyncSearchClient:
             except Exception as e:
                 print(f"CrossRef search error: {e}")
         end_time = time.time()
-        print(f"CrossRef search took {end_time - start_time:.2f} seconds")
+        print(f"CrossRef search took {end_time - start_time:.2f} seconds for query: {query}, filter: {crossref_filters}")
         return results
 
-    async def search_all(self, pubmed_query: str, general_query: str, max_results_per_source: int = 20) -> pd.DataFrame:
+    async def search_openalex(self, query: str, max_results: int = 20, publication_types: Optional[List[str]] = None) -> List[SearchResult]:
+        start_time = time.time()
+        results: List[SearchResult] = []
+        base_url = "https://api.openalex.org/works"
+        
+        params = {"mailto": self.email, "per-page": str(max_results)}
+        
+        filter_parts = []
+        if query: # OpenAlex uses specific fields for search, e.g., title.search, default_field.search
+            # For a general query, we can use default_field.search or title.search
+            # Let's assume 'default.search' for general text query
+            filter_parts.append(f"default.search:{query}")
+
+        if publication_types and self.publication_type_mappings:
+            mapped_types = []
+            for pub_type_key in publication_types:
+                api_specific_value = self.publication_type_mappings.get(pub_type_key, {}).get("openalex")
+                if api_specific_value: # e.g., "journal-article", "review-article"
+                    mapped_types.append(api_specific_value)
+            if mapped_types:
+                # OpenAlex filters are comma-separated for AND, pipe-separated for OR.
+                # If we want to match ANY of the provided types, we use OR.
+                types_str = "|".join(mapped_types)
+                filter_parts.append(f"type:{types_str}")
+        
+        if filter_parts:
+            params["filter"] = ",".join(filter_parts)
+
+        async with self.openalex_semaphore:
+            try:
+                response = await self.client.get(base_url, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                for item in data.get("results", []):
+                    doi = item.get("doi")
+                    if doi and doi.startswith("https://doi.org/"):
+                        doi = doi.replace("https://doi.org/", "")
+                    
+                    title = item.get("title")
+                    
+                    authors = []
+                    for authorship in item.get("authorships", []):
+                        author = authorship.get("author", {})
+                        authors.append(author.get("display_name", ""))
+                    
+                    year = item.get("publication_year")
+                    
+                    abstract = None # OpenAlex abstracts are often inverted indexes
+                    if item.get("abstract_inverted_index"):
+                        # Reconstruct abstract if possible, or leave as None
+                        # This is complex, so for now, leave abstract as None from OpenAlex
+                        pass
+
+                    journal = item.get("host_venue", {}).get("display_name")
+                    pmid = item.get("ids", {}).get("pmid")
+                    if pmid and pmid.startswith("https://pubmed.ncbi.nlm.nih.gov/"):
+                        pmid = pmid.replace("https://pubmed.ncbi.nlm.nih.gov/", "")
+                    pmcid = item.get("ids", {}).get("pmcid")
+                    if pmcid and pmcid.startswith("https://www.ncbi.nlm.nih.gov/pmc/articles/"):
+                        pmcid = pmcid.replace("https://www.ncbi.nlm.nih.gov/pmc/articles/", "").rstrip('/')
+
+
+                    url = item.get("doi") # This is the full DOI URL
+
+                    citation_count = item.get("cited_by_count")
+
+                    result_item: SearchResult = {
+                        "title": title,
+                        "authors": authors,
+                        "doi": doi,
+                        "pmid": pmid,
+                        "pmcid": pmcid,
+                        "year": year,
+                        "abstract": abstract,
+                        "journal": journal,
+                        "url": url,
+                        "source_api": "OpenAlex",
+                        "sjr_percentile": None,
+                        "oa_status": item.get("oa_status"),
+                        "citation_count": citation_count
+                    }
+                    results.append(result_item)
+                    if len(results) >= max_results:
+                        break
+            except httpx.HTTPStatusError as e:
+                print(f"OpenAlex HTTP error: {e.response.status_code} - {e.response.text}")
+            except Exception as e:
+                print(f"OpenAlex search error: {e}")
+        end_time = time.time()
+        print(f"OpenAlex search took {end_time - start_time:.2f} seconds for query: {query}, params: {params}")
+        return results
+
+
+    async def search_all(self, pubmed_query: str, general_query: str, 
+                         max_results_per_source: int = 20, 
+                         publication_types: Optional[List[str]] = None) -> pd.DataFrame:
         start_time = time.time()
         
         tasks = []
         if pubmed_query:
-            tasks.append(self.search_pubmed(pubmed_query, max_results_per_source))
-            tasks.append(self.search_europepmc(pubmed_query, max_results_per_source))
+            tasks.append(self.search_pubmed(pubmed_query, max_results_per_source, publication_types))
+            tasks.append(self.search_europepmc(pubmed_query, max_results_per_source, publication_types))
         if general_query:
-            tasks.append(self.search_semanticscholar(general_query, max_results_per_source))
-            tasks.append(self.search_crossref(general_query, max_results_per_source))
+            tasks.append(self.search_semanticscholar(general_query, max_results_per_source, publication_types))
+            tasks.append(self.search_crossref(general_query, max_results_per_source, publication_types))
+            tasks.append(self.search_openalex(general_query, max_results_per_source, publication_types))
 
-        all_source_results = await asyncio.gather(*tasks)
+
+        all_source_results = await asyncio.gather(*tasks, return_exceptions=True) # Capture exceptions
         
         flat_results: List[SearchResult] = []
+        for i, source_result_list_or_exc in enumerate(all_source_results):
+            if isinstance(source_result_list_or_exc, Exception):
+                task_name = tasks[i].__qualname__ if hasattr(tasks[i], '__qualname__') else f"Task {i}"
+                print(f"Warning: Task {task_name} failed with {type(source_result_list_or_exc).__name__}: {source_result_list_or_exc}")
+                continue # Skip this source if it failed
+            if source_result_list_or_exc: # Ensure it's not None
+                flat_results.extend(source_result_list_or_exc)
+
+        if not flat_results:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(flat_results)
         for source_result_list in all_source_results:
             if source_result_list: # Ensure it's not None
                 flat_results.extend(source_result_list)
@@ -492,7 +702,7 @@ class AsyncSearchClient:
         df_final = df_final.sort_values(by=['year', 'title'], ascending=[False, True], na_position='last').reset_index(drop=True)
 
         end_time = time.time()
-        print(f"Overall search_all took {end_time - start_time:.2f} seconds. Found {len(df_final)} unique articles.")
+        print(f"Overall search_all took {end_time - start_time:.2f} seconds. Found {len(df_final)} unique articles with pub_types: {publication_types}.")
         return df_final
 
 
@@ -501,13 +711,21 @@ class SearchOutput(TypedDict):
     meta: Dict[str, Any]
 
 async def _async_search_literature(pubmed_query: str, general_query: str,
-                                   max_results_per_source: int = 50) -> SearchOutput:
+                                   max_results_per_source: int = 50,
+                                   publication_types: Optional[List[str]] = None,
+                                   publication_type_mappings: Optional[Dict[str, Dict[str, str]]] = None) -> SearchOutput:
     """
     Internal helper that instantiates AsyncSearchClient and returns the structured output
     from client.search_all(). Always awaits client.close().
     """
-    async with AsyncSearchClient() as client:
-        df = await client.search_all(pubmed_query, general_query, max_results_per_source)
+    # Pass mappings to AsyncSearchClient constructor
+    async with AsyncSearchClient(publication_type_mappings=publication_type_mappings) as client:
+        df = await client.search_all(
+            pubmed_query, 
+            general_query, 
+            max_results_per_source,
+            publication_types=publication_types
+        )
     
     data_records = []
     if not df.empty:
@@ -549,6 +767,7 @@ async def _async_search_literature(pubmed_query: str, general_query: str,
         "total_hits": len(data_records), 
         "query_pubmed": pubmed_query,
         "query_general": general_query,
+        "publication_types_applied": publication_types if publication_types else [],
         "timestamp": pd.Timestamp.now(tz='UTC').isoformat()
     }
 
@@ -556,15 +775,18 @@ async def _async_search_literature(pubmed_query: str, general_query: str,
 
 
 def search_literature(pubmed_query: str, general_query: str,
-                      max_results_per_source: int = 50) -> SearchOutput:
+                      max_results_per_source: int = 50,
+                      publication_types: Optional[List[str]] = None,
+                      publication_type_mappings: Optional[Dict[str, Dict[str, str]]] = None) -> SearchOutput:
     """
-    Search the biomedical literature via PubMed, Europe PMC, Semantic Scholar
-    and Crossref.
+    Search the biomedical literature via PubMed, Europe PMC, Semantic Scholar, Crossref, and OpenAlex.
 
     Args:
         pubmed_query: Boolean search string for PubMed and Europe PMC (can use MeSH).
-        general_query: Boolean search string for Semantic Scholar and Crossref.
-        max_results_per_source: Records to pull from each API (default = 50).
+        general_query: Boolean search string for Semantic Scholar, Crossref, and OpenAlex.
+        max_results_per_source: Records to pull from each API.
+        publication_types: Optional list of types like "research", "review" to filter by.
+        publication_type_mappings: Mappings for publication types to API-specific terms.
 
     Returns:
         A dictionary with 'data' and 'meta' fields.
@@ -581,54 +803,65 @@ def search_literature(pubmed_query: str, general_query: str,
         nest_asyncio.apply()
         # Ensure the task is awaited if called from an already running loop context
         # This part might need adjustment based on how it's integrated into a larger async app
-        future = asyncio.ensure_future(_async_search_literature(pubmed_query, general_query, max_results_per_source))
-        return loop.run_until_complete(future) # This might be problematic if loop is already run_until_complete
-                                              # Consider returning the future/task for the caller to await if in async context
+        future = asyncio.ensure_future(_async_search_literature(
+            pubmed_query, general_query, max_results_per_source, 
+            publication_types, publication_type_mappings
+        ))
+        return loop.run_until_complete(future)
     else:
-        return asyncio.run(_async_search_literature(pubmed_query, general_query, max_results_per_source))
+        return asyncio.run(_async_search_literature(
+            pubmed_query, general_query, max_results_per_source,
+            publication_types, publication_type_mappings
+        ))
 
 class SearchLiteratureParams(BaseModel):
     pubmed_query: str = Field(..., description="Boolean search string for PubMed and Europe PMC (can use MeSH).")
-    general_query: str = Field(..., description="Boolean search string for Semantic Scholar and Crossref.")
-    max_results_per_source: int = Field(50, description="Records to pull from each API (default = 50).")
+    general_query: str = Field(..., description="Boolean search string for Semantic Scholar, Crossref, and OpenAlex.")
+    max_results_per_source: int = Field(50, description="Records to pull from each API.")
+    publication_types: Optional[List[str]] = Field(None, description="Optional list of publication types (e.g. ['research', 'review']) to filter by.")
 
 class LiteratureSearchToolInstanceConfig(BaseModel):
-    pass
+    # This could hold publication_type_mappings if loaded globally for the tool
+    publication_type_mappings: Optional[Dict[str, Dict[str, str]]] = None
 
 class LiteratureSearchTool(
     BaseTool[SearchLiteratureParams, SearchOutput], 
     Component[LiteratureSearchToolInstanceConfig]
 ):
     component_config_schema: Type[LiteratureSearchToolInstanceConfig] = LiteratureSearchToolInstanceConfig
+    _publication_type_mappings: Optional[Dict[str, Dict[str, str]]]
 
-    def __init__(self):
+    def __init__(self, publication_type_mappings: Optional[Dict[str, Dict[str, str]]] = None):
         super().__init__(
             args_type=SearchLiteratureParams,
             return_type=SearchOutput, 
             name="search_literature",
-            description="High-throughput literature search across PubMed, Europe PMC, Semantic Scholar and Crossref."
+            description="High-throughput literature search across PubMed, Europe PMC, Semantic Scholar, Crossref, and OpenAlex."
         )
+        self._publication_type_mappings = publication_type_mappings
 
     @classmethod
     def _from_config(cls, config: LiteratureSearchToolInstanceConfig) -> "LiteratureSearchTool":
-        return cls()
+        # If mappings are stored in config, pass them here
+        return cls(publication_type_mappings=config.publication_type_mappings)
 
     def _to_config(self) -> LiteratureSearchToolInstanceConfig:
-        return LiteratureSearchToolInstanceConfig()
+        return LiteratureSearchToolInstanceConfig(publication_type_mappings=self._publication_type_mappings)
 
     async def run(self, args: SearchLiteratureParams, cancellation_token: Any) -> SearchOutput:
-        # The search_literature function is synchronous, but this tool's run method is async.
-        # We need to run the synchronous search_literature in a thread to avoid blocking the event loop.
         loop = asyncio.get_running_loop()
+        # Pass the tool's mappings to the underlying search_literature function
         return await loop.run_in_executor(
             None, 
             search_literature, 
             args.pubmed_query, 
             args.general_query, 
-            args.max_results_per_source
+            args.max_results_per_source,
+            args.publication_types,
+            self._publication_type_mappings # Pass stored mappings
         )
 
-__all__ = ["search_literature", "LiteratureSearchTool", "SearchLiteratureParams"]
+__all__ = ["search_literature", "LiteratureSearchTool", "SearchLiteratureParams", "SearchResult", "AsyncSearchClient"]
 
 if __name__ == "__main__":
     import sys
@@ -642,13 +875,32 @@ if __name__ == "__main__":
     parser.add_argument("--pubmed", type=str, default="metagenomics[Mesh]", help="PubMed/EuropePMC query.")
     parser.add_argument("--general", type=str, default="metagenomics", help="General query for other APIs.")
     parser.add_argument("--max_results", type=int, default=10, help="Max results per source.")
+    parser.add_argument("--pub_types", type=str, default=None, help="Comma-separated publication types (e.g., research,review).")
     args = parser.parse_args()
 
     print(f"Searching PubMed/EuropePMC for: {args.pubmed}")
     print(f"Searching general APIs for: {args.general}")
+    if args.pub_types:
+        print(f"Filtering by publication types: {args.pub_types}")
+
+    # For testing the script directly, we might need to load mappings from a default config path
+    # or pass them explicitly if the script were to be more complex.
+    # For now, this test call won't use mappings unless search_literature loads them itself.
+    # The plan is for LiteratureSearchTool to manage and pass mappings.
+    # This __main__ block is primarily for basic testing of search_literature.
     
+    publication_types_list = [s.strip() for s in args.pub_types.split(',')] if args.pub_types else None
+
     # search_literature is synchronous, so we call it directly
-    search_output_dict = search_literature(args.pubmed, args.general, args.max_results)
+    # This direct call won't have publication_type_mappings unless we load them here.
+    # For a simple test, we can pass None for mappings.
+    search_output_dict = search_literature(
+        args.pubmed, 
+        args.general, 
+        args.max_results,
+        publication_types=publication_types_list,
+        publication_type_mappings=None # In a real scenario, these would be loaded
+    )
     
     if search_output_dict and search_output_dict.get('data'):
         df = pd.DataFrame(search_output_dict['data'])

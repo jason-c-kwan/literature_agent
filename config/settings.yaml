@@ -1,27 +1,58 @@
-version: '0.1'
-weights:
-  relevance: 0.5
-  journal_quality: 0.2
-  citation_zscore: 0.3
-caps:
-  max_results_per_api: 250
-  max_ranked_papers: 100
-  max_summary_tokens: 2048
-triage:
-  sjr_percentile_threshold: 50  # Accept journals in the top 50% (Q1 and Q2)
-  min_age_normalized_citations: 1.0  # Require at least 1 citation per year since publication
-  open_access_statuses:
-    - gold
-    - hybrid
-    - green
-resolve_content_timeout: 15 # seconds
-resolve_max_retries: 3
-resolve_retry_backoff_factor: 0.5 # seconds
-resolve_retry_status_forcelist: [500, 502, 503, 504] # HTTP status codes to retry on
-resolve_per_domain_concurrency: 2 # Max concurrent requests per domain
+# Configuration for literature search agent
 
-proxy_settings:
-  enabled: false # Set to true to enable proxies
-  proxies: # List of proxy URLs, e.g., ["http://user:pass@host:port"]
-    # - "http://your_proxy_url_1"
-    # - "http://your_proxy_url_2"
+# API Keys and Endpoints (can be overridden by .env variables)
+# Example:
+# api_keys:
+#   pubmed: YOUR_PUBMED_KEY_HERE
+#   semantic_scholar: YOUR_S2_KEY_HERE
+
+# Search settings
+search_settings:
+  default_max_results_per_source: 100
+  default_publication_types: # Default if --pub-types CLI flag is not used
+    - "research"
+    - "review"
+  # Add other search-related defaults here if needed
+
+# Mappings for publication types from user input (CLI/default) to API-specific terms
+publication_type_mappings:
+  research: # User input string "research"
+    pubmed: "Journal Article[Publication Type]" # Value for PubMed 'term' filter
+    europepmc: "PUB_TYPE:\"journal-article\""  # Value for EuropePMC query
+    semanticscholar: "JournalArticle"          # Value for Semantic Scholar 'publication_types' parameter
+    crossref: "journal-article"                # Value for CrossRef 'type' filter
+    openalex: "journal-article"                # Value for OpenAlex 'type' filter (or 'work_type' if that's confirmed)
+  review: # User input string "review"
+    pubmed: "Review[Publication Type]"
+    europepmc: "PUB_TYPE:\"review\""
+    semanticscholar: "Review"
+    crossref: "review-article"
+    openalex: "review-article"
+
+# Triage Agent Settings (example)
+triage_settings:
+  relevance_threshold: 3 # Example: minimum score to keep an article
+  # other triage parameters...
+
+# Ranking Agent Settings (example)
+ranking_settings:
+  # parameters for ranking...
+  weights:
+    year: 0.2
+    citation_count: 0.5
+    # other ranking criteria...
+
+# LLM Model configurations (used by agents that call LLMs)
+# These are illustrative; actual structure depends on how agents load model configs.
+# model_configs:
+#   query_refiner_model:
+#     provider: "openai" # or "azure", "anthropic", etc.
+#     model_name: "gpt-3.5-turbo"
+#     # other model parameters like temperature, max_tokens
+#   triage_model:
+#     provider: "openai"
+#     model_name: "gpt-4"
+
+# Other application-wide settings
+# Example:
+# logging_level: "INFO"
