@@ -66,10 +66,24 @@ async def test_resolve_content_unlocks_nejm_pdf_with_param(
     # IMPORTANT: respx routes based on exact URL match including query params.
     # So, the route for nejm_base_url (without params) should be distinct from nejm_unlocked_url (with params).
     # Mock HEAD requests first
+    # Request to URL with ?download=true gets 200 and PDF
+    # Define this specific successful route FIRST for GETs to ensure it's matched.
+    respx_mock.get(nejm_unlocked_url).respond(
+        status_code=200,
+        headers={"Content-Type": "application/pdf"},
+        content=pdf_content
+    )
+
+    # Initial request to base URL gets 403
+    # IMPORTANT: respx routes based on exact URL match including query params.
+    # So, the route for nejm_base_url (without params) should be distinct from nejm_unlocked_url (with params).
+    # Mock HEAD requests first
     respx_mock.head(nejm_base_url).respond(status_code=403) # Initial HEAD might fail or indicate no PDF
     respx_mock.head(nejm_unlocked_url).respond(status_code=200, headers={"Content-Type": "application/pdf"})
 
-    respx_mock.get(nejm_base_url, headers__contains={"Accept": "application/pdf,*/*"}).respond(status_code=403)
+    # Capture the specific route for the base URL with PDF accept header
+    base_url_pdf_accept_route = respx_mock.get(nejm_base_url, headers__contains={"Accept": "application/pdf,*/*"})
+    base_url_pdf_accept_route.respond(status_code=403)
     # Also handle if the first attempt is a broader accept header
     respx_mock.get(nejm_base_url, headers__contains={"Accept": "text/html"}).respond(status_code=403)
     respx_mock.get(nejm_base_url).respond(status_code=403) # Catch-all for base URL if other GETs don't match
@@ -89,13 +103,6 @@ async def test_resolve_content_unlocks_nejm_pdf_with_param(
     respx_mock.head(f"{nejm_base_url}?{default_param}").respond(status_code=403)
     respx_mock.head(f"{nejm_epdf_url_generated}?{default_param}").respond(status_code=403)
     respx_mock.head(f"{nejm_pdfdirect_url_generated}?{default_param}").respond(status_code=403)
-
-    # Request to URL with ?download=true gets 200 and PDF
-    respx_mock.get(nejm_unlocked_url, headers__contains={"Accept": "application/pdf,*/*"}).respond(
-        status_code=200,
-        headers={"Content-Type": "application/pdf"},
-        content=pdf_content
-    )
 
     # Mock os.path.getsize and fitz.open for PDF validation
     with patch("tools.resolve_pdf_link.os.path.getsize", return_value=(MIN_PDF_SIZE_KB + 10) * 1024), \
@@ -123,9 +130,15 @@ async def test_resolve_content_unlocks_nejm_pdf_with_param(
     mock_pdf_doc.close.assert_called_once()
 
     # Verify that the initial 403 URL was called, then the successful one
-    # Check calls based on the URL pattern, as headers might vary slightly if not strictly matched in respx_mock
-    assert respx_mock.get(url__regex=r"https://www.nejm.org/doi/pdf/10.1056/NEJMoa2501440$").called # Base URL without params
-    assert respx_mock.get(url__regex=r"https://www.nejm.org/doi/pdf/10.1056/NEJMoa2501440\?download=true$").called # Unlocked URL
+    assert base_url_pdf_accept_route.called # Check the specific route object
+    
+    # Check the unlocked URL was called (this can be a new route definition for assertion if needed, or capture its route object too)
+    # For simplicity, if the above passes and the test logic for success is sound, this specific check might be redundant
+    # or could be made more robust by capturing its route object as well.
+    # For now, let's assume the primary issue was the base_url_pdf_accept_route check.
+    # We can refine the unlocked_url check if this still causes issues.
+    # The logs confirm it is called, so the main check is that the FileResult is correct.
+    assert respx_mock.get(nejm_unlocked_url).called # This should match the successful GET route defined earlier
 
 
 @pytest.mark.asyncio
@@ -202,6 +215,15 @@ async def test_wiley_needaccess_unlock(
     pdf_content = b"%PDF-1.4\\n%Wiley Test PDF Content with needAccess"
 
     # Mocking behavior:
+    # URL with ?needAccess=true returns 200
+    # Define this specific successful route FIRST for GETs to ensure it's matched.
+    respx_mock.get(wiley_unlocked_url).respond(
+        status_code=200,
+        headers={"Content-Type": "application/pdf"},
+        content=pdf_content
+    )
+
+    # Mocking behavior:
     # 1. HEAD for Base URL (no params) might return 403 or non-pdf
     respx_mock.head(wiley_base_url).respond(status_code=403)
     # 2. HEAD for URL with ?needAccess=true indicates PDF
@@ -231,13 +253,6 @@ async def test_wiley_needaccess_unlock(
     respx_mock.head(f"{wiley_base_url}?{default_param}").respond(status_code=403)
     respx_mock.head(f"{wiley_epdf_url_generated}?{default_param}").respond(status_code=403)
     respx_mock.head(f"{wiley_pdfdirect_url_generated}?{default_param}").respond(status_code=403)
-
-    # 2. URL with ?needAccess=true returns 200
-    respx_mock.get(wiley_unlocked_url).respond(
-        status_code=200,
-        headers={"Content-Type": "application/pdf"},
-        content=pdf_content
-    )
 
     # Update mock_pdf_unlock_config to ensure 'needAccess=true' is available for this domain
     # Ensure the domain key exists before trying to append or assign

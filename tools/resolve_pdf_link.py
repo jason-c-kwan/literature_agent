@@ -122,7 +122,14 @@ def generate_pdf_retry_urls(original_url: str) -> List[str]:
 
         unlock_params_config = load_pdf_unlock_params()
         # Ensure 'default' and domain specific params are lists, even if not present in YAML
-        domain_specific_params_list = unlock_params_config.get(parsed_original_url.netloc, []) or []
+        
+        netloc = parsed_original_url.netloc
+        domain_specific_params_list = unlock_params_config.get(netloc, []) or []
+        # If no params found for full netloc (e.g., www.example.com), try base domain (e.g., example.com)
+        if not domain_specific_params_list and netloc.startswith("www."):
+            base_domain = netloc[4:]
+            domain_specific_params_list = unlock_params_config.get(base_domain, []) or []
+        
         default_params_list = unlock_params_config.get("default", []) or []
         
         seen_param_tuples = set()

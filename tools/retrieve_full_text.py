@@ -257,7 +257,11 @@ async def get_full_text_for_doi(
                                 
                                 cookies_for_this_call = session_cookies_by_domain.get(current_domain_for_call) # Re-fetch, might have been updated
                                 async with SEMAPHORE_GENERAL_SCRAPING:
-                                    advanced_result = await advanced_scraper.scrape_with_fallback(link_url, session_cookies=cookies_for_this_call) # Pass cookies
+                                    advanced_result = await advanced_scraper.scrape_with_fallback(
+                                        link_url,
+                                        original_doi_for_referer=doi, # Pass original DOI
+                                        session_cookies=cookies_for_this_call
+                                    )
                                 
                                 # Update cookies from advanced_scraper result
                                 _update_session_cookies(advanced_result, doi)
@@ -337,7 +341,12 @@ async def get_full_text_for_doi(
                         
                         cookies_for_this_call = session_cookies_by_domain.get(current_domain_for_call) # Re-fetch
                         async with SEMAPHORE_GENERAL_SCRAPING:
-                            advanced_result = await advanced_scraper.scrape_with_fallback(oa_url, session_cookies=cookies_for_this_call) # Pass cookies
+                            # Pass original_doi_for_referer to advanced_scraper in Unpaywall path as well
+                            advanced_result = await advanced_scraper.scrape_with_fallback(
+                                url=oa_url, # Explicitly name url argument
+                                original_doi_for_referer=doi, 
+                                session_cookies=cookies_for_this_call
+                            )
                         
                         # Update cookies from advanced_scraper result
                         _update_session_cookies(advanced_result, doi)

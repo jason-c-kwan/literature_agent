@@ -370,7 +370,8 @@ async def scrape_with_fallback(
     url: str,
     attempt_playwright: bool = True, 
     playwright_page_content_for_llm: Optional[str] = None,
-    session_cookies: Optional[List[Dict]] = None # Added for cookie hand-off
+    session_cookies: Optional[List[Dict]] = None, # Added for cookie hand-off
+    original_doi_for_referer: Optional[str] = None # Added for referer context
 ) -> ScraperResult: # Changed ResolveResult to ScraperResult
     logger.info(f"Starting advanced scrape for URL: {url}", extra={"url": url, "event_type": "scrape_start"})
 

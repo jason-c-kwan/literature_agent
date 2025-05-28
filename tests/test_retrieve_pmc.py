@@ -59,9 +59,9 @@ class TestFetchPmcXml(unittest.TestCase):
 
 
     @patch('tools.retrieve_pmc.aiohttp.ClientSession')
-    @patch('tools.retrieve_pmc.API_EMAIL', "test@example.com") # Patch module-level API_EMAIL
-    @patch('tools.retrieve_pmc.PUBMED_API_KEY', "test_api_key") # Patch module-level API_KEY
-    def test_fetch_successful_oa_article(self, MockClientSession, mock_api_email, mock_api_key): # Add mocks to signature
+    @patch('tools.retrieve_pmc.API_EMAIL', "test@example.com") # Ensure test-specific email
+    @patch('tools.retrieve_pmc.PUBMED_API_KEY', "test_api_key")   # Ensure test-specific API key
+    def test_fetch_successful_oa_article(self, MockClientSession): # Corrected argument order
         mock_response = AsyncMock()
         mock_response.status = 200
         mock_response.text = AsyncMock(return_value=MOCK_OA_XML)
