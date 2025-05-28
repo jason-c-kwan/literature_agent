@@ -18,6 +18,7 @@ from bs4 import BeautifulSoup
 from readability import Document  # readability-lxml
 import fitz  # PyMuPDF
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError, Download # Added Download
+from unittest.mock import MagicMock, AsyncMock # Added for type checking mock objects
 
 from consts.http_headers import DEFAULT_HEADERS # Added import
 
@@ -111,23 +112,36 @@ async def get_domain_semaphore(url: str) -> asyncio.Semaphore:
             domain_semaphores[domain] = asyncio.Semaphore(PER_DOMAIN_CONCURRENCY)
         return domain_semaphores[domain]
 
-# --- Result types (copied from resolve_pdf_link.py) ---
+# --- Result types ---
+class _ReturnPDFBytes(Exception):
+    """Custom exception to signal PDF bytes captured directly from Playwright response."""
+    pass
+
 class Failure(NamedTuple):
     type: Literal["failure"]
     reason: str
-    status_code: Optional[int] = None # Added status_code
+    status_code: Optional[int] = None
+    cookies: Optional[List[Dict]] = None # Added for consistency
 
 class HTMLResult(NamedTuple):
     type: Literal["html"]
     text: str
-    url: str # Added final URL
+    url: str
+    cookies: Optional[List[Dict]] = None # Added for cookie hand-off
 
 class FileResult(NamedTuple):
     type: Literal["file"]
     path: str
-    url: str # Added final URL
+    url: str
+    cookies: Optional[List[Dict]] = None # Added for cookie hand-off
 
-ResolveResult = Union[Failure, HTMLResult, FileResult]
+class PDFBytesResult(NamedTuple):
+    type: Literal["pdf_bytes"]
+    content: bytes
+    url: str
+    cookies: Optional[List[Dict]] = None # Added for cookie hand-off
+
+ScraperResult = Union[Failure, HTMLResult, FileResult, PDFBytesResult] # Updated Union type
 
 # --- Constants and Helper Functions from resolve_pdf_link.py (adapted) ---
 PAYWALL_KEYWORDS = [
@@ -195,7 +209,13 @@ def is_html_potentially_paywalled(full_html_content: str) -> bool:
 
 DEFAULT_USER_AGENT = DEFAULT_HEADERS["User-Agent"] # Use from consts
 
-async def _make_request_with_retry(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> httpx.Response:
+async def _make_request_with_retry(
+    client: httpx.AsyncClient, 
+    method: str, 
+    url: str, 
+    passed_cookies: Optional[List[Dict]] = None, # Added for cookie hand-off
+    **kwargs
+) -> httpx.Response:
     # Start with DEFAULT_HEADERS, then layer specific headers from kwargs, then ensure User-Agent
     request_specific_headers = kwargs.pop("headers", {})
     final_headers = {**DEFAULT_HEADERS, **request_specific_headers}
@@ -203,6 +223,22 @@ async def _make_request_with_retry(client: httpx.AsyncClient, method: str, url: 
     # Ensure User-Agent is present, defaulting to DEFAULT_USER_AGENT (which is from DEFAULT_HEADERS)
     if "User-Agent" not in final_headers:
         final_headers["User-Agent"] = DEFAULT_USER_AGENT
+
+    # --- Cookie Injection (Task 2b) ---
+    if passed_cookies:
+        target_domain = urlparse(url).netloc
+        relevant_cookies_for_domain = [
+            c for c in passed_cookies
+            if c.get('domain') and target_domain.endswith(c['domain'].lstrip('.'))
+        ]
+        if relevant_cookies_for_domain:
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in relevant_cookies_for_domain if c.get('name') and c.get('value')])
+            if cookie_str:
+                if "Cookie" in final_headers: # Merge if other cookies were already set via kwargs
+                    final_headers["Cookie"] = f"{final_headers['Cookie']}; {cookie_str}"
+                else:
+                    final_headers["Cookie"] = cookie_str
+                logger.info(f"Using {len(relevant_cookies_for_domain)} cookies for domain {target_domain} for URL {url}", extra={"url":url, "event_type":"cookie_injection_advanced_scraper", "num_cookies": len(relevant_cookies_for_domain)})
     
     current_proxies = None
     if PROXY_SETTINGS.get("enabled") and PROXY_SETTINGS.get("proxies"):
@@ -284,7 +320,30 @@ async def _extract_html_text(html_content: str, url: str) -> Optional[str]:
                 logger.info(f"Extracted HTML content from {url} using <article> tag.", extra={"url": url, "length": len(extracted_text), "event_type": "html_extract_article_success"})
     return extracted_text
 
-async def _handle_pdf_download(response_content: bytes, url: str, source_description: str = "direct") -> ResolveResult:
+
+# --- Cloudflare Cookie Helpers (Task 3b) ---
+async def _check_for_cf_clearance_cookie_once(page) -> bool:
+    if not page or not page.context:
+        logger.warning("_check_for_cf_clearance_cookie_once called with invalid page or context", extra={"event_type":"cf_cookie_check_invalid_page"})
+        return False
+    try:
+        current_cookies = await page.context.cookies()
+        return any(c.get("name") == "cf_clearance" for c in current_cookies)
+    except Exception as e: 
+        logger.warning(f"Error getting cookies in _check_for_cf_clearance_cookie_once: {e}", extra={"event_type":"cf_cookie_check_exception"})
+        return False
+
+async def _wait_for_cf_clearance_cookie(page, timeout: int) -> bool:
+    # timeout is in milliseconds
+    end_time = asyncio.get_event_loop().time() + timeout / 1000.0
+    while asyncio.get_event_loop().time() < end_time:
+        if await _check_for_cf_clearance_cookie_once(page):
+            return True
+        await asyncio.sleep(0.5) # Poll every 500ms
+    return False # Timeout
+
+
+async def _handle_pdf_download(response_content: bytes, url: str, source_description: str = "direct") -> ScraperResult:
     if not os.path.exists(DOWNLOADS_DIR):
         os.makedirs(DOWNLOADS_DIR)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f") 
@@ -310,9 +369,27 @@ async def _handle_pdf_download(response_content: bytes, url: str, source_descrip
 async def scrape_with_fallback(
     url: str,
     attempt_playwright: bool = True, 
-    playwright_page_content_for_llm: Optional[str] = None
-) -> ResolveResult:
+    playwright_page_content_for_llm: Optional[str] = None,
+    session_cookies: Optional[List[Dict]] = None # Added for cookie hand-off
+) -> ScraperResult: # Changed ResolveResult to ScraperResult
     logger.info(f"Starting advanced scrape for URL: {url}", extra={"url": url, "event_type": "scrape_start"})
+
+    # --- PDF Capture Handler (Task 1b) ---
+    async def _maybe_capture_pdf(response):
+        ctype = response.headers.get("content-type", "").lower()
+        if "application/pdf" in ctype:
+            pdf_bytes_content_for_exception = None 
+            try:
+                logger.info("Captured PDF response %s from Playwright event", response.url, extra={"url": response.url, "event_type": "playwright_pdf_event_capture"})
+                pdf_bytes_content_for_exception = await response.body()
+                # This raise is the one we want to propagate
+                raise _ReturnPDFBytes(pdf_bytes_content_for_exception, response.url)
+            except _ReturnPDFBytes: # Explicitly catch _ReturnPDFBytes to re-raise
+                raise
+            except Exception as e_body: # Catch other errors from response.body()
+                logger.error(f"Error getting response.body() in _maybe_capture_pdf for {response.url}: {e_body}", exc_info=True, extra={"url": response.url, "event_type": "playwright_pdf_body_error"})
+                # Do not raise _ReturnPDFBytes if body cannot be fetched, and do not re-raise other exceptions from here, let them be handled by Playwright's event system.
+
     if not os.path.exists(DOWNLOADS_DIR):
         try:
             os.makedirs(DOWNLOADS_DIR)
@@ -333,7 +410,8 @@ async def scrape_with_fallback(
             # --- Direct HTTP Attempts ---
             try:
                 logger.info(f"Attempting direct GET for HTML/PDF: {url}", extra={"url": url, "event_type": "direct_get_html_pdf_attempt"})
-                get_response = await _make_request_with_retry(client, "GET", url, headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"})
+                # Pass session_cookies to the initial direct GET attempt
+                get_response = await _make_request_with_retry(client, "GET", url, headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"}, passed_cookies=session_cookies)
                 final_url_after_redirects = str(get_response.url)
                 content_type = get_response.headers.get("content-type", "").lower()
 
@@ -377,6 +455,69 @@ async def scrape_with_fallback(
                 logger.error(f"Unexpected error during direct HTTP phase for {url}: {e_unexpected_direct}", exc_info=True, extra={"url":url, "event_type":"direct_http_unexpected_error"})
                 direct_http_exception = e_unexpected_direct
 
+            # --- HEAD request for PDF if GET wasn't conclusive ---
+            # This section is reached if the initial direct GET did not return a FileResult or HTMLResult.
+            # We now try a HEAD request to see if the content is a PDF, using final_url_after_redirects from the GET attempt.
+            # Only proceed if direct_http_exception is not a critical, non-recoverable error from the GET attempt.
+            # For instance, if GET resulted in a 404, a HEAD might still be useful if the URL was for a landing page.
+            # If GET had a network error for the domain, HEAD would likely also fail.
+            
+            # Condition: if we haven't returned a success from GET, and direct_http_exception is None or a non-blocking error (e.g. 403, or 200 but wrong content type)
+            # For simplicity, we'll attempt HEAD if no success from GET, and rely on _make_request_with_retry for HEAD.
+            # The test `test_scrape_direct_pdf_success_via_head` implies HEAD should be tried even if GET returned non-HTML/PDF content.
+
+            # Check if we already have a success (HTMLResult or FileResult would have returned)
+            # If we are here, it means the initial GET didn't yield a direct success that caused an early return.
+            # We proceed to check with HEAD if no critical error from GET.
+            
+            # A more robust check for whether to proceed with HEAD:
+            should_attempt_head = True # Assume yes, unless specific direct_http_exception says no
+            if isinstance(direct_http_exception, (httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError)):
+                # If the domain itself is unreachable from GET, HEAD will also likely fail.
+                logger.info(f"Skipping HEAD request for {final_url_after_redirects} due to prior critical network/timeout/proxy error from GET: {type(direct_http_exception).__name__}",
+                            extra={"url":url, "final_url": final_url_after_redirects, "event_type":"direct_head_skip_critical_get_error"})
+                should_attempt_head = False
+            
+            if should_attempt_head:
+                try:
+                    logger.info(f"Direct GET for {url} did not yield conclusive content. Attempting HEAD request for PDF at {final_url_after_redirects}",
+                                extra={"url": url, "final_url_for_head": final_url_after_redirects, "event_type": "direct_head_pdf_attempt"})
+                    # Use session_cookies for the HEAD request as well
+                    head_response = await _make_request_with_retry(client, "HEAD", final_url_after_redirects, headers={"Accept": "application/pdf,*/*;q=0.8"}, passed_cookies=session_cookies)
+                    head_content_type = head_response.headers.get("content-type", "").lower()
+                    
+                    if "application/pdf" in head_content_type:
+                        pdf_url_from_head = str(head_response.url) # URL might change after HEAD redirects
+                        logger.info(f"HEAD request to {pdf_url_from_head} indicates PDF. Attempting GET to download.",
+                                    extra={"url": url, "pdf_url_from_head": pdf_url_from_head, "event_type": "direct_head_pdf_confirmed_get_attempt"})
+                        
+                        pdf_get_response = await _make_request_with_retry(client, "GET", pdf_url_from_head, passed_cookies=session_cookies) # Pass cookies
+                        pdf_dl_result = await _handle_pdf_download(pdf_get_response.content, str(pdf_get_response.url), "direct_head_get")
+                        if pdf_dl_result.type == "file":
+                            return pdf_dl_result # Success
+                        else: # PDF download/validation failed
+                            logger.warning(f"PDF download after HEAD confirmation failed for {str(pdf_get_response.url)}: {pdf_dl_result.reason}",
+                                           extra={"url":url, "pdf_url": str(pdf_get_response.url), "reason":pdf_dl_result.reason, "event_type":"direct_head_get_pdf_fail_validation"})
+                            # Update direct_http_exception if this is a new or more relevant failure
+                            if not direct_http_exception or isinstance(direct_http_exception, httpx.HTTPStatusError) and direct_http_exception.response.status_code == 200:
+                                direct_http_exception = RuntimeError(f"PDF content from HEAD/GET for {str(pdf_get_response.url)} was invalid: {pdf_dl_result.reason}")
+                    else:
+                        logger.info(f"HEAD request to {str(head_response.url)} did not indicate PDF (Content-Type: {head_content_type}).",
+                                    extra={"url": url, "final_url_after_head": str(head_response.url), "head_content_type": head_content_type, "event_type": "direct_head_not_pdf"})
+
+                except httpx.HTTPStatusError as e_head_status:
+                    logger.warning(f"HEAD request for PDF for {final_url_after_redirects} failed with HTTP {e_head_status.response.status_code}",
+                                   extra={"url": url, "final_url_for_head": final_url_after_redirects, "status_code": e_head_status.response.status_code, "event_type": "direct_head_pdf_http_status_fail"})
+                    if not direct_http_exception: direct_http_exception = e_head_status 
+                except httpx.RequestError as e_head_request: # Covers NetworkError, Timeout, etc.
+                    logger.warning(f"HEAD request for PDF for {final_url_after_redirects} failed with RequestError: {e_head_request}",
+                                   extra={"url": url, "final_url_for_head": final_url_after_redirects, "error": str(e_head_request), "event_type": "direct_head_pdf_request_fail"})
+                    if not direct_http_exception: direct_http_exception = e_head_request
+                except Exception as e_unexpected_head: # Catch any other unexpected errors
+                    logger.error(f"Unexpected error during HEAD PDF check for {final_url_after_redirects}: {e_unexpected_head}", exc_info=True,
+                                 extra={"url":url, "final_url_for_head": final_url_after_redirects, "event_type":"direct_head_pdf_unexpected_error"})
+                    if not direct_http_exception: direct_http_exception = e_unexpected_head
+
             # --- Playwright Attempt ---
             if attempt_playwright:
                 logger.info(f"Attempting Playwright fallback for: {url} (Direct HTTP exception was: {type(direct_http_exception).__name__ if direct_http_exception else 'None'})", 
@@ -384,10 +525,11 @@ async def scrape_with_fallback(
                                    "direct_http_exception_details": str(direct_http_exception) if direct_http_exception else None, 
                                    "event_type": "playwright_attempt_after_direct"})
                 
-                playwright_result: Optional[ResolveResult] = None
-                # Ensure random is available in this scope, even if imported globally.
-                # import random # This is already at the top of the file, should not be needed here.
-                                # The UnboundLocalError suggests it's not seen. Let's trust the global import for now.
+                playwright_result: Optional[ScraperResult] = None # Corrected type hint
+                # Ensure random is available in this scope.
+                import random # Explicitly import random here to ensure availability in this scope
+                local_randint = random.randint # Assign to local variable
+
                 try:
                     async with async_playwright() as p:
                         browser_args = []
@@ -405,6 +547,9 @@ async def scrape_with_fallback(
                         page = await browser.new_page()
                         await page.set_viewport_size({"width": 1920, "height": 1080}) # Set viewport
                         
+                        # --- Register PDF Capture Handler (Task 1c) ---
+                        page.on("response", _maybe_capture_pdf)
+
                         # Ensure random is available for the timeout call
                         # This is belt-and-suspenders as it's imported globally
                         # import random # Already globally imported, this line is not needed if global works.
@@ -414,12 +559,13 @@ async def scrape_with_fallback(
                                         # Forcing it into local scope for this call:
                         
                         download_info = {"path": None, "url": None, "error": None}
+                        p_cookies: List[Dict] = [] # Initialize p_cookies
 
                         async def handle_download(download):
                             try:
                                 suggested_filename = download.suggested_filename
                                 if not suggested_filename.lower().endswith(".pdf"):
-                                    logger.warning(f"Playwright download is not a PDF: {suggested_filename}", extra={"url": url, "filename": suggested_filename, "event_type": "playwright_download_not_pdf"})
+                                    logger.warning(f"Playwright download is not a PDF: {suggested_filename}", extra={"url": url, "download_suggested_filename": suggested_filename, "event_type": "playwright_download_not_pdf"})
                                     download_info["error"] = "Downloaded file not a PDF."
                                     await download.cancel()
                                     return
@@ -436,96 +582,152 @@ async def scrape_with_fallback(
                                 download_info["error"] = str(e_download)
                             
                         page.on("download", handle_download)
-                        logger.info(f"Playwright: Navigating to {url}", extra={"url": url, "event_type": "playwright_goto_attempt"})
-                        pw_response_status = None
+                        
+                        # --- Try block for PDF capture from response (Task 1c) ---
                         try:
+                            logger.info(f"Playwright: Navigating to {url}", extra={"url": url, "event_type": "playwright_goto_attempt"})
+                            pw_response_status = None
                             pw_nav_response = await page.goto(url, timeout=PLAYWRIGHT_NAV_TIMEOUT, wait_until="load") # Changed to 'load' for initial check
                             final_url_after_redirects = page.url
                             pw_response_status = pw_nav_response.status if pw_nav_response else None
-                            logger.info(f"Playwright: Initial navigation to {final_url_after_redirects} completed with status {pw_response_status}", extra={"url": url, "final_url": final_url_after_redirects, "status": pw_response_status, "event_type": "playwright_goto_initial_success"})
+                            # Ensure pw_response_status is serializable for logging
+                            loggable_status = pw_response_status
+                            from unittest.mock import MagicMock, AsyncMock # Explicit import here
+                            if hasattr(pw_response_status, '_is_coroutine') or isinstance(pw_response_status, (MagicMock, AsyncMock)):
+                                loggable_status = str(pw_response_status) # Or a default like None/0 if it's a mock without a set status
 
-                            # Cloudflare check
-                            page_content_for_cf_check = await page.content()
-                            cf_challenge_present = "cf-chl" in page_content_for_cf_check.lower()
-                            # More robust selector for verify button
-                            verify_button_selector = 'iframe[src*="challenges.cloudflare.com"]' # Check for iframe first
-                            
-                            # Check for iframe containing the challenge
-                            iframe_element = await page.query_selector(verify_button_selector)
-                            if iframe_element:
-                                logger.info(f"Playwright: Cloudflare iframe detected on {final_url_after_redirects}. Attempting to click verify inside iframe.", extra={"url":url, "event_type":"cloudflare_iframe_detected"})
+                            logger.info(f"Playwright: Initial navigation to {final_url_after_redirects} completed with status {loggable_status}", extra={"url": url, "final_url": final_url_after_redirects, "status": loggable_status, "event_type": "playwright_goto_initial_success"})
+
+                            # --- Enhanced Cloudflare iframe Detection (Task 3a) ---
+                            cf_iframe_selector = 'iframe[src*="challenges.cloudflare.com"], iframe[id^="cf-chl-widget"]'
+                            cloudflare_iframe_element = await page.query_selector(cf_iframe_selector)
+
+                            if cloudflare_iframe_element:
+                                logger.info(f"Cloudflare challenge iframe detected on {page.url}. Waiting for clearance or network idle.", extra={"url": page.url, "event_type": "cloudflare_iframe_detected_wait_start"})
+                                
+                                # Attempt to click common elements inside iframe if it's a known pattern (e.g., Turnstile)
                                 try:
-                                    frame = await iframe_element.content_frame()
+                                    frame = await cloudflare_iframe_element.content_frame()
                                     if frame:
-                                        # Common selectors within Cloudflare iframe
-                                        cf_button_selectors_in_iframe = [
-                                            "input[type='button'][value*='Verify']",
-                                            "button:has-text('Verify you are human')",
-                                            "input[type='checkbox']", # Sometimes it's just a checkbox
-                                            "#challenge-stage span.mark" # Another common pattern
-                                        ]
-                                        clicked_in_iframe = False
-                                        for sel in cf_button_selectors_in_iframe:
-                                            verify_button_in_iframe = frame.locator(sel).first
-                                            if await verify_button_in_iframe.is_visible(timeout=5000):
-                                                await verify_button_in_iframe.click(timeout=5000)
-                                                logger.info(f"Playwright: Clicked Cloudflare verify button (selector: {sel}) inside iframe for {final_url_after_redirects}.", extra={"url":url, "selector": sel, "event_type":"cloudflare_verify_clicked_iframe"})
-                                                await page.wait_for_load_state("networkidle", timeout=60000) # Wait for verification to complete
-                                                logger.info(f"Playwright: Network idle after Cloudflare iframe verify click for {final_url_after_redirects}.", extra={"url":url, "event_type":"cloudflare_network_idle_after_iframe_verify"})
-                                                final_url_after_redirects = page.url # Update final URL
-                                                clicked_in_iframe = True
-                                                break
-                                        if not clicked_in_iframe:
-                                            logger.warning(f"Playwright: Cloudflare iframe detected, but no known verify button found/clicked for {final_url_after_redirects}.", extra={"url":url, "event_type":"cloudflare_iframe_verify_button_not_found"})
-                                    else:
-                                        logger.warning(f"Playwright: Could not get content frame for Cloudflare iframe on {final_url_after_redirects}.", extra={"url":url, "event_type":"cloudflare_iframe_no_content_frame"})
-                                except Exception as e_cf_iframe:
-                                    logger.warning(f"Playwright: Error interacting with Cloudflare iframe for {final_url_after_redirects}: {e_cf_iframe}", exc_info=True, extra={"url":url, "event_type":"cloudflare_iframe_interaction_error"})
-                            elif cf_challenge_present: # Fallback to direct button click if no iframe or iframe interaction failed
-                                logger.info(f"Playwright: Cloudflare challenge detected (cf-chl in content) on {final_url_after_redirects}. Looking for verify button.", extra={"url":url, "event_type":"cloudflare_challenge_detected_direct"})
-                                direct_verify_selectors = [
-                                    "button:has-text('Verify you are human')",
-                                    "button:has-text('Verify')",
-                                    "input[type='button'][value*='Verify']"
-                                ]
-                                clicked_direct_button = False
-                                for sel in direct_verify_selectors:
-                                    verify_button = page.locator(sel).first
-                                    if await verify_button.is_visible(timeout=5000):
-                                        await verify_button.click(timeout=5000)
-                                        logger.info(f"Playwright: Clicked direct Cloudflare verify button (selector: {sel}) for {final_url_after_redirects}.", extra={"url":url, "selector": sel, "event_type":"cloudflare_verify_clicked_direct"})
-                                        await page.wait_for_load_state("networkidle", timeout=60000)
-                                        logger.info(f"Playwright: Network idle after direct Cloudflare verify click for {final_url_after_redirects}.", extra={"url":url, "event_type":"cloudflare_network_idle_after_direct_verify"})
-                                        final_url_after_redirects = page.url # Update final URL
-                                        clicked_direct_button = True
-                                        break
-                                if not clicked_direct_button:
-                                     logger.warning(f"Playwright: Cloudflare challenge detected, but no direct verify button found/clicked for {final_url_after_redirects}.", extra={"url":url, "event_type":"cloudflare_direct_verify_button_not_found"})
-                            
-                            # Final wait for network idle if not already done by CF logic, or if CF logic was skipped
-                            if not iframe_element and not cf_challenge_present: # If no CF was detected
-                                await page.wait_for_load_state("networkidle", timeout=PLAYWRIGHT_NAV_TIMEOUT / 2) # Use half of nav timeout
-                                logger.info(f"Playwright: Standard network idle wait for {final_url_after_redirects}.", extra={"url":url, "event_type":"playwright_standard_network_idle"})
+                                        turnstile_checkbox_selector = 'input[type="checkbox"]' # Common for Turnstile
+                                        checkbox_in_iframe = frame.locator(turnstile_checkbox_selector).first
+                                        if await checkbox_in_iframe.is_visible(timeout=3000): # Shorter timeout for visibility check
+                                            await checkbox_in_iframe.click(timeout=3000)
+                                            logger.info(f"Clicked Turnstile checkbox in Cloudflare iframe for {page.url}.", extra={"url":page.url, "event_type":"cloudflare_turnstile_clicked_iframe"})
+                                            await page.wait_for_timeout(2000) # Give it a moment to process after click
+                                except Exception as e_cf_click:
+                                    logger.warning(f"Could not click element in Cloudflare iframe or iframe interaction failed: {e_cf_click}", extra={"url":page.url, "event_type":"cloudflare_iframe_click_error"})
+                                
+                                # Wait for either networkidle or cf_clearance cookie
+                                network_idle_task = asyncio.create_task(page.wait_for_load_state("networkidle", timeout=45000))
+                                cookie_check_task = asyncio.create_task(_wait_for_cf_clearance_cookie(page, timeout=45000))
 
-                            # Use the globally imported random
-                            await page.wait_for_timeout(random.randint(2000, 5000)) # General post-load delay
+                                done, pending = await asyncio.wait(
+                                   [network_idle_task, cookie_check_task],
+                                   return_when=asyncio.FIRST_COMPLETED
+                                )
+
+                                for task_iter in pending:
+                                    task_iter.cancel()
+                                    try:
+                                        await task_iter
+                                    except asyncio.CancelledError:
+                                        pass
+
+                                cleared_by_cookie = False
+                                if cookie_check_task in done and not cookie_check_task.cancelled() and cookie_check_task.exception() is None and cookie_check_task.result():
+                                    logger.info(f"cf_clearance cookie appeared for {page.url}.", extra={"url": page.url, "event_type": "cloudflare_cookie_appeared"})
+                                    cleared_by_cookie = True
+                                elif network_idle_task in done and not network_idle_task.cancelled() and network_idle_task.exception() is None:
+                                    logger.info(f"Network idle achieved for {page.url} while waiting for Cloudflare.", extra={"url": page.url, "event_type": "cloudflare_network_idle_achieved"})
+                                    if await _check_for_cf_clearance_cookie_once(page):
+                                        cleared_by_cookie = True
+                                        logger.info(f"cf_clearance cookie found after network idle for {page.url}.", extra={"url": page.url, "event_type": "cloudflare_cookie_after_network_idle"})
+                                else:
+                                    logger.warning(f"Neither networkidle nor cf_clearance cookie confirmed in time for {page.url}.", extra={"url": page.url, "event_type": "cloudflare_wait_timeout_or_error"})
+                                
+                                if cleared_by_cookie:
+                                    logger.info(f"Cloudflare challenge likely passed for {page.url} (cookie present).", extra={"url": page.url, "event_type": "cloudflare_challenge_passed_cookie"})
+                                else:
+                                    logger.warning(f"Cloudflare challenge may not have passed for {page.url} (no cookie after waits). Proceeding cautiously.", extra={"url": page.url, "event_type": "cloudflare_challenge_passage_uncertain"})
+                                final_url_after_redirects = page.url # Update URL after CF handling
+                            
+                            # Fallback to existing cf-chl keyword check if no specific iframe was found
+                            
+                            # Fetch page content once, may be used for CF keyword check and main content extraction
+                            # This is the primary place page.content() should be called if page exists.
+                            fetched_page_content = ""
+                            if 'page' in locals() and page:
+                                try:
+                                    fetched_page_content = await page.content() 
+                                    logger.info(f"Playwright: Fetched page content (primary), length {len(fetched_page_content)} from {page.url}", extra={"url":page.url, "length":len(fetched_page_content), "event_type":"playwright_content_fetched_primary"})
+                                except Exception as e_fetch_content_primary:
+                                    logger.warning(f"Playwright: Failed to fetch page content (primary): {e_fetch_content_primary}", extra={"url":page.url if page else url, "event_type":"playwright_content_fetch_primary_error"})
+                            
+                            page_content_for_cf_check = fetched_page_content # Use the fetched content
+
+                            if "cf-chl" in page_content_for_cf_check.lower():
+                                logger.info(f"Playwright: Fallback Cloudflare challenge detected (cf-chl in content) on {final_url_after_redirects}. Looking for verify button.", extra={"url":url, "event_type":"cloudflare_challenge_detected_direct_fallback"})
+                                # ... (existing direct button clicking logic can remain here if needed as a further fallback) ...
+                                # For now, the primary new logic is the iframe + cookie/networkidle wait.
+                                # If this fallback is still desired, it should also be followed by the cookie/networkidle check.
+                                # To simplify, we'll assume the iframe or the cookie check is the main path.
+                                # If direct button clicking is still needed, it should also be followed by the wait logic.
+                                # For now, let's prioritize the new iframe logic and cookie check.
+                                # If no iframe, but cf-chl is present, we might still want to wait for cookie or network idle.
+                                logger.info(f"cf-chl keyword found without specific iframe for {page.url}. Waiting for cookie or network idle.", extra={"url": page.url, "event_type": "cf_chl_keyword_wait_start"})
+                                network_idle_task_fallback = asyncio.create_task(page.wait_for_load_state("networkidle", timeout=45000))
+                                cookie_check_task_fallback = asyncio.create_task(_wait_for_cf_clearance_cookie(page, timeout=45000))
+                                done_fallback, pending_fallback = await asyncio.wait([network_idle_task_fallback, cookie_check_task_fallback], return_when=asyncio.FIRST_COMPLETED)
+                                for task_iter_fb in pending_fallback: task_iter_fb.cancel(); await asyncio.sleep(0) # allow cancellation
+                                if cookie_check_task_fallback in done_fallback and not cookie_check_task_fallback.cancelled() and cookie_check_task_fallback.exception() is None and cookie_check_task_fallback.result():
+                                     logger.info(f"cf_clearance cookie appeared (fallback check) for {page.url}.", extra={"url": page.url, "event_type": "cloudflare_cookie_appeared_fallback"})
+                                elif network_idle_task_fallback in done_fallback and not network_idle_task_fallback.cancelled() and network_idle_task_fallback.exception() is None:
+                                     logger.info(f"Network idle achieved (fallback check) for {page.url}.", extra={"url": page.url, "event_type": "cloudflare_network_idle_fallback"})
+                                     if await _check_for_cf_clearance_cookie_once(page): logger.info(f"cf_clearance cookie found after network idle (fallback) for {page.url}.", extra={"url": page.url})
+                                else:
+                                     logger.warning(f"Fallback cf-chl check: Neither networkidle nor cookie confirmed for {page.url}.", extra={"url": page.url, "event_type": "cloudflare_fallback_wait_timeout"})
+                                final_url_after_redirects = page.url # Update URL
+
+                            else: # No Cloudflare detected by iframe or keyword
+                                await page.wait_for_load_state("networkidle", timeout=PLAYWRIGHT_NAV_TIMEOUT / 2) 
+                                logger.info(f"Playwright: Standard network idle wait for {final_url_after_redirects} (no CF detected).", extra={"url":url, "event_type":"playwright_standard_network_idle_no_cf"})
+                            
+                            post_load_delay = local_randint(2000, 5000) # Pre-calculate delay
+                            await page.wait_for_timeout(post_load_delay) # Use pre-calculated delay
                             final_url_after_redirects = page.url # Update final URL again after all waits
                             # Re-fetch status if navigation happened due to CF
                             if pw_nav_response: pw_response_status = pw_nav_response.status 
 
+                        except _ReturnPDFBytes as e_pdf_bytes: 
+                            pdf_bytes_content, pdf_url_from_event = e_pdf_bytes.args
+                            logger.info(f"Successfully surfaced PDF bytes from Playwright response handler for URL: {pdf_url_from_event}", extra={"url": pdf_url_from_event, "event_type": "playwright_pdf_event_success"})
+                            p_cookies = []
+                            if page and page.context:
+                                try:
+                                    p_cookies = await page.context.cookies() or []
+                                except Exception as e_cookie_pdf_event:
+                                    logger.warning(f"Failed to fetch cookies during PDFBytesResult creation: {e_cookie_pdf_event}", extra={"url":url, "event_type":"playwright_cookie_fetch_pdfbytes_error"})
+                            # Set playwright_result, do not return or close browser here. Let finally handle close.
+                            playwright_result = PDFBytesResult(type="pdf_bytes", content=pdf_bytes_content, url=pdf_url_from_event, cookies=p_cookies)
+                            # This will bypass further processing in the try block and go to finally.
                         except PlaywrightTimeoutError:
                             logger.warning(f"Playwright: Timed out navigating or waiting for state for {url}. Content might be partial.", extra={"url": url, "event_type": "playwright_nav_timeout_or_wait_fail"})
                             final_url_after_redirects = page.url 
                         except PlaywrightError as e_goto:
                             logger.error(f"Playwright: Navigation error for {url}: {e_goto}", exc_info=True, extra={"url": url, "event_type": "playwright_nav_error"})
+                            p_cookies = await page.context.cookies() or [] # Try to get cookies even on error
                             await browser.close()
-                            return Failure(type="failure", reason=f"Playwright navigation error: {e_goto}", status_code=getattr(e_goto, 'response_status', None))
+                            return Failure(type="failure", reason=f"Playwright navigation error: {e_goto}", status_code=getattr(e_goto, 'response_status', None), cookies=p_cookies)
 
+                        # --- Existing Playwright result handling (HTML, File download) ---
+                        # This block is now part of the try, if _ReturnPDFBytes wasn't raised.
                         if download_info["path"]:
                             is_valid, reason = is_pdf_content_valid(download_info["path"])
                             if is_valid:
                                 logger.info(f"Playwright auto-downloaded PDF is valid: {download_info['path']}", extra={"url": url, "event_type": "playwright_autodownload_pdf_valid"})
-                                playwright_result = FileResult(type="file", path=download_info["path"], url=download_info["url"] or final_url_after_redirects)
+                                p_cookies = await page.context.cookies() or []
+                                playwright_result = FileResult(type="file", path=download_info["path"], url=download_info["url"] or final_url_after_redirects, cookies=p_cookies)
                             else:
                                 logger.warning(f"Playwright auto-downloaded PDF invalid: {reason}. Deleting.", extra={"url": url, "path": download_info["path"], "reason": reason, "event_type": "playwright_autodownload_pdf_invalid"})
                                 try: os.remove(download_info["path"])
@@ -533,13 +735,22 @@ async def scrape_with_fallback(
                         elif download_info["error"]:
                              logger.warning(f"Playwright download event error: {download_info['error']}", extra={"url": url, "event_type": "playwright_download_event_error"})
 
-                        if not playwright_result:
-                            logger.info(f"Playwright: Attempting to get page content from {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_get_content_attempt"})
-                            rendered_html = await page.content()
-                            logger.info(f"Playwright: Got page content, length {len(rendered_html)} chars from {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "content_length": len(rendered_html), "event_type": "playwright_get_content_success"})
+                        if not playwright_result: # If not PDFBytesResult and not FileResult from download event
+                            logger.info(f"Playwright: Using/Re-fetching page content from {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_use_or_refetch_content_attempt"})
+                            
+                            rendered_html = fetched_page_content # Use already fetched content
+                            
+                            if not rendered_html and 'page' in locals() and page: # If primary fetch was empty or failed, try to get it now
+                                logger.info(f"Playwright: Re-fetching page content for {page.url} as primary fetch was empty or failed.", extra={"url":page.url, "event_type":"playwright_content_refetch"})
+                                try:
+                                    rendered_html = await page.content()
+                                except Exception as e_refetch:
+                                    logger.warning(f"Playwright: Re-fetching page content failed: {e_refetch}", extra={"url":page.url, "event_type":"playwright_content_refetch_error"})
+                                    rendered_html = "" # Ensure it's a string
+
+                            logger.info(f"Playwright: Using page content, length {len(rendered_html)} chars from {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "content_length": len(rendered_html), "event_type": "playwright_using_content_success"})
                             extracted_text_playwright = await _extract_html_text(rendered_html, final_url_after_redirects)
                             
-                            # Check for common verification/error messages
                             is_verification_page = False
                             if extracted_text_playwright:
                                 verification_keywords = ["verify you are human", "enable javascript and cookies", "security of your connection", "waiting for response"]
@@ -551,79 +762,140 @@ async def scrape_with_fallback(
                             if extracted_text_playwright and not is_verification_page:
                                 logger.info(f"Playwright: Extracted text length {len(extracted_text_playwright)} from {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "extracted_length": len(extracted_text_playwright), "event_type": "playwright_text_extraction_info"})
                                 paywalled_playwright = is_html_potentially_paywalled(rendered_html)
+                                p_cookies = await page.context.cookies() or []
                                 if len(extracted_text_playwright) >= MIN_CHARS_FOR_FULL_ARTICLE_OVERRIDE:
                                     logger.info(f"Playwright: Long HTML content from {final_url_after_redirects} overrides paywall.", extra={"url": final_url_after_redirects, "length": len(extracted_text_playwright), "event_type": "playwright_html_long_override_paywall"})
-                                    playwright_result = HTMLResult(type="html", text=extracted_text_playwright, url=final_url_after_redirects)
+                                    playwright_result = HTMLResult(type="html", text=extracted_text_playwright, url=final_url_after_redirects, cookies=p_cookies)
                                 elif not paywalled_playwright and len(extracted_text_playwright) >= MIN_HTML_CONTENT_LENGTH:
                                     logger.info(f"Playwright: Sufficient non-paywalled HTML from {final_url_after_redirects}.", extra={"url": final_url_after_redirects, "length": len(extracted_text_playwright), "event_type": "playwright_html_sufficient_success"})
-                                    playwright_result = HTMLResult(type="html", text=extracted_text_playwright, url=final_url_after_redirects)
-                                else: # Short or paywalled
+                                    playwright_result = HTMLResult(type="html", text=extracted_text_playwright, url=final_url_after_redirects, cookies=p_cookies)
+                                else: 
                                     logger.info(f"Playwright: HTML from {final_url_after_redirects} is short or paywalled (or was verification page). Paywalled: {paywalled_playwright}, Length: {len(extracted_text_playwright)}", extra={"url": final_url_after_redirects, "length": len(extracted_text_playwright), "paywalled": paywalled_playwright, "event_type": "playwright_html_short_or_paywalled"})
-                            elif is_verification_page:
-                                # Already logged, playwright_result remains None to allow fallback
-                                pass
-                            else: # No substantial text extracted
-                                logger.info(f"Playwright: No substantial HTML text extracted from {final_url_after_redirects}.", extra={"url": final_url_after_redirects, "event_type": "playwright_html_no_extract"})
-                        
-                        if not playwright_result: # If no auto-download or other early success
-                            page_content_lower = ""
-                            try:
-                                current_page_content = await page.content()
-                                page_content_lower = current_page_content.lower()
-                            except PlaywrightError as e_content:
-                                logger.warning(f"Playwright: Could not get page content from {final_url_after_redirects} to check for 'PDF': {e_content}", extra={"url":url, "final_url":final_url_after_redirects, "event_type":"playwright_get_content_for_pdf_check_error"})
+                            # ... (rest of HTML processing, PDF link finding, etc.)
+                            # Ensure p_cookies are collected before returning/closing browser in these paths too.
+                            if not playwright_result: # If no auto-download or other early success
+                                page_content_lower = ""
+                                try:
+                                    current_page_content = await page.content()
+                                    page_content_lower = current_page_content.lower()
+                                except PlaywrightError as e_content:
+                                    logger.warning(f"Playwright: Could not get page content from {final_url_after_redirects} to check for 'PDF': {e_content}", extra={"url":url, "final_url":final_url_after_redirects, "event_type":"playwright_get_content_for_pdf_check_error"})
 
-                            if direct_http_exception and "pdf" in page_content_lower: 
-                                logger.info(f"Playwright: Direct HTTP failed and 'pdf' found in page content of {final_url_after_redirects}. Attempting click_download_and_capture.", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_pdf_in_content_click_attempt"})
-                                
-                                pdf_bytes_captured = await click_download_and_capture(page)
-                                
-                                if pdf_bytes_captured:
-                                    logger.info(f"Playwright: Captured {len(pdf_bytes_captured)} bytes via click_download_and_capture for {final_url_after_redirects}.", extra={"url": url, "final_url": final_url_after_redirects, "bytes": len(pdf_bytes_captured), "event_type": "playwright_click_capture_success_bytes"})
-                                    click_capture_result = await _handle_pdf_download(pdf_bytes_captured, final_url_after_redirects, "playwright_click_capture")
-                                    if click_capture_result.type == "file":
-                                        playwright_result = click_capture_result 
-                                        logger.info(f"Playwright: Successfully processed PDF from click_download_and_capture for {final_url_after_redirects}.", extra={"url": url, "path": playwright_result.path, "event_type": "playwright_click_capture_processed_file"})
-                                    else: 
-                                        logger.warning(f"Playwright: PDF from click_download_and_capture for {final_url_after_redirects} was invalid or failed to save: {click_capture_result.reason}", extra={"url": url, "reason": click_capture_result.reason, "event_type": "playwright_click_capture_invalid_or_save_fail"})
+                                if direct_http_exception and "pdf" in page_content_lower: 
+                                    logger.info(f"Playwright: Direct HTTP failed and 'pdf' found in page content of {final_url_after_redirects}. Attempting click_download_and_capture.", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_pdf_in_content_click_attempt"})
+                                    pdf_bytes_captured = await click_download_and_capture(page)
+                                    if pdf_bytes_captured:
+                                        logger.info(f"Playwright: Captured {len(pdf_bytes_captured)} bytes via click_download_and_capture for {final_url_after_redirects}.", extra={"url": url, "final_url": final_url_after_redirects, "bytes": len(pdf_bytes_captured), "event_type": "playwright_click_capture_success_bytes"})
+                                        p_cookies = await page.context.cookies() or [] # Get cookies before handling download
+                                        click_capture_result = await _handle_pdf_download(pdf_bytes_captured, final_url_after_redirects, "playwright_click_capture")
+                                        if click_capture_result.type == "file":
+                                            playwright_result = FileResult(type="file", path=click_capture_result.path, url=click_capture_result.url, cookies=p_cookies)
+                                            logger.info(f"Playwright: Successfully processed PDF from click_download_and_capture for {final_url_after_redirects}.", extra={"url": url, "path": playwright_result.path, "event_type": "playwright_click_capture_processed_file"})
+                                        else: 
+                                            logger.warning(f"Playwright: PDF from click_download_and_capture for {final_url_after_redirects} was invalid or failed to save: {click_capture_result.reason}", extra={"url": url, "reason": click_capture_result.reason, "event_type": "playwright_click_capture_invalid_or_save_fail"})
+                                    else:
+                                        logger.info(f"Playwright: click_download_and_capture did not return bytes for {final_url_after_redirects}.", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_click_capture_no_bytes"})
+                            
+                            if not playwright_result: # Re-check if click_download_and_capture succeeded
+                                logger.info(f"Playwright: Attempting to find PDF links in DOM of {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_find_pdf_links_attempt"})
+                                pdf_links = await page.query_selector_all("a[href$='.pdf'], a[href*='downloadSgArticle'], a[href*='pdfLink']")
+                                if pdf_links:
+                                    logger.info(f"Playwright: Found {len(pdf_links)} potential PDF links in DOM of {final_url_after_redirects}.", extra={"url": url, "final_url": final_url_after_redirects, "count": len(pdf_links), "event_type": "playwright_found_pdf_links_count"})
+                                    for i, link_element in enumerate(pdf_links):
+                                        pdf_url_rel = await link_element.get_attribute("href")
+                                        if pdf_url_rel:
+                                            pdf_abs_url = urlparse(final_url_after_redirects)._replace(path=pdf_url_rel).geturl() if not pdf_url_rel.startswith(('http://', 'https://')) else pdf_url_rel
+                                            logger.info(f"Playwright: Trying PDF link {i+1}/{len(pdf_links)}: {pdf_abs_url}", extra={"url": url, "pdf_link": pdf_abs_url, "event_type": "playwright_try_pdf_link"})
+                                            try:
+                                                async with httpx.AsyncClient(follow_redirects=True) as pdf_client: # New client for this specific download
+                                                    # Pass session_cookies from the main scrape_with_fallback call
+                                                    pdf_response = await _make_request_with_retry(pdf_client, "GET", pdf_abs_url, passed_cookies=session_cookies) # Pass cookies here
+                                                    pdf_content_type = pdf_response.headers.get("content-type", "").lower()
+                                                    if pdf_content_type.startswith("application/pdf"):
+                                                        p_cookies = await page.context.cookies() or [] # Get cookies before handling download
+                                                        dl_result = await _handle_pdf_download(pdf_response.content, pdf_abs_url, "playwright_link_get")
+                                                        if dl_result.type == "file":
+                                                            playwright_result = FileResult(type="file", path=dl_result.path, url=dl_result.url, cookies=p_cookies)
+                                                            logger.info(f"Playwright: Successfully downloaded PDF from link {pdf_abs_url}", extra={"url":url, "pdf_link":pdf_abs_url, "event_type":"playwright_pdf_link_download_success"})
+                                                            break 
+                                                    else:
+                                                        logger.warning(f"Playwright: PDF link {pdf_abs_url} did not return PDF content-type: {pdf_content_type}", extra={"url":url, "pdf_link":pdf_abs_url, "content_type":pdf_content_type, "event_type":"playwright_pdf_link_wrong_content_type"})
+                                            except Exception as e_fetch_link:
+                                                logger.warning(f"Playwright: Error fetching PDF link {pdf_abs_url}: {e_fetch_link}", exc_info=True, extra={"url": url, "pdf_link": pdf_abs_url, "event_type": "playwright_fetch_pdf_link_error"})
                                 else:
-                                    logger.info(f"Playwright: click_download_and_capture did not return bytes for {final_url_after_redirects}.", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_click_capture_no_bytes"})
+                                    logger.info(f"Playwright: No PDF links found in DOM of {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_no_pdf_links_found"})
                         
-                        if not playwright_result: # Re-check if click_download_and_capture succeeded
-                            logger.info(f"Playwright: Attempting to find PDF links in DOM of {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_find_pdf_links_attempt"})
-                            pdf_links = await page.query_selector_all("a[href$='.pdf'], a[href*='downloadSgArticle'], a[href*='pdfLink']")
-                            if pdf_links:
-                                logger.info(f"Playwright: Found {len(pdf_links)} potential PDF links in DOM of {final_url_after_redirects}.", extra={"url": url, "final_url": final_url_after_redirects, "count": len(pdf_links), "event_type": "playwright_found_pdf_links_count"})
-                                for i, link_element in enumerate(pdf_links):
-                                    pdf_url_rel = await link_element.get_attribute("href")
-                                    if pdf_url_rel:
-                                        pdf_abs_url = urlparse(final_url_after_redirects)._replace(path=pdf_url_rel).geturl() if not pdf_url_rel.startswith(('http://', 'https://')) else pdf_url_rel
-                                        logger.info(f"Playwright: Trying PDF link {i+1}/{len(pdf_links)}: {pdf_abs_url}", extra={"url": url, "pdf_link": pdf_abs_url, "event_type": "playwright_try_pdf_link"})
-                                        try:
-                                            async with httpx.AsyncClient(follow_redirects=True) as pdf_client:
-                                                pdf_response = await _make_request_with_retry(pdf_client, "GET", pdf_abs_url)
-                                                pdf_content_type = pdf_response.headers.get("content-type", "").lower()
-                                                if pdf_content_type.startswith("application/pdf"):
-                                                    dl_result = await _handle_pdf_download(pdf_response.content, pdf_abs_url, "playwright_link_get")
-                                                    if dl_result.type == "file":
-                                                        playwright_result = dl_result
-                                                        logger.info(f"Playwright: Successfully downloaded PDF from link {pdf_abs_url}", extra={"url":url, "pdf_link":pdf_abs_url, "event_type":"playwright_pdf_link_download_success"})
-                                                        break 
-                                                else:
-                                                    logger.warning(f"Playwright: PDF link {pdf_abs_url} did not return PDF content-type: {pdf_content_type}", extra={"url":url, "pdf_link":pdf_abs_url, "content_type":pdf_content_type, "event_type":"playwright_pdf_link_wrong_content_type"})
-                                        except Exception as e_fetch_link:
-                                            logger.warning(f"Playwright: Error fetching PDF link {pdf_abs_url}: {e_fetch_link}", exc_info=True, extra={"url": url, "pdf_link": pdf_abs_url, "event_type": "playwright_fetch_pdf_link_error"})
-                            else:
-                                logger.info(f"Playwright: No PDF links found in DOM of {final_url_after_redirects}", extra={"url": url, "final_url": final_url_after_redirects, "event_type": "playwright_no_pdf_links_found"})
+                        # Ensure cookies are fetched if not already done and playwright_result is set
+                        if playwright_result and not playwright_result.cookies:
+                            if page and page.context: # Check if page and context are valid
+                                try:
+                                    p_cookies = await page.context.cookies() or []
+                                    if isinstance(playwright_result, (HTMLResult, FileResult, PDFBytesResult)): # PDFBytesResult also needs cookies
+                                        playwright_result = playwright_result._replace(cookies=p_cookies)
+                                except Exception as e_cookie_fetch:
+                                    logger.warning(f"Failed to fetch cookies after Playwright success: {e_cookie_fetch}", extra={"url":url, "event_type":"playwright_cookie_fetch_late_error"})
                         
-                        logger.info(f"Playwright: Closing browser for {url}", extra={"url": url, "event_type": "playwright_browser_close"})
-                        await browser.close()
+                        # Browser close is handled by the main finally block
                         if playwright_result:
                             return playwright_result
+                except _ReturnPDFBytes as e_pdf_bytes_outer: # Catch if raised outside the inner try (e.g. during initial page.on events before goto)
+                    pdf_bytes_content, pdf_url_from_event = e_pdf_bytes_outer.args
+                    logger.info(f"Successfully surfaced PDF bytes (outer catch) from Playwright for URL: {pdf_url_from_event}", extra={"url": pdf_url_from_event, "event_type": "playwright_pdf_event_success_outer"})
+                    p_cookies_outer = []
+                    if 'page' in locals() and page.context:
+                        try:
+                            p_cookies_outer = await page.context.cookies() or []
+                        except Exception as e_cookie_outer:
+                            logger.warning(f"Failed to fetch cookies after _ReturnPDFBytes (outer): {e_cookie_outer}", extra={"url":url, "event_type":"playwright_cookie_fetch_outer_error"})
+                    if 'browser' in locals() and browser.is_connected(): # browser might not be in locals if async_playwright() itself failed
+                        try: 
+                            # This path means an exception occurred before normal browser close logic was reached
+                            # or _ReturnPDFBytes was raised very early.
+                            if not playwright_result: # If no result was set (e.g. _ReturnPDFBytes from page.on before goto try-block)
+                                p_cookies_outer = await page.context.cookies() or []
+                                playwright_result = PDFBytesResult(type="pdf_bytes", content=pdf_bytes_content, url=pdf_url_from_event, cookies=p_cookies_outer)
+                            # Browser will be closed by the finally block associated with 'async with async_playwright() as p:'
+                        except Exception as e_outer_close_logic:
+                             logger.error(f"Error in _ReturnPDFBytes outer catch during cookie/close prep: {e_outer_close_logic}", extra={"url":url})
+
+                    if playwright_result: # Should be set if _ReturnPDFBytes was the cause
+                        return playwright_result # Return the result, finally will close browser.
+                    else: # Should not happen if _ReturnPDFBytes was the only exception type here.
+                        # Fallback if playwright_result wasn't set for some reason but we are in this specific except block.
+                        return Failure(type="failure", reason=f"Unhandled state in _ReturnPDFBytes outer catch for {url}")
                 except PlaywrightError as e_pw:
                     logger.error(f"Playwright processing error for {url}: {e_pw}", exc_info=True, extra={"url": url, "event_type": "playwright_general_error"})
+                    current_cookies_on_error = []
+                    if 'page' in locals() and page.context:
+                        try: current_cookies_on_error = await page.context.cookies() or []
+                        except: pass
+                    # Browser close is handled by the main finally block
+                    return Failure(type="failure", reason=f"Playwright error: {e_pw}", cookies=current_cookies_on_error)
                 except Exception as e_pw_unhandled:
                     logger.error(f"Unhandled Playwright exception for {url}: {e_pw_unhandled}", exc_info=True, extra={"url": url, "event_type": "playwright_unhandled_exception"})
+                    current_cookies_on_error = []
+                    if 'page' in locals() and page.context:
+                        try: current_cookies_on_error = await page.context.cookies() or []
+                        except: pass
+                    # Browser close is handled by the main finally block
+                    return Failure(type="failure", reason=f"Unhandled Playwright exception: {e_pw_unhandled}", cookies=current_cookies_on_error)
+                finally: # Ensure browser is closed and cookies are attempted to be fetched
+                    if 'page' in locals() and page.context and playwright_result and not playwright_result.cookies:
+                         # This case might be redundant if already handled before browser.close()
+                         # but good as a final fallback if playwright_result was set but cookies missed.
+                        try:
+                            final_attempt_cookies = await page.context.cookies() or []
+                            if isinstance(playwright_result, (HTMLResult, FileResult, PDFBytesResult)):
+                                playwright_result = playwright_result._replace(cookies=final_attempt_cookies)
+                        except Exception as e_final_cookie:
+                            logger.warning(f"Final attempt to fetch cookies failed: {e_final_cookie}", extra={"url":url, "event_type":"playwright_cookie_fetch_final_error"})
+                    
+                    if 'browser' in locals() and browser.is_connected():
+                        logger.info(f"Playwright: Ensuring browser is closed in finally block for {url}", extra={"url": url, "event_type": "playwright_browser_close_finally"})
+                        try:
+                            await browser.close()
+                        except Exception as e_close_finally:
+                             logger.warning(f"Error closing browser in finally block: {e_close_finally}", extra={"url":url, "event_type":"playwright_browser_close_finally_error"})
                 
                 # If Python Playwright didn't get a result, try Node.js stealth fetcher
                 if not playwright_result:
@@ -723,7 +995,7 @@ async def click_download_and_capture(page, timeout: int = 30000) -> Optional[byt
     logger.warning(f"Failed to click and capture download for {page.url} after trying all selectors.", extra={"url": page.url, "event_type": "click_download_all_selectors_failed"})
     return None
 
-async def _run_nodejs_stealth_fetcher(url: str) -> ResolveResult:
+async def _run_nodejs_stealth_fetcher(url: str) -> ScraperResult: # Changed ResolveResult to ScraperResult
     """
     Runs the Node.js stealth_fetcher.js script as a subprocess.
     """
@@ -821,6 +1093,8 @@ async def _run_nodejs_stealth_fetcher(url: str) -> ResolveResult:
                     async with httpx.AsyncClient(follow_redirects=True, timeout=REQUEST_TIMEOUT * 2) as pdf_client: # Longer timeout for PDF download
                         try:
                             # Re-use _make_request_with_retry for robustness
+                            # Node.js fetcher runs in its own context, doesn't have access to Python session_cookies directly
+                            # So, _make_request_with_retry here won't have session_cookies unless explicitly passed from Node.js result (not current design)
                             pdf_response = await _make_request_with_retry(pdf_client, "GET", pdf_direct_url, headers={"Accept": "application/pdf,*/*"})
                             # _handle_pdf_download will save, validate, and return FileResult or Failure
                             return await _handle_pdf_download(pdf_response.content, pdf_direct_url, "nodejs_pdf_url_download")

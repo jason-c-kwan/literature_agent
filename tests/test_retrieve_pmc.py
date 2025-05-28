@@ -59,7 +59,9 @@ class TestFetchPmcXml(unittest.TestCase):
 
 
     @patch('tools.retrieve_pmc.aiohttp.ClientSession')
-    def test_fetch_successful_oa_article(self, MockClientSession):
+    @patch('tools.retrieve_pmc.API_EMAIL', "test@example.com") # Patch module-level API_EMAIL
+    @patch('tools.retrieve_pmc.PUBMED_API_KEY', "test_api_key") # Patch module-level API_KEY
+    def test_fetch_successful_oa_article(self, MockClientSession, mock_api_email, mock_api_key): # Add mocks to signature
         mock_response = AsyncMock()
         mock_response.status = 200
         mock_response.text = AsyncMock(return_value=MOCK_OA_XML)
@@ -71,9 +73,11 @@ class TestFetchPmcXml(unittest.TestCase):
         # Configure the context manager __aenter__ for the session
         mock_session_instance.__aenter__.return_value = mock_session_instance
         mock_session_instance.get.return_value = mock_response
+        mock_session_instance.close = AsyncMock() # Ensure close is an AsyncMock
 
         pmc_id = "PMC12345"
-        result = self.loop.run_until_complete(fetch_pmc_xml(pmc_id))
+        # Pass the mocked session to the function
+        result = self.loop.run_until_complete(fetch_pmc_xml(pmc_id, session=mock_session_instance)) 
         
         self.assertEqual(result, MOCK_OA_XML)
         mock_session_instance.get.assert_called_once()
@@ -99,10 +103,16 @@ class TestFetchPmcXml(unittest.TestCase):
         # A simple way is to ensure the test setup reflects the condition.
         # The @patch('tools.retrieve_pmc.API_EMAIL', None) should handle this.
 
+        # If fetch_pmc_xml creates its own session when API_EMAIL is None, this test is fine.
+        # If it expects a session to be passed, and we want to test the no-API_EMAIL path,
+        # we might not need to mock/pass a session here, as it should return early.
         result = self.loop.run_until_complete(fetch_pmc_xml(pmc_id))
         
         self.assertIsNone(result)
-        MockClientSession.return_value.__aenter__.return_value.get.assert_not_called()
+        # If API_EMAIL is None, get should not be called, regardless of session.
+        # MockClientSession().get.assert_not_called() # Accessing get on the instance
+        # Or, more directly, if the session isn't even created by the SUT:
+        MockClientSession.assert_not_called() # If API_EMAIL is None, session might not be created by SUT
 
     @patch('tools.retrieve_pmc.aiohttp.ClientSession')
     def test_fetch_error_xml_not_found(self, MockClientSession):
@@ -115,9 +125,10 @@ class TestFetchPmcXml(unittest.TestCase):
         mock_session_instance = MockClientSession.return_value
         mock_session_instance.__aenter__.return_value = mock_session_instance
         mock_session_instance.get.return_value = mock_response
+        mock_session_instance.close = AsyncMock()
 
         pmc_id = "PMC_INVALID"
-        result = self.loop.run_until_complete(fetch_pmc_xml(pmc_id))
+        result = self.loop.run_until_complete(fetch_pmc_xml(pmc_id, session=mock_session_instance))
         
         self.assertIsNone(result) # Expect None due to <ERROR> tag
         mock_session_instance.get.assert_called_once()
@@ -133,9 +144,10 @@ class TestFetchPmcXml(unittest.TestCase):
         mock_session_instance = MockClientSession.return_value
         mock_session_instance.__aenter__.return_value = mock_session_instance
         mock_session_instance.get.return_value = mock_response
+        mock_session_instance.close = AsyncMock()
 
         pmc_id = "PMC_MALFORMED"
-        result = self.loop.run_until_complete(fetch_pmc_xml(pmc_id))
+        result = self.loop.run_until_complete(fetch_pmc_xml(pmc_id, session=mock_session_instance))
         
         self.assertIsNone(result) # Expect None due to ParseError
         mock_session_instance.get.assert_called_once()
@@ -168,9 +180,10 @@ class TestFetchPmcXml(unittest.TestCase):
         mock_session_instance = MockClientSession.return_value
         mock_session_instance.__aenter__.return_value = mock_session_instance
         mock_session_instance.get.return_value = mock_response
+        mock_session_instance.close = AsyncMock()
         
         pmc_id = "PMC_HTTP_ERROR"
-        result = self.loop.run_until_complete(fetch_pmc_xml(pmc_id))
+        result = self.loop.run_until_complete(fetch_pmc_xml(pmc_id, session=mock_session_instance))
         
         self.assertIsNone(result)
         mock_session_instance.get.assert_called_once()
@@ -187,9 +200,10 @@ class TestFetchPmcXml(unittest.TestCase):
         # A simple Mock() should suffice for the first argument in a testing context.
         connector_error = ClientConnectorError(Mock(), os_error) 
         mock_session_instance.get.side_effect = connector_error
+        mock_session_instance.close = AsyncMock()
 
         pmc_id = "PMC_NET_ERROR"
-        result = self.loop.run_until_complete(fetch_pmc_xml(pmc_id))
+        result = self.loop.run_until_complete(fetch_pmc_xml(pmc_id, session=mock_session_instance))
         
         self.assertIsNone(result)
         mock_session_instance.get.assert_called_once()
@@ -206,9 +220,10 @@ class TestFetchPmcXml(unittest.TestCase):
         mock_session_instance = MockClientSession.return_value
         mock_session_instance.__aenter__.return_value = mock_session_instance
         mock_session_instance.get.return_value = mock_response
+        mock_session_instance.close = AsyncMock()
 
         pmc_id = "PMC12345"
-        result = self.loop.run_until_complete(fetch_pmc_xml(pmc_id))
+        result = self.loop.run_until_complete(fetch_pmc_xml(pmc_id, session=mock_session_instance))
         
         self.assertEqual(result, MOCK_OA_XML)
         mock_session_instance.get.assert_called_once()

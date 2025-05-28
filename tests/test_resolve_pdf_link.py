@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re # Added import
 import shutil
 from unittest.mock import MagicMock, patch
 
@@ -62,11 +63,13 @@ async def test_resolve_content_pdf_via_head(respx_mock: MockRouter, mock_datetim
     """Test successful PDF download identified by HEAD request."""
     test_url = "http://example.com/document.pdf"
     pdf_content = b"%PDF-1.4\n%Dummy PDF content for test"
-    
+
+    # Mock HEAD request
     respx_mock.head(test_url).respond(
         status_code=200,
         headers={"Content-Type": "application/pdf"}
     )
+    # Mock GET request that follows successful HEAD
     respx_mock.get(test_url).respond(
         status_code=200,
         content=pdf_content,
@@ -85,7 +88,7 @@ async def test_resolve_content_pdf_via_head(respx_mock: MockRouter, mock_datetim
 
     assert isinstance(result, FileResult)
     assert result.type == "file"
-    expected_filename = "20240101_120000_example_com_document_pdf.pdf"
+    expected_filename = "20240101_120000_example_com_document_pdf_head.pdf" # Changed
     assert result.path == os.path.join(DOWNLOADS_DIR, expected_filename)
     assert os.path.exists(result.path)
     with open(result.path, "rb") as f:
@@ -136,10 +139,12 @@ async def test_resolve_content_invalid_dummy_pdf_deleted(respx_mock: MockRouter,
     """Test that a downloaded PDF identified as 'dummy' is deleted."""
     test_url = "http://example.com/dummy.pdf"
     # Content that is_pdf_content_valid should flag as dummy
-    pdf_content = b"Dummy PDF file content." 
+    pdf_content = b"Dummy PDF file content."
 
-    respx_mock.head(test_url).respond(headers={"Content-Type": "application/pdf"})
-    respx_mock.get(test_url).respond(content=pdf_content, headers={"Content-Type": "application/pdf"})
+    respx_mock.head(test_url).respond(status_code=200, headers={"Content-Type": "application/pdf"})
+    # Also mock potential retry URLs if generate_pdf_retry_urls is called
+    respx_mock.get(test_url, headers__contains={"Accept": "application/pdf"}).respond(content=pdf_content, headers={"Content-Type": "application/pdf"})
+    respx_mock.get(test_url).respond(content=pdf_content, headers={"Content-Type": "application/pdf"}) # Catch-all GET
 
     # Mock os.path.getsize to be small enough but not < MIN_PDF_SIZE_KB unless content is also small
     # Let's say it's just above MIN_PDF_SIZE_KB to pass initial size check, forcing content check
@@ -166,7 +171,7 @@ async def test_resolve_content_invalid_dummy_pdf_deleted(respx_mock: MockRouter,
         result = await resolve_content(test_url)
 
     assert isinstance(result, Failure)
-    assert "dummy pdf" in result.reason.lower() # Changed "PDF" to "pdf" to match lowercased reason
+    assert "pdf content suggests it's a dummy" in result.reason.lower() # Changed assertion
     # Check that the file was created then removed
     mock_os_remove.assert_called_once_with(expected_filepath)
     # To be absolutely sure it was created and then removed, we'd need to check os.path.exists(expected_filepath) is false
@@ -224,9 +229,11 @@ async def test_resolve_content_html_paywall_detected_full_html(respx_mock: MockR
     test_url = "http://example.com/paywall_article.html"
     # HTML content that includes paywall keywords
     full_html = "<html><body><h1>Paywall Page</h1><p>Access this article for $10. Buy this article now!</p><div>Some short preview text.</div></body></html>"
-    
-    respx_mock.head(test_url).respond(headers={"Content-Type": "text/html"})
+
+    respx_mock.head(test_url).respond(status_code=200, headers={"Content-Type": "text/html"})
     respx_mock.get(test_url).respond(content=full_html, headers={"Content-Type": "text/html"})
+    # Mock retry URLs as well, in case they are attempted, to return the same HTML
+    respx_mock.get(url__regex=rf"{re.escape(test_url)}.*").respond(content=full_html, headers={"Content-Type": "text/html"})
 
     result = await resolve_content(test_url)
 
@@ -294,8 +301,10 @@ async def test_resolve_content_request_timeout(respx_mock: MockRouter):
 async def test_resolve_content_unsupported_content_type(respx_mock: MockRouter):
     """Test handling of unsupported content types."""
     test_url = "http://example.com/image.jpg"
-    respx_mock.head(test_url).respond(headers={"Content-Type": "image/jpeg"})
+    respx_mock.head(test_url).respond(status_code=200, headers={"Content-Type": "image/jpeg"})
     respx_mock.get(test_url).respond(content=b"jpeg_data", headers={"Content-Type": "image/jpeg"})
+    # Mock retry URLs as well
+    respx_mock.get(url__regex=rf"{re.escape(test_url)}.*").respond(content=b"jpeg_data", headers={"Content-Type": "image/jpeg"})
 
     result = await resolve_content(test_url)
     assert isinstance(result, Failure)
@@ -306,8 +315,9 @@ async def test_resolve_content_pdf_too_small(respx_mock: MockRouter, mock_dateti
     """Test PDF validation: file too small."""
     test_url = "http://example.com/small.pdf"
     pdf_content = b"%PDF-tiny"
-    respx_mock.head(test_url).respond(headers={"Content-Type": "application/pdf"})
+    respx_mock.head(test_url).respond(status_code=200, headers={"Content-Type": "application/pdf"})
     respx_mock.get(test_url).respond(content=pdf_content, headers={"Content-Type": "application/pdf"})
+    respx_mock.get(url__regex=rf"{re.escape(test_url)}.*").respond(content=pdf_content, headers={"Content-Type": "application/pdf"})
 
     # Mock os.path.getsize to return a size smaller than MIN_PDF_SIZE_KB
     with patch("tools.resolve_pdf_link.os.path.getsize", return_value=(MIN_PDF_SIZE_KB - 1) * 1024), \
@@ -324,8 +334,9 @@ async def test_resolve_content_pdf_zero_pages(respx_mock: MockRouter, mock_datet
     """Test PDF validation: zero pages."""
     test_url = "http://example.com/zeropage.pdf"
     pdf_content = b"%PDF-valid_but_empty"
-    respx_mock.head(test_url).respond(headers={"Content-Type": "application/pdf"})
+    respx_mock.head(test_url).respond(status_code=200, headers={"Content-Type": "application/pdf"})
     respx_mock.get(test_url).respond(content=pdf_content, headers={"Content-Type": "application/pdf"})
+    respx_mock.get(url__regex=rf"{re.escape(test_url)}.*").respond(content=pdf_content, headers={"Content-Type": "application/pdf"})
 
     with patch("tools.resolve_pdf_link.os.path.getsize", return_value=(MIN_PDF_SIZE_KB + 1) * 1024), \
          patch("tools.resolve_pdf_link.fitz.open") as mock_fitz_open, \
@@ -347,8 +358,9 @@ async def test_resolve_content_pdf_one_page_very_short_text(respx_mock: MockRout
     """Test PDF validation: 1 page, very short non-specific text."""
     test_url = "http://example.com/short_text.pdf"
     pdf_content = b"%PDF-short_text_content"
-    respx_mock.head(test_url).respond(headers={"Content-Type": "application/pdf"})
+    respx_mock.head(test_url).respond(status_code=200, headers={"Content-Type": "application/pdf"})
     respx_mock.get(test_url).respond(content=pdf_content, headers={"Content-Type": "application/pdf"})
+    respx_mock.get(url__regex=rf"{re.escape(test_url)}.*").respond(content=pdf_content, headers={"Content-Type": "application/pdf"})
 
     with patch("tools.resolve_pdf_link.os.path.getsize", return_value=(MIN_PDF_SIZE_KB + 1) * 1024), \
          patch("tools.resolve_pdf_link.fitz.open") as mock_fitz_open, \

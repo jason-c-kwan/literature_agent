@@ -8,6 +8,8 @@ from bs4 import BeautifulSoup
 import re
 import markdown # For converting Markdown to HTML
 from typing import Optional # Added Optional
+import os # Moved import os to the top
+
 
 def parse_page_numbers(page_str: Optional[str], total_pages: int) -> Optional[list[int]]: # Added Optional to arg and return
     """
@@ -82,49 +84,34 @@ def parse_page_numbers(page_str: Optional[str], total_pages: int) -> Optional[li
     return sorted(list(indices))
 
 
-def convert_pdf_to_markdown_string(pdf_path: str, pages_to_process_str: Optional[str] = None) -> str:
+def get_raw_markdown_from_pdf(pdf_path: str, pages_to_process_str: Optional[str] = None) -> str:
     """
-    Converts a PDF file to a cleaned Markdown string.
+    Opens a PDF file, processes specified pages, and returns raw Markdown from pymupdf4llm.
     Args:
         pdf_path: Path to the input PDF file.
         pages_to_process_str: Optional comma-separated page string (e.g., "0,1,5-N").
-                              If None or empty, all pages are processed.
     Returns:
-        A string containing the Markdown representation of the PDF content.
+        Raw Markdown string from pymupdf4llm.
     Raises:
-        FileNotFoundError: If pdf_path does not exist.
-        ValueError: If pages_to_process_str is invalid.
-        Exception: For errors during PDF opening or Markdown conversion.
+        FileNotFoundError, ValueError, RuntimeError.
     """
-    if not pymupdf. ΕίναιΑρχείο(pdf_path): # Using a placeholder for file existence check if pymupdf doesn't have it
-        # A more standard check:
-        import os
-        if not os.path.exists(pdf_path):
-            raise FileNotFoundError(f"Input PDF file not found: {pdf_path}")
-
-    doc = None  # Initialize doc to None for the finally block
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"Input PDF file not found: {pdf_path}")
+    doc = None
     try:
         doc = pymupdf.open(pdf_path)
     except Exception as e:
-        # print(f"Error opening PDF '{pdf_path}': {e}", file=sys.stderr) # CLI concern
-        raise RuntimeError(f"Error opening PDF '{pdf_path}': {e}") from e # For library use
-
-    total_pages = doc.page_count
+        raise RuntimeError(f"Error opening PDF '{pdf_path}': {e}") from e
     
-    if total_pages == 0 and pages_to_process_str:
-        # print(f"Warning: PDF '{pdf_path}' has 0 pages. --pages argument will be ignored.", file=sys.stderr) # CLI concern
-        pass # Let to_markdown handle it, or it will be empty.
-
+    total_pages = doc.page_count
     selected_page_numbers: Optional[list[int]] = None
     if pages_to_process_str:
         try:
             selected_page_numbers = parse_page_numbers(pages_to_process_str, total_pages)
-            # if selected_page_numbers is None and pages_to_process_str.strip(): # CLI concern
-                # print(f"Warning: --pages argument '{pages_to_process_str}' resulted in no specific pages selected; processing all pages.", file=sys.stderr)
         except ValueError as e:
             if doc: doc.close()
-            raise # Re-raise the ValueError from parse_page_numbers
-
+            raise
+            
     try:
         markdown_content_raw = to_markdown(
             doc,
@@ -135,26 +122,28 @@ def convert_pdf_to_markdown_string(pdf_path: str, pages_to_process_str: Optional
             page_chunks=False
         )
     except Exception as e:
-        # print(f"Error during Markdown conversion: {e}", file=sys.stderr) # CLI concern
         raise RuntimeError(f"Error during Markdown conversion from pymupdf4llm: {e}") from e
     finally:
         if doc:
             doc.close()
+    return markdown_content_raw
 
-    # --- Post-process raw markdown_content ---
+def clean_markdown_to_text_blocks(markdown_content_raw: str) -> str:
+    """
+    Cleans raw Markdown content into a string of text blocks.
+    Headers are converted to plain text lines. Markdown formatting is stripped.
+    """
     text_blocks = []
     current_block_lines = []
-    is_header_block = False # Not strictly needed for string output, but helps structure
+    is_header_block = False
 
-    def finalize_block():
+    def finalize_block_local():
         nonlocal text_blocks, current_block_lines, is_header_block
         if current_block_lines:
             raw_block_text = "\n".join(current_block_lines)
-            # Convert Markdown to HTML, then extract text to clean formatting
             html_block = markdown.markdown(raw_block_text)
             soup_block = BeautifulSoup(html_block, "html.parser")
             clean_text = soup_block.get_text(separator=' ', strip=True)
-            # Further cleaning: replace multiple spaces, remove space before punctuation
             clean_text = re.sub(r'\s+', ' ', clean_text).strip()
             clean_text = re.sub(r'\s+([.,;:?!])', r'\1', clean_text)
             
@@ -164,14 +153,13 @@ def convert_pdf_to_markdown_string(pdf_path: str, pages_to_process_str: Optional
             is_header_block = False
 
     if not markdown_content_raw.strip():
-        return "" # Return empty string if no content
+        return "" 
     
     for line in markdown_content_raw.splitlines():
         stripped_line = line.strip()
         if stripped_line.startswith("#"):
-            finalize_block() 
+            finalize_block_local() 
             is_header_block = True
-            # For string output, we just care about the text content of the header
             header_text_content = ""
             for i, char_in_line in enumerate(stripped_line):
                 if char_in_line != '#':
@@ -181,15 +169,23 @@ def convert_pdf_to_markdown_string(pdf_path: str, pages_to_process_str: Optional
                  current_block_lines.append(header_text_content)
         elif stripped_line: 
             if is_header_block: 
-                finalize_block()
+                finalize_block_local()
             current_block_lines.append(stripped_line)
         elif not stripped_line and current_block_lines: 
-            finalize_block()
+            finalize_block_local()
     
-    finalize_block() 
+    finalize_block_local() 
     
     return "\n".join(text_blocks)
 
+def convert_pdf_to_markdown_string(pdf_path: str, pages_to_process_str: Optional[str] = None) -> str:
+    """
+    Converts a PDF file to a cleaned Markdown string (text blocks).
+    This function preserves the original public API.
+    """
+    raw_markdown = get_raw_markdown_from_pdf(pdf_path, pages_to_process_str)
+    cleaned_text = clean_markdown_to_text_blocks(raw_markdown)
+    return cleaned_text
 
 def main():
     parser = argparse.ArgumentParser(description="Parse PDF files to Markdown or structured JSON.")
@@ -207,10 +203,10 @@ def main():
         help="Output format. 'markdown' outputs plain text. 'json' outputs structured data. Default is 'markdown'."
     )
     args = parser.parse_args()
-
+    
+    raw_markdown_content = ""
     try:
-        # Call the new function to get the processed Markdown string
-        markdown_text_output = convert_pdf_to_markdown_string(args.input_pdf, args.pages)
+        raw_markdown_content = get_raw_markdown_from_pdf(args.input_pdf, args.pages)
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -224,16 +220,13 @@ def main():
         print(f"An unexpected error occurred: {e}", file=sys.stderr)
         sys.exit(1)
 
-
     if args.format == "markdown":
-        sys.stdout.write(markdown_text_output)
-        # Ensure a newline at the end, even if content is empty
+        cleaned_text_output = clean_markdown_to_text_blocks(raw_markdown_content)
+        sys.stdout.write(cleaned_text_output)
         sys.stdout.write('\n')
 
     elif args.format == "json":
-        # Re-process the markdown_text_output to generate JSON structure
-        # This logic is adapted from the original main() function's JSON output part.
-        if not markdown_text_output.strip():
+        if not raw_markdown_content.strip():
             sys.stdout.write("[]\n")
         else:
             output_elements_json = []
@@ -252,23 +245,21 @@ def main():
                         output_elements_json.append({"type": "paragraph", "text": text_content})
                     current_paragraph_lines_json_cli = []
 
-            for line in markdown_text_output.splitlines():
+            for line in raw_markdown_content.splitlines(): # Use raw_markdown_content here
                 stripped_line = line.strip()
                 if stripped_line.startswith("#"):
                     finalize_paragraph_json_for_cli()
                     level = 0
                     text_content_json = ""
-                    # Correctly find the start of text after '#'
                     for i, char_in_line in enumerate(stripped_line):
                         if char_in_line == '#':
                             level += 1
                         else:
                             text_content_json = stripped_line[i:].strip()
                             break
-                    # If line was only '###' (no text), text_content_json might be empty
                     if not text_content_json and level > 0 and stripped_line == '#' * level:
-                         pass # Header with no text, skip or handle as empty header
-                    elif text_content_json: # Process if there is text
+                         pass 
+                    elif text_content_json: 
                         html_header = markdown.markdown(text_content_json)
                         soup_header = BeautifulSoup(html_header, "html.parser")
                         clean_header_text = soup_header.get_text(separator=' ', strip=True)
@@ -278,10 +269,10 @@ def main():
                             output_elements_json.append({"type": "heading", "level": level, "text": clean_header_text})
                 elif stripped_line:
                     current_paragraph_lines_json_cli.append(stripped_line)
-                elif not stripped_line and current_paragraph_lines_json_cli: # Empty line ends current paragraph
+                elif not stripped_line and current_paragraph_lines_json_cli: 
                     finalize_paragraph_json_for_cli()
             
-            finalize_paragraph_json_for_cli() # Finalize any last block
+            finalize_paragraph_json_for_cli() 
             
             sys.stdout.write(json.dumps(output_elements_json, indent=2))
             sys.stdout.write('\n')

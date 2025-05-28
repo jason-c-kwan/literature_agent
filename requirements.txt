@@ -10,6 +10,7 @@ pymupdf4llm
 markdownify>=0.11.6
 markdown             # For Markdown to HTML conversion
 tiktoken>=0.6.0
+poetry
 
 # --- Tool utilities ----------------------------
 biopython

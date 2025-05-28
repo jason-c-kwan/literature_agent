@@ -96,17 +96,22 @@ async def fetch_pmc_xml(pmc_id: str, session: Optional[aiohttp.ClientSession] = 
         # HTTP error (4xx or 5xx)
         # print(f"HTTP error {e.status} for PMCID {pmc_id}: {e.message}")
         return None
-    except aiohttp.ClientError as e:
+    except aiohttp.ClientError as e: # Corrected indentation
         # Other AIOHTTP client errors (e.g., connection issues)
         # print(f"AIOHTTP client error for PMCID {pmc_id}: {e}")
         return None
-    except Exception as e:
+    except Exception as e: # This except should be at the same level as the try
         # Catch any other unexpected errors during the process
         # print(f"An unexpected error occurred while fetching PMCID {pmc_id}: {e}")
         return None
     finally:
         if not provided_session and session:
-            await session.close()
+            if hasattr(session, "close"):
+                if asyncio.iscoroutinefunction(session.close):
+                    await session.close()
+                elif callable(session.close): # Check if it's callable but not a coroutine
+                    session.close()
+                # If it's neither, we might have a problem or it's not a closeable session mock
 
 
 # async def main():

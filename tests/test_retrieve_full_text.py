@@ -1,9 +1,15 @@
 import asyncio
 import json
+import os # For path operations in new test
 import unittest
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch, AsyncMock, MagicMock, call
+from urllib.parse import urlparse # For new test
+
+from aiohttp import web # For mock server in new test
 
 from tools import retrieve_full_text # Module to test
+from tools import advanced_scraper # For result types in new test
+from tools import resolve_pdf_link # For result types in new test
 
 # Basic article data for testing
 SAMPLE_ARTICLE_DOI_ONLY = {"doi": "10.1234/test.doi", "relevance_score": 5}
@@ -116,9 +122,14 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
             markdown, status = await retrieve_full_text.get_full_text_for_doi(SAMPLE_ARTICLE_DOI_ONLY)
 
             self.assertIsNone(markdown)
-            self.assertEqual(status, "Previously failed")
+            # After a cached failure, a fresh attempt is made. If all fresh attempts fail:
+            self.assertEqual(status, "Full text not found after all attempts") 
             mock_get_cache.assert_called_once_with(SAMPLE_ARTICLE_DOI_ONLY["doi"])
-            mock_fetch_epmc.assert_not_called() # Ensure no further processing after cached failure
+            # Subsequent calls *should* be made now
+            mock_fetch_epmc.assert_called_once() 
+            mock_fetch_pmc.assert_called_once()
+            mock_get_elink.assert_called_once()
+            mock_get_unpaywall.assert_called_once()
 
     async def test_retrieval_no_doi_provided(self):
         markdown, status = await retrieve_full_text.get_full_text_for_doi(SAMPLE_ARTICLE_NO_DOI)
@@ -181,7 +192,12 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(markdown, "Markdown from Elink PDF")
         self.assertTrue(status.startswith(f"Retrieved PDF via Elink ({elink_pdf_url})"))
         mock_get_elink.assert_called_once_with(identifier=article_input["pmid"], id_type="pmid")
-        mock_resolve_content.assert_called_once_with(elink_pdf_url, client=unittest.mock.ANY)
+        mock_resolve_content.assert_called_once_with(
+            elink_pdf_url, 
+            client=unittest.mock.ANY, 
+            original_doi_for_referer=article_input["doi"],
+            session_cookies=unittest.mock.ANY # or specific if known
+        )
         mock_parse_pdf.assert_called_once_with("/fake/path/to/article.pdf")
         mock_write_cache.assert_called_once()
 
@@ -211,6 +227,12 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(markdown, "HTML content from Elink")
         self.assertTrue(status.startswith(f"Retrieved HTML via Elink ({elink_html_url})"))
+        mock_resolve_content.assert_called_once_with(
+            elink_html_url,
+            client=unittest.mock.ANY,
+            original_doi_for_referer=article_input["doi"],
+            session_cookies=unittest.mock.ANY
+        )
         mock_write_cache.assert_called_once()
 
     @patch('tools.retrieve_full_text.get_from_cache', new_callable=AsyncMock)
@@ -243,7 +265,12 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(markdown, "Markdown from Unpaywall PDF")
         self.assertTrue(status.startswith(f"Retrieved PDF via Unpaywall ({unpaywall_pdf_url})"))
         mock_get_unpaywall.assert_called_once_with(article_input["doi"], session=unittest.mock.ANY)
-        mock_resolve_content.assert_called_once_with(unpaywall_pdf_url, client=unittest.mock.ANY)
+        mock_resolve_content.assert_called_once_with(
+            unpaywall_pdf_url, 
+            client=unittest.mock.ANY,
+            original_doi_for_referer=article_input["doi"],
+            session_cookies=unittest.mock.ANY
+        )
         mock_parse_pdf.assert_called_once_with("/fake/path/to/unpaywall.pdf")
         mock_write_cache.assert_called_once()
 
@@ -278,8 +305,13 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(markdown, "HTML from Advanced Scraper via Elink")
         self.assertTrue(status.startswith(f"Retrieved HTML via Elink > Advanced Scraper ({elink_url})"))
-        mock_resolve_content_elink.assert_called_once_with(elink_url, client=unittest.mock.ANY)
-        mock_scrape_fallback.assert_called_once_with(elink_url)
+        mock_resolve_content_elink.assert_called_once_with(
+            elink_url, 
+            client=unittest.mock.ANY,
+            original_doi_for_referer=article_input["doi"],
+            session_cookies=unittest.mock.ANY
+        )
+        mock_scrape_fallback.assert_called_once_with(elink_url, session_cookies=unittest.mock.ANY, original_doi_for_referer=article_input["doi"])
         mock_write_cache.assert_called_once()
 
 
@@ -391,6 +423,115 @@ class TestRetrieveFullTextsForDois(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result_data["triaged_articles"][2]["fulltext"], "Markdown for DOI3")
         self.assertEqual(result_data["triaged_articles"][2]["fulltext_retrieval_status"], "success")
+
+# --- Integration Test for Cloudflare Scenario ---
+class TestCloudflarePDFRetrieval(unittest.IsolatedAsyncioTestCase):
+    
+    async def asyncSetUp(self):
+        self.pdf_server_hits = {}
+        self.app = web.Application()
+        self.app.router.add_get("/pdf/{id}", self.cloudflare_pdf_handler)
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, '127.0.0.1', 0) # Port 0 for random available port
+        await self.site.start()
+        self.server_port = self.site._server.sockets[0].getsockname()[1]
+        self.mock_pdf_base_url = f"http://127.0.0.1:{self.server_port}"
+
+        # Ensure cache directory exists for the test
+        if not os.path.exists(retrieve_full_text.CACHE_DIR):
+            os.makedirs(retrieve_full_text.CACHE_DIR, exist_ok=True)
+
+    async def asyncTearDown(self):
+        await self.runner.cleanup()
+        # Clean up cache file if created
+        test_doi = "10.9999/cloudflare.test.integration"
+        cache_file = os.path.join(retrieve_full_text.CACHE_DIR, f"{test_doi.replace('/', '_')}.json")
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
+
+    async def cloudflare_pdf_handler(self, request):
+        pdf_id = request.match_info.get('id', "unknown")
+        hit_count = self.pdf_server_hits.get(pdf_id, 0)
+        self.pdf_server_hits[pdf_id] = hit_count + 1
+
+        # Print headers for debugging
+        # print(f"Mock server hit {hit_count + 1} for {pdf_id}, Headers: {request.headers}")
+
+        if hit_count == 0: # First hit (simulating Playwright's initial navigation)
+            # Return 403 with Cloudflare iframe
+            html_content = '<html><body><iframe id="cf-chl-widget-abc" src="https://challenges.cloudflare.com/turnstile"></iframe><p>Please verify you are human.</p></body></html>'
+            # print(f"Mock server: Returning 403 + iframe for {pdf_id}")
+            return web.Response(text=html_content, status=403, content_type='text/html')
+        else: # Second hit (simulating Playwright's navigation after CF challenge)
+            # This response should be application/pdf
+            # print(f"Mock server: Returning PDF for {pdf_id}")
+            pdf_body_content = b"%PDF-1.4\nTest PDF content from mock server for Cloudflare." * 200 # Ensure valid size
+            response = web.Response(
+                body=pdf_body_content,
+                content_type='application/pdf'
+            )
+            # Server sets the cookie upon successful challenge (simulated here on 2nd+ hit)
+            response.set_cookie("cf_clearance", "mock_server_token_xyz", path="/", httponly=True, samesite='Lax')
+            return response
+
+    @patch('tools.retrieve_full_text.elink_pubmed.get_article_links', new_callable=AsyncMock)
+    @patch('tools.retrieve_full_text.resolve_pdf_link.resolve_content', new_callable=AsyncMock)
+    @patch('tools.retrieve_full_text.parse_pdf_to_markdown', new_callable=AsyncMock)
+    @patch('tools.retrieve_full_text.get_from_cache', new_callable=AsyncMock)
+    @patch('tools.retrieve_full_text.write_to_cache', new_callable=AsyncMock)
+    async def test_get_full_text_for_doi_cloudflare_scenario(
+        self, mock_write_cache, mock_get_cache, mock_parse_pdf, 
+        mock_resolve_content, mock_get_elink_links
+    ):
+        test_doi_id = "cloudflare.test.integration"
+        test_doi = f"10.9999/{test_doi_id}"
+        mock_pdf_url = f"{self.mock_pdf_base_url}/pdf/{test_doi_id}"
+
+        mock_get_cache.return_value = None # Cache miss
+        mock_get_elink_links.return_value = [mock_pdf_url] # Elink provides the URL to our mock server
+
+        # Mock resolve_content to fail for the initial URL, forcing advanced_scraper
+        mock_resolve_content.return_value = resolve_pdf_link.Failure(type="failure", reason="Simulated resolve_content failure for CF page")
+        
+        # Mock parse_pdf_to_markdown to return specific content
+        mock_parse_pdf.return_value = "Successfully parsed PDF from Cloudflare mock"
+
+        article_data = {"doi": test_doi, "relevance_score": 5, "pmid": "pmid_cf_integration_test"}
+        
+        markdown, status_msg = await retrieve_full_text.get_full_text_for_doi(article_data)
+
+        self.assertEqual(markdown, "Successfully parsed PDF from Cloudflare mock")
+        # Check that the status message indicates success through advanced_scraper's PDFBytesResult path
+        self.assertTrue("AdvancedScraper_PDFBytes" in status_msg or "Advanced Scraper (bytes)" in status_msg, f"Status message was: {status_msg}")
+
+        # Assertions:
+        # 1. Elink was called
+        mock_get_elink_links.assert_called_once_with(identifier=article_data["pmid"], id_type="pmid")
+        
+        # 2. resolve_content was called for the mock_pdf_url and failed (as per our mock)
+        mock_resolve_content.assert_called_once()
+        args_resolve, _ = mock_resolve_content.call_args
+        self.assertEqual(args_resolve[0], mock_pdf_url) # Check URL passed to resolve_content
+
+        # 3. parse_pdf_to_markdown was called (meaning advanced_scraper got the PDF bytes)
+        mock_parse_pdf.assert_called_once()
+        # The argument to parse_pdf_to_markdown will be a temporary file path
+        self.assertTrue(os.path.exists(mock_parse_pdf.call_args[0][0]))
+
+        # 4. Cache was written with success
+        mock_write_cache.assert_called_once_with(
+            test_doi,
+            unittest.mock.ANY # Allow any dict, but check specific fields below
+        )
+        cached_data_arg = mock_write_cache.call_args[0][1]
+        self.assertEqual(cached_data_arg["status"], "success")
+        self.assertEqual(cached_data_arg["markdown"], "Successfully parsed PDF from Cloudflare mock")
+        self.assertTrue("AdvancedScraper_PDFBytes" in cached_data_arg["source"])
+        
+        # 5. Check server hits (optional, but good for confirming flow)
+        self.assertGreaterEqual(self.pdf_server_hits.get(test_doi_id, 0), 2, "Mock server should have been hit at least twice")
+
 
 if __name__ == '__main__':
     unittest.main()

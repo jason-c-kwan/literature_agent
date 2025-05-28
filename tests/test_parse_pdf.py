@@ -11,8 +11,8 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Now the import should work
-from cli.parse_pdf import main as parse_pdf_main
-from cli.parse_pdf import parse_page_numbers
+from tools.parse_pdf import main as parse_pdf_main # This was already correct
+from tools.parse_pdf import parse_page_numbers, convert_pdf_to_markdown_string # Removed extract_text_from_pdf_path_with_pymupdf
 
 
 # Helper to run the main script with arguments and capture stdout
@@ -23,8 +23,10 @@ def run_script(args_list):
     sys.stdout = captured_output
     
     # Mock sys.exit to prevent tests from exiting
+    # Also mock os.path.exists within tools.parse_pdf to avoid FileNotFoundError for dummy paths
     with patch.object(sys, 'argv', ['parse_pdf.py'] + args_list), \
-         patch('sys.exit') as mock_exit:
+         patch('sys.exit') as mock_exit, \
+         patch('tools.parse_pdf.os.path.exists', return_value=True) as mock_os_exists:
         try:
             parse_pdf_main()
         except SystemExit as e: # Argparse calls sys.exit on error or --help
@@ -91,8 +93,8 @@ def test_parse_page_numbers_page_out_of_bounds():
 
 # --- Tests for main script functionality ---
 
-@patch('cli.parse_pdf.pymupdf.open')
-@patch('cli.parse_pdf.to_markdown')
+@patch('tools.parse_pdf.pymupdf.open') # Corrected path for patching
+@patch('tools.parse_pdf.to_markdown') # Corrected path for patching
 def test_markdown_output_default(mock_to_markdown, mock_pymupdf_open):
     # Mock pymupdf.open()
     mock_doc = MagicMock()
@@ -130,8 +132,8 @@ def test_markdown_output_default(mock_to_markdown, mock_pymupdf_open):
     mock_doc.close.assert_called_once()
 
 
-@patch('cli.parse_pdf.pymupdf.open')
-@patch('cli.parse_pdf.to_markdown')
+@patch('tools.parse_pdf.pymupdf.open') # Corrected path for patching
+@patch('tools.parse_pdf.to_markdown') # Corrected path for patching
 def test_json_output(mock_to_markdown, mock_pymupdf_open):
     mock_doc = MagicMock()
     mock_doc.page_count = 1
@@ -153,8 +155,8 @@ def test_json_output(mock_to_markdown, mock_pymupdf_open):
     assert loaded_output == expected_json_structure
     mock_doc.close.assert_called_once()
 
-@patch('cli.parse_pdf.pymupdf.open')
-@patch('cli.parse_pdf.to_markdown')
+@patch('tools.parse_pdf.pymupdf.open') # Corrected path for patching
+@patch('tools.parse_pdf.to_markdown') # Corrected path for patching
 def test_page_selection(mock_to_markdown, mock_pymupdf_open):
     mock_doc = MagicMock()
     mock_doc.page_count = 5
@@ -173,8 +175,8 @@ def test_page_selection(mock_to_markdown, mock_pymupdf_open):
     )
     mock_doc.close.assert_called_once()
 
-@patch('cli.parse_pdf.pymupdf.open')
-@patch('cli.parse_pdf.to_markdown')
+@patch('tools.parse_pdf.pymupdf.open') # Corrected path for patching
+@patch('tools.parse_pdf.to_markdown') # Corrected path for patching
 def test_empty_pdf_content_markdown(mock_to_markdown, mock_pymupdf_open):
     mock_doc = MagicMock()
     mock_doc.page_count = 1
@@ -190,8 +192,8 @@ def test_empty_pdf_content_markdown(mock_to_markdown, mock_pymupdf_open):
     # Then script adds a newline.
     assert output == "\n"
 
-@patch('cli.parse_pdf.pymupdf.open')
-@patch('cli.parse_pdf.to_markdown')
+@patch('tools.parse_pdf.pymupdf.open') # Corrected path for patching
+@patch('tools.parse_pdf.to_markdown') # Corrected path for patching
 def test_empty_pdf_content_json(mock_to_markdown, mock_pymupdf_open):
     mock_doc = MagicMock()
     mock_doc.page_count = 1
@@ -208,7 +210,7 @@ def test_empty_pdf_content_json(mock_to_markdown, mock_pymupdf_open):
     assert loaded_output == [] # Should be empty as "  \n  ".strip() is empty
 
 
-@patch('cli.parse_pdf.pymupdf.open')
+@patch('tools.parse_pdf.pymupdf.open') # Corrected path for patching
 def test_pdf_open_error(mock_pymupdf_open):
     mock_pymupdf_open.side_effect = Exception("Failed to open PDF")
     
@@ -220,12 +222,12 @@ def test_pdf_open_error(mock_pymupdf_open):
     
     sys.stderr = sys.__stderr__ # Restore stderr
     
-    assert "Error opening PDF 'nonexistent.pdf': Failed to open PDF" in captured_stderr.getvalue()
+    assert "Error processing PDF: Error opening PDF 'nonexistent.pdf': Failed to open PDF" in captured_stderr.getvalue()
     mock_exit.assert_called_once_with(1)
 
 
-@patch('cli.parse_pdf.pymupdf.open')
-@patch('cli.parse_pdf.to_markdown')
+@patch('tools.parse_pdf.pymupdf.open') # Corrected path for patching
+@patch('tools.parse_pdf.to_markdown') # Corrected path for patching
 def test_markdown_conversion_error(mock_to_markdown, mock_pymupdf_open):
     mock_doc = MagicMock()
     mock_doc.page_count = 1
@@ -239,14 +241,14 @@ def test_markdown_conversion_error(mock_to_markdown, mock_pymupdf_open):
 
     sys.stderr = sys.__stderr__
     
-    assert "Error during Markdown conversion: Markdown conversion failed" in captured_stderr.getvalue()
+    assert "Error processing PDF: Error during Markdown conversion from pymupdf4llm: Markdown conversion failed" in captured_stderr.getvalue()
     mock_exit.assert_called_once_with(1)
     mock_doc.close.assert_called_once() # Ensure doc is closed even on error
 
 def test_invalid_pages_argument_error():
     # This will be caught by argparse or our validator, leading to sys.exit
     # We need to mock pymupdf.open because it's called before page parsing validation for total_pages
-    with patch('cli.parse_pdf.pymupdf.open') as mock_open:
+    with patch('tools.parse_pdf.pymupdf.open') as mock_open: # Corrected path for patching
         mock_doc = MagicMock()
         mock_doc.page_count = 5
         mock_open.return_value = mock_doc
@@ -264,8 +266,8 @@ def test_invalid_pages_argument_error():
 
 
 # Test for 0 page document
-@patch('cli.parse_pdf.pymupdf.open')
-@patch('cli.parse_pdf.to_markdown')
+@patch('tools.parse_pdf.pymupdf.open') # Corrected path for patching
+@patch('tools.parse_pdf.to_markdown') # Corrected path for patching
 def test_zero_page_document(mock_to_markdown, mock_pymupdf_open):
     mock_doc = MagicMock()
     mock_doc.page_count = 0
@@ -286,8 +288,8 @@ def test_zero_page_document(mock_to_markdown, mock_pymupdf_open):
     assert expected_error_msg_part in captured_stderr.getvalue()
     
     # Re-run to check exit status properly
-    with patch('cli.parse_pdf.pymupdf.open', return_value=mock_doc) as mock_open_again, \
-         patch('cli.parse_pdf.to_markdown', return_value="") as mock_to_markdown_again:
+    with patch('tools.parse_pdf.pymupdf.open', return_value=mock_doc) as mock_open_again, \
+         patch('tools.parse_pdf.to_markdown', return_value="") as mock_to_markdown_again: # Corrected path for patching
         
         captured_stderr_again = io.StringIO()
         sys.stderr = captured_stderr_again
@@ -300,8 +302,8 @@ def test_zero_page_document(mock_to_markdown, mock_pymupdf_open):
         mock_exit_again.assert_called_with(1)
     
     # Test 0-page doc with no --pages (should process "all" 0 pages)
-    with patch('cli.parse_pdf.pymupdf.open', return_value=mock_doc) as mock_open_again, \
-         patch('cli.parse_pdf.to_markdown', return_value="") as mock_to_markdown_again:
+    with patch('tools.parse_pdf.pymupdf.open', return_value=mock_doc) as mock_open_again, \
+         patch('tools.parse_pdf.to_markdown', return_value="") as mock_to_markdown_again: # Corrected path for patching
         
         output_all_pages, _ = run_script(['zeropage.pdf'])
         assert output_all_pages == "\n" # Script outputs a newline for empty content
