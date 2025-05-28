@@ -16,10 +16,12 @@ from pydantic import BaseModel # Added for DebugClient
 from tools.triage import TriageAgent
 from tools.ranking import RankerAgent
 from tools.export import ExporterAgent
+from tools.retrieve_full_text import FullTextRetrievalAgent # Added for FullTextRetrievalAgent
 from tools._base import StubConfig # Added import
 import asyncio
 import re
 import json
+import uuid # For generating run_id
 from rich.console import Console
 from rich.theme import Theme
 from prompt_toolkit import prompt
@@ -170,13 +172,14 @@ def styled_input(prompt_message: str, console: Console) -> str:
     return prompt(f"{plain_prompt} ").strip()
 
 async def run_search_pipeline(
-    query_team: BaseGroupChat, 
-    literature_search_tool: LiteratureSearchTool, 
-    triage_agent: TriageAgent, 
-    original_query: str, 
+    query_team: BaseGroupChat,
+    literature_search_tool: LiteratureSearchTool,
+    triage_agent: TriageAgent,
+    agents: Dict[str, Any], # Added agents dictionary
+    original_query: str,
     console: Console,
-    settings_config: Dict[str, Any], # Added to access settings
-    cli_args: argparse.Namespace # Added to access parsed CLI args
+    settings_config: Dict[str, Any],
+    cli_args: argparse.Namespace
 ):
     all_articles_data = []
     processed_dois_for_articles = set()
@@ -387,6 +390,62 @@ async def run_search_pipeline(
     # MODIFIED: Update count and message
     console.print(f"[secondary]Total unique articles (relevance 4 or 5) saved:[/secondary] [highlight]{len(highly_relevant_articles)}[/highlight]")
     
+    # --- Full Text Retrieval Step ---
+    full_text_agent_instance = agents.get("FullTextRetrievalAgent")
+    full_text_results_list = highly_relevant_articles # Default to previous results if agent fails
+
+    if full_text_agent_instance and highly_relevant_articles:
+        console.print(f"[secondary]Attempting full text retrieval for {len(highly_relevant_articles)} articles...[/secondary]")
+        try:
+            # Prepare input for FullTextRetrievalAgent
+            # It expects a TextMessage with JSON string content
+            input_json_str = json.dumps(highly_relevant_articles)
+            task_message = TextMessage(content=input_json_str, source="pipeline_orchestrator")
+            
+            # Run the agent
+            # The agent's run method returns a TaskResult
+            task_result = await full_text_agent_instance.run(task=task_message)
+            
+            if task_result.messages and isinstance(task_result.messages[-1], TextMessage):
+                response_content = task_result.messages[-1].content
+                if isinstance(response_content, str):
+                    full_text_results_list = json.loads(response_content)
+                    console.print(f"[info]Full text retrieval agent processed {len(full_text_results_list)} articles.[/info]")
+                    
+                    # Write full_text_results to disk for debugging
+                    run_id = str(uuid.uuid4()) # Generate a unique run ID
+                    workspace_debug_dir = os.path.join("workspace", run_id)
+                    os.makedirs(workspace_debug_dir, exist_ok=True)
+                    full_text_output_path = os.path.join(workspace_debug_dir, "full_text_results.json")
+                    with open(full_text_output_path, "w") as f:
+                        json.dump(full_text_results_list, f, indent=2)
+                    console.print(f"[debug]Full text results saved to {full_text_output_path}[/debug]")
+                else:
+                    console.print(f"[red]FullTextRetrievalAgent response content was not a string: {type(response_content)}[/red]")
+            else:
+                console.print(f"[red]FullTextRetrievalAgent did not return a final TextMessage as expected.[/red]")
+                if task_result.messages:
+                     console.print(f"[debug]Last message from agent: {task_result.messages[-1]}[/debug]")
+
+
+        except Exception as e:
+            console.print(f"[red]Error during full text retrieval agent execution: {e}[/red]")
+            # full_text_results_list remains highly_relevant_articles
+    elif not highly_relevant_articles:
+        console.print("[info]No highly relevant articles to process for full text retrieval.[/info]")
+    else:
+        console.print("[yellow]FullTextRetrievalAgent not found or not loaded. Skipping full text retrieval.[/yellow]")
+
+    # Update output_data with the results from full text retrieval
+    # The 'triaged_articles' key will now hold articles potentially enriched with 'fulltext'
+    output_data["triaged_articles"] = full_text_results_list
+    
+    # Re-save the triage_results.json, now potentially with full text data
+    with open(output_file_path, "w") as f: # output_file_path was defined earlier
+        json.dump(output_data, f, indent=2)
+    console.print(f"[primary]Main pipeline results (including full text attempt) saved to {output_file_path}[/primary]")
+    console.print(f"[secondary]Total articles in final output (after full text attempt):[/secondary] [highlight]{len(full_text_results_list)}[/highlight]")
+
     return output_data
 
 async def main():
@@ -542,13 +601,17 @@ async def main():
                         publication_type_mappings=publication_type_mappings_from_settings,
                         **filtered_agent_config_params
                     )
+                elif agent_name == "FullTextRetrievalAgent":
+                    # FullTextRetrievalAgent does not require a model_client
+                    component = FullTextRetrievalAgent(**filtered_agent_config_params)
                 else:
                     # console.print(f"[yellow]Warning: Unhandled component type for {agent_name}. Skipping.[/yellow]")
                     pass
 
                 if component:
                     agents[agent_name] = component
-                    if agent_name == "query_team":
+                    # Ensure query_team is assigned if it's the component being processed
+                    if agent_name == "query_team" and isinstance(component, BaseGroupChat): # Added type check
                         query_team = component
             except Exception as e:
                 console.print(f"[red]Error manually loading component {agent_name}: {e}[/red]")
@@ -604,14 +667,17 @@ async def main():
         # console.print("[yellow]No query entered. Exiting.[/yellow]")
         return
 
+    # Pass the full 'agents' dictionary to run_search_pipeline
+    # so it can retrieve FullTextRetrievalAgent or any other agent it might need.
     await run_search_pipeline(
         query_team, 
-        literature_search_tool_instance, # Use the instance from agents dict
+        literature_search_tool_instance, 
         triage_agent_instance, 
+        agents, # Pass the whole agents dictionary
         original_query, 
         console,
-        settings_config, # Pass loaded settings
-        args # Pass parsed CLI args
+        settings_config, 
+        args 
     )
 
 

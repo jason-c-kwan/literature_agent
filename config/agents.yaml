@@ -258,3 +258,14 @@
 #   component_type: tool
 #   config:
 #     description: "Attempts to download and validate a PDF from a specific URL, assuming it's a direct link."
+
+# ─── FULL TEXT RETRIEVAL AGENT (New) ───────────────────────────
+- name: FullTextRetrievalAgent
+  provider: tools.retrieve_full_text.FullTextRetrievalAgent
+  component_type: agent
+  config:
+    name: FullTextRetrievalAgent
+    description: "Given a list of article identifiers (e.g., DOIs or PMIDs), retrieve full-text JSON using tools/retrieve_full_text.py."
+    # Input schema: List of records (Python list of dicts), typically from TriageAgent output.
+    # Output schema: Same list of records, but each record may have an added `fulltext` field (string or null)
+    # and `fulltext_retrieval_status` / `fulltext_retrieval_message` fields.

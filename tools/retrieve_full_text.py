@@ -739,3 +739,97 @@ if __name__ == "__main__":
         message = article.get('fulltext_retrieval_message', '')
         has_fulltext = "Yes" if article.get("fulltext") else "No"
         print(f"DOI: {doi:<30} | Status: {status:<20} | Has Fulltext: {has_fulltext:<3} | Message: {message}")
+
+
+# --- AutoGen Agent Definition ---
+from autogen_agentchat.agents import BaseChatAgent
+from autogen_agentchat.messages import BaseChatMessage, TextMessage
+from autogen_agentchat.base import Response
+from autogen_core import CancellationToken
+from typing import Sequence
+
+
+class FullTextRetrievalAgent(BaseChatAgent):
+    def __init__(
+        self,
+        name: str,
+        description: Optional[str] = "Retrieves full text for a list of articles.",
+        **kwargs,
+    ):
+        super().__init__(name=name, description=description, **kwargs)
+
+    @property
+    def produced_message_types(self) -> Sequence[type[BaseChatMessage]]:
+        """The types of messages that the agent produces."""
+        return (TextMessage,)
+
+    async def on_messages(
+        self, messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken
+    ) -> Response:
+        """Handles incoming messages and returns a response with enriched articles."""
+        if not messages:
+            return Response(
+                chat_message=TextMessage(content="Error: No input messages received.", source=self.name),
+                inner_messages=[],
+            )
+
+        # Assuming the input is in the last message, as a JSON string of List[Dict[str, Any]]
+        last_message = messages[-1]
+        if not isinstance(last_message, TextMessage) or not isinstance(last_message.content, str):
+            return Response(
+                chat_message=TextMessage(
+                    content="Error: Expected a TextMessage with a JSON string content.", source=self.name
+                ),
+                inner_messages=[],
+            )
+
+        try:
+            input_articles: List[Dict[str, Any]] = json.loads(last_message.content)
+            if not isinstance(input_articles, list):
+                raise ValueError("Parsed JSON is not a list.")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse input JSON: {e}", extra={"input_content": last_message.content})
+            return Response(
+                chat_message=TextMessage(content=f"Error: Invalid JSON input. {e}", source=self.name),
+                inner_messages=[],
+            )
+        except ValueError as e:
+            logger.error(f"Parsed JSON is not a list: {e}", extra={"input_content": last_message.content})
+            return Response(
+                chat_message=TextMessage(content=f"Error: Input JSON must be a list of articles. {e}", source=self.name),
+                inner_messages=[],
+            )
+
+        # The retrieve_full_texts_for_dois function expects a specific dictionary structure.
+        # We'll wrap our input_articles list into that structure.
+        # We use a dummy query and refined_queries as they are part of the expected structure
+        # but not directly used by the full-text retrieval logic for each article.
+        mock_query_refiner_output = {
+            "query": "Full-text retrieval task",
+            "refined_queries": [],
+            "triaged_articles": input_articles  # This is the list we want to process
+        }
+
+        try:
+            # Call the existing function to retrieve full texts
+            # This function modifies mock_query_refiner_output in-place
+            # and also returns it.
+            enriched_output_dict = await retrieve_full_texts_for_dois(mock_query_refiner_output)
+            
+            # Extract the enriched articles list
+            enriched_articles_list = enriched_output_dict.get("triaged_articles", [])
+
+            output_json = json.dumps(enriched_articles_list, indent=2)
+            response_message = TextMessage(content=output_json, source=self.name)
+        except Exception as e:
+            logger.error(f"Error during full text retrieval: {e}", exc_info=True)
+            response_message = TextMessage(
+                content=f"Error during full text retrieval: {str(e)}", source=self.name
+            )
+
+        return Response(chat_message=response_message, inner_messages=[])
+
+    async def on_reset(self, cancellation_token: CancellationToken) -> None:
+        """Resets the agent to its initialization state."""
+        # This agent is stateless, so nothing to do here.
+        pass
