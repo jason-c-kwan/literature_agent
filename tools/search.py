@@ -406,10 +406,15 @@ class AsyncSearchClient:
             for pub_type_key in publication_types:
                 api_specific_value = self.publication_type_mappings.get(pub_type_key, {}).get("crossref")
                 if api_specific_value: # e.g., "journal-article", "review-article"
-                    mapped_types.append(api_specific_value)
+                    # Quick fix for "review-article" not being valid for CrossRef
+                    if api_specific_value == "review-article":
+                        mapped_types.append("journal-article")
+                    else:
+                        mapped_types.append(api_specific_value)
             if mapped_types:
                 # For CrossRef, multiple type filters are usually comma-separated for the 'type' filter key
-                crossref_filters['type'] = ",".join(mapped_types)
+                # Remove duplicates that might arise from mapping "review-article" to "journal-article"
+                crossref_filters['type'] = ",".join(list(set(mapped_types)))
 
         async with self.crossref_semaphore:
             try:

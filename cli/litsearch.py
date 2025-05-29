@@ -30,14 +30,169 @@ from prompt_toolkit.formatted_text import HTML
 
 # Import GroupChat for the new query logic
 from autogen_agentchat.teams import BaseGroupChat
+from autogen_agentchat.ui import Console as AgentChatConsole # Renamed to avoid conflict
 #from autogen_agentchat.messages import HandoffMessage
-from autogen_agentchat.messages import ToolCallRequestEvent, TextMessage, ToolCallSummaryMessage # Added ToolCallSummaryMessage
+from autogen_agentchat.messages import ToolCallRequestEvent, TextMessage, ToolCallSummaryMessage, BaseChatMessage # Added BaseChatMessage
 
 from autogen_core.tools import FunctionTool
 # clarifier_stub and its FunctionTool definition will be replaced by actual_clarifier_tool_func
 # and its FunctionTool definition within the main() function, as it needs access to 'console'.
 from tools.triage import TriageAgent # Added for TriageAgent type hint
 
+REQUIRED_METADATA_FIELDS = [
+    "purpose", "scope", "audience", "article_type",
+    "date_range", "open_access", "output_format" # Removed "keywords"
+]
+
+def build_prompt_for_metadata_collection(
+    original_query: str,
+    collected_metadata: Dict[str, Any],
+    all_required_fields: List[str],
+    field_prompts: Dict[str, str] # The actual prompt text for each field
+) -> str:
+    """
+    Builds the message to send to the QueryRefinerAgent to guide metadata collection.
+    """
+    if not collected_metadata:
+        first_field_to_ask = all_required_fields[0]
+        prompt_for_first_field = field_prompts.get(first_field_to_ask, f"Please provide information for {first_field_to_ask}.")
+        return (
+            f"My initial research query is: '{original_query}'. "
+            f"Please start by asking me: \"{prompt_for_first_field}\" "
+            "Ask only one question per turn until all required information is gathered."
+        )
+    else:
+        next_field_to_ask = None
+        for field in all_required_fields:
+            if field not in collected_metadata:
+                next_field_to_ask = field
+                break
+        
+        collected_info_str = "; ".join(f"'{k}': '{v}'" for k, v in collected_metadata.items())
+        if next_field_to_ask:
+            prompt_for_next_field = field_prompts.get(next_field_to_ask, f"Please provide information for {next_field_to_ask}.")
+            # Make the instruction very direct
+            return (
+                f"We have already discussed: {collected_info_str}. "
+                f"The original query was: '{original_query}'. "
+                f"Your next immediate task is to ask me the following question, and only this question: \"{prompt_for_next_field}\" "
+                "Do not summarize. Do not proceed with research. Only ask this one question."
+            )
+        else: # All fields collected
+            return (
+                f"All required information has been collected: {collected_info_str}. "
+                f"The original query was: '{original_query}'. "
+                "You can now proceed based on this information." # This message signals completion to QRA
+            )
+
+def parse_chat_history_for_metadata(
+    chat_history: Sequence[BaseChatMessage], # Changed type hint
+    field_question_map: Dict[str, str], # Maps field name to the question text (prompt) for that field
+    user_proxy_name: str, # Name of the UserProxyAgent
+    query_refiner_name: str # Name of the QueryRefinerAgent
+) -> Dict[str, Any]:
+    """
+    Parses the chat history to extract metadata based on questions and answers.
+    """
+    metadata: Dict[str, Any] = {}
+    if not chat_history:
+        return metadata
+
+    for i, msg in enumerate(chat_history):
+        # Check if the message is a question from the QueryRefinerAgent
+        if msg.source == query_refiner_name and isinstance(msg.content, str):
+            question_text = msg.content.strip()
+            # Try to find which field this question corresponds to
+            asked_field = None
+            for field, prompt_text in field_question_map.items():
+                # This matching needs to be robust. The agent might not ask the exact prompt text.
+                # For now, we assume the agent asks a question that *contains* the core prompt text.
+                # Or, if the agent is well-behaved, it uses the exact prompt.
+                # A more robust way would be if the agent tagged its question.
+                if prompt_text.lower() in question_text.lower() or field.lower() in question_text.lower(): # Simple check
+                    asked_field = field
+                    break
+            
+            # If a known field was asked, look for the next message from UserProxyAgent as the answer
+            if asked_field and (i + 1) < len(chat_history):
+                answer_msg = chat_history[i+1]
+                if answer_msg.source == user_proxy_name and isinstance(answer_msg.content, str):
+                    metadata[asked_field] = answer_msg.content.strip()
+                    # print(f"DEBUG: Matched field '{asked_field}' with question '{question_text}' and answer '{metadata[asked_field]}'") # Debug
+    
+    # print(f"DEBUG: [parse_chat_history_for_metadata] History len {len(chat_history)}, Extracted: {metadata}")
+    return metadata
+
+def convert_metadata_to_search_params(
+    metadata: Dict[str, Any],
+    original_query: str,
+    console: Console,
+    refined_terms: Optional[str] = None
+) -> Optional[SearchLiteratureParams]:
+    """
+    Converts collected metadata and refined terms into SearchLiteratureParams.
+    """
+    general_query_to_use = original_query # Default
+    pubmed_query_to_use = "" # Default to empty, can be refined
+
+    if refined_terms and refined_terms.strip():
+        console.print(f"[info]Using refined search terms for general query: '{refined_terms}'[/info]")
+        general_query_to_use = refined_terms
+        # Potentially, refined_terms could also be structured for PubMed, or inspire its creation.
+        # For now, let's assume refined_terms are primarily for general search.
+        # A more sophisticated approach might involve the LLM generating specific PubMed syntax.
+        # If refined_terms look like a PubMed query, we could use them.
+        # Example: if "cancer[MeSH Terms] AND therapy" in refined_terms.
+        # For simplicity, we'll keep pubmed_query basic for now or derive it.
+        # One simple strategy: if refined_terms are just keywords, use them for pubmed_query too.
+        if not any(char in refined_terms for char in "[]()*"): # Basic check if it's not complex PubMed syntax
+            pubmed_query_to_use = refined_terms
+            console.print(f"[info]Using refined terms for PubMed query as well: '{refined_terms}'[/info]")
+        else:
+            # If refined_terms seem complex, maybe they are already a PubMed query
+            # Or we need a separate step to generate a PubMed query from metadata + refined_terms
+            # For now, if refined_terms are complex, we'll use them for general and try to make a simpler one for pubmed
+            # or leave pubmed_query as potentially empty if it's hard to derive.
+            # A simple fallback for PubMed could be keywords from 'scope' or 'purpose' if available.
+            scope_text = metadata.get("scope", "")
+            purpose_text = metadata.get("purpose", "")
+            if scope_text or purpose_text:
+                # This is a very naive keyword extraction for PubMed.
+                # Consider using an LLM for better PubMed query formulation based on all metadata.
+                potential_pubmed_keywords = f"{scope_text} {purpose_text} {original_query}".strip()
+                # Replace common conjunctions that might not work well as standalone pubmed terms
+                potential_pubmed_keywords = re.sub(r'\b(and|or|not|the|a|of|in|for|to|with)\b', '', potential_pubmed_keywords, flags=re.IGNORECASE)
+                potential_pubmed_keywords = ' '.join(potential_pubmed_keywords.split()) # Clean up multiple spaces
+                if potential_pubmed_keywords:
+                    pubmed_query_to_use = potential_pubmed_keywords
+                    console.print(f"[info]Derived potential PubMed query from scope/purpose/original: '{pubmed_query_to_use}'[/info]")
+                else:
+                    console.print(f"[yellow]Could not derive a specific PubMed query from metadata, using refined_terms if simple, or empty.[/yellow]")
+                    if not any(char in refined_terms for char in "[]()*"):
+                         pubmed_query_to_use = refined_terms
+                    else: # refined_terms are complex, don't use for pubmed directly
+                         pubmed_query_to_use = "" # Or try to extract keywords from original_query
+                         if original_query:
+                            temp_original_keywords = re.sub(r'\b(and|or|not|the|a|of|in|for|to|with)\b', '', original_query, flags=re.IGNORECASE)
+                            pubmed_query_to_use = ' '.join(temp_original_keywords.split())
+                            console.print(f"[info]Using keywords from original query for PubMed: '{pubmed_query_to_use}'[/info]")
+
+
+    elif original_query: # No refined_terms, fallback to original_query
+        console.print(f"[yellow]No refined terms provided, falling back to original query for general search: '{original_query}'[/yellow]")
+        general_query_to_use = original_query
+        # Try to make a simple PubMed query from original_query
+        temp_original_keywords = re.sub(r'\b(and|or|not|the|a|of|in|for|to|with)\b', '', original_query, flags=re.IGNORECASE)
+        pubmed_query_to_use = ' '.join(temp_original_keywords.split())
+        console.print(f"[info]Using keywords from original query for PubMed: '{pubmed_query_to_use}'[/info]")
+    else:
+        console.print("[red]Cannot form search query: No refined terms and no original query.[/red]")
+        return None
+
+    return SearchLiteratureParams(
+        pubmed_query=pubmed_query_to_use.strip(),
+        general_query=general_query_to_use.strip()
+    )
 
 class DebugOpenAIChatCompletionClient(OpenAIChatCompletionClient):
     async def create(
@@ -172,169 +327,224 @@ def styled_input(prompt_message: str, console: Console) -> str:
     return prompt(f"{plain_prompt} ").strip()
 
 async def run_search_pipeline(
-    query_team: BaseGroupChat,
+    query_team: BaseGroupChat, # May become unused for refinement, but kept for signature consistency for now
     literature_search_tool: LiteratureSearchTool,
     triage_agent: TriageAgent,
-    agents: Dict[str, Any], # Added agents dictionary
+    agents: Dict[str, Any],
     original_query: str,
     console: Console,
     settings_config: Dict[str, Any],
-    cli_args: argparse.Namespace
+    cli_args: argparse.Namespace,
+    query_refiner_config_params: Dict[str, Any],
+    fields_to_collect_override: Optional[List[str]] = None
 ):
     all_articles_data = []
     processed_dois_for_articles = set()
     all_refined_queries = []
-    
-    MAX_REFINEMENT_ATTEMPTS = 3
-    refinement_attempts = 0
-    refined_query_objects = []
-    
-    console.print(f"[secondary]Initiating research query with GroupChat:[/secondary] [highlight]'{original_query}'[/highlight]")
-    
-    # Determine publication types to use
-    final_publication_types_to_use = []
-    if cli_args.pub_types: # CLI flag is provided
-        final_publication_types_to_use = [s.strip().lower() for s in cli_args.pub_types.split(',') if s.strip()]
-        console.print(f"[info]Using publication types from CLI: {final_publication_types_to_use}[/info]")
-    else: # CLI flag not provided, use default from settings
-        default_pub_types_from_settings = settings_config.get('search_settings', {}).get('default_publication_types', [])
-        if default_pub_types_from_settings: # Ensure it's a list and clean
-             final_publication_types_to_use = [str(s).strip().lower() for s in default_pub_types_from_settings if str(s).strip()]
-             console.print(f"[info]Using default publication types from settings: {final_publication_types_to_use}[/info]")
-        else:
-            console.print(f"[info]No publication type filter applied (neither CLI nor settings default provided).[/info]")
 
-    # Determine max_results_per_source
-    default_max_results = settings_config.get('search_settings', {}).get('default_max_results_per_source', 50)
-    # Potentially add a CLI flag for max_results here if desired in future, to override settings
-    max_results_to_use = default_max_results
-    console.print(f"[info]Using max results per source: {max_results_to_use}[/info]")
+    query_refiner_agent = agents.get("query_refiner")
+    user_proxy_agent = agents.get("user_proxy")
 
-    try: # OUTER TRY BLOCK
-        # Query Refinement Loop
-        while refinement_attempts < MAX_REFINEMENT_ATTEMPTS:
-            refinement_attempts += 1
-            console.print(f"[info]Query refinement attempt {refinement_attempts}/{MAX_REFINEMENT_ATTEMPTS}...[/info]")
+    if not query_refiner_agent or not user_proxy_agent:
+        console.print("[red]Error: Query Refiner or User Proxy agent not found in 'agents' dict.[/red]")
+        return {"query": original_query, "refined_queries": [], "triaged_articles": []}
+
+    field_question_map = query_refiner_config_params.get('required_fields', {})
+    
+    active_fields_to_collect = fields_to_collect_override if fields_to_collect_override is not None else REQUIRED_METADATA_FIELDS
+
+    # Ensure field_question_map (from config) has prompts for all active_fields_to_collect.
+    if not active_fields_to_collect:
+        console.print(f"[red]Error: No fields specified for metadata collection.[/red]")
+        search_params = convert_metadata_to_search_params({}, original_query, console) # Fallback
+    elif not all(field in field_question_map for field in active_fields_to_collect):
+        missing_prompts = [field for field in active_fields_to_collect if field not in field_question_map]
+        console.print(f"[red]Error: 'required_fields' in QueryRefinerAgent config is missing prompts for: {missing_prompts} (from active list: {active_fields_to_collect}). Config has prompts for: {list(field_question_map.keys())}[/red]")
+        search_params = convert_metadata_to_search_params({}, original_query, console) # Fallback
+    else:
+        # Proceed with metadata collection
+        collected_metadata: Dict[str, Any] = {}
+        MAX_CLARIFICATION_ITERATIONS = len(active_fields_to_collect) + 3
+        clarification_iteration = 0
+        console.print(f"[secondary]Starting metadata collection for query:[/secondary] [highlight]'{original_query}'[/highlight]")
+        console.print(f"[info]Fields to collect: {active_fields_to_collect}[/info]")
+
+        while not all(field in collected_metadata for field in active_fields_to_collect) and clarification_iteration < MAX_CLARIFICATION_ITERATIONS:
+            clarification_iteration += 1
+            console.print(f"[info]Metadata collection iteration {clarification_iteration}/{MAX_CLARIFICATION_ITERATIONS}. Collected: {collected_metadata}[/info]")
+
+            current_prompt_to_refiner = build_prompt_for_metadata_collection(
+                original_query,
+                collected_metadata,
+                active_fields_to_collect, # Use the determined list of fields
+                field_question_map
+            )
             
-            task_for_refiner = original_query
-            if refinement_attempts > 1 and 'last_refined_queries_str' in locals() and last_refined_queries_str:
-                task_for_refiner = (
-                    f"The previous attempt to generate refined queries resulted in a JSON parsing error. "
-                    f"The problematic output was: \n```json\n{last_refined_queries_str}\n```\n"
-                    f"Please ensure your output is a valid JSON array of three objects, each with 'pubmed_query' and 'general_query' string fields. "
-                    f"The original query was: '{original_query}'"
+            if "All required information has been collected" in current_prompt_to_refiner:
+                 console.print("[info]Metadata collection prompt indicates completion based on current state.")
+                 break
+
+            console.print(f"[debug]UserProxyAgent sending to QueryRefinerAgent (iteration {clarification_iteration}): {current_prompt_to_refiner}[/debug]")
+            
+            try:
+                # Use query_team.run_stream wrapped with AgentChatConsole
+                # The task for query_team.run_stream() should be a message object or string.
+                # current_prompt_to_refiner is already a string.
+                chat_result = await AgentChatConsole(query_team.run_stream(
+                    task=TextMessage(content=current_prompt_to_refiner, source="pipeline_orchestrator")
+                ))
+            except Exception as e_chat:
+                console.print(f"[red]Error during AgentChatConsole(query_team.run_stream(...)): {e_chat}[/red]")
+                break
+
+            if chat_result and chat_result.messages: # Changed from chat_result.chat_history to chat_result.messages
+                actual_chat_messages = [m for m in chat_result.messages if isinstance(m, BaseChatMessage)]
+                console.print(f"[debug]Chat history for iteration {clarification_iteration} (last {len(actual_chat_messages)} chat messages):")
+                for msg_idx, msg_obj in enumerate(actual_chat_messages):
+                     console.print(f"[debug]  Msg {msg_idx} (Source: {getattr(msg_obj, 'source', 'N/A')}): {str(msg_obj.content)[:200]}...")
+
+                newly_collected = parse_chat_history_for_metadata(
+                    actual_chat_messages, # Pass filtered list
+                    field_question_map,
+                    user_proxy_agent.name,
+                    query_refiner_agent.name
                 )
+                if newly_collected:
+                    all_needed_present_in_newly_collected = True
+                    if not active_fields_to_collect: # Handle empty active_fields_to_collect
+                        all_needed_present_in_newly_collected = False
+                    else:
+                        for fld in active_fields_to_collect:
+                            if fld not in newly_collected:
+                                all_needed_present_in_newly_collected = False
+                                break
+                    
+                    if all_needed_present_in_newly_collected and \
+                       len(newly_collected) >= len(active_fields_to_collect) and \
+                       all(f in newly_collected for f in active_fields_to_collect): # Ensure all active fields are in newly_collected
+                        # If newly_collected has at least all the active fields,
+                        # and all active fields are indeed in newly_collected.
+                        # Prioritize taking all values from newly_collected for the active fields.
+                        temp_collected_metadata = collected_metadata.copy()
+                        for fld in active_fields_to_collect:
+                            if fld in newly_collected: # Should always be true if all_needed_present_in_newly_collected is true
+                                temp_collected_metadata[fld] = newly_collected[fld]
+                        collected_metadata = temp_collected_metadata
+                        # console.print(f"[debug] Optimization: newly_collected contains all active fields. Updated collected_metadata. Collected: {collected_metadata}")
+                    else:
+                        # Original update logic if the above condition isn't met
+                        # console.print(f"[debug] Standard update. Newly: {newly_collected}, Active: {active_fields_to_collect}, Current Collected: {collected_metadata}")
+                        for k, v in newly_collected.items():
+                            if k in active_fields_to_collect and k not in collected_metadata: # Add only if not already present from a previous partial collection
+                                collected_metadata[k] = v
+                            elif k in active_fields_to_collect and k in collected_metadata and collected_metadata[k] != v : # If present but different, update (optional, depends on desired behavior)
+                                # This part is tricky: should new values override old ones if a field is "re-collected"?
+                                # For now, let's stick to adding only if not already present to match original logic more closely for partials.
+                                # If a field is asked for again, parse_chat_history_for_metadata should ideally handle the latest answer.
+                                # The current loop structure implies we ask until a field is present.
+                                pass # Sticking to "add if not present"
 
-            refined_queries_str = "" 
-            try: # INNER TRY for team_result and parsing
-                team_result = await query_team.run(task=task_for_refiner)
-                console.print(f"[debug]Team run completed (attempt {refinement_attempts}). Messages: {team_result.messages}[/debug]")
-
-                if team_result.messages and isinstance(team_result.messages, list) and len(team_result.messages) > 0:
-                    for msg in reversed(team_result.messages):
-                        if msg.source == "query_refiner" and (isinstance(msg, TextMessage) or isinstance(msg, ToolCallSummaryMessage)):
-                            if hasattr(msg, "content") and isinstance(msg.content, str):
-                                code_block_pattern = re.compile(r"```(?:json|python|text)?\n(.*?)\n```", re.DOTALL)
-                                match = code_block_pattern.search(msg.content)
-                                if match:
-                                    refined_queries_str = match.group(1).strip()
-                                    break
-                                elif msg.content.strip().startswith("[") and msg.content.strip().endswith("]"):
-                                    refined_queries_str = msg.content.strip()
-                                    break
-                
-                last_refined_queries_str = refined_queries_str
-
-                if not refined_queries_str:
-                    console.print(f"[red]Query refiner did not produce a parsable output string on attempt {refinement_attempts}.[/red]")
-                    if refinement_attempts == MAX_REFINEMENT_ATTEMPTS:
-                        console.print(f"[red]Max refinement attempts reached. No output from query refiner.[/red]")
-                    continue 
-
-                console.print(f"[debug]Attempting to parse refined_queries_str (attempt {refinement_attempts}): {refined_queries_str}[/debug]")
-                
-                parsed_json = json.loads(refined_queries_str)
-                if not isinstance(parsed_json, list):
-                    raise ValueError("Agent did not return a JSON array.")
-                if not all(isinstance(obj, dict) and "pubmed_query" in obj and "general_query" in obj for obj in parsed_json):
-                    raise ValueError("Each object in the JSON array must have 'pubmed_query' and 'general_query' fields.")
-                if len(parsed_json) != 3:
-                     console.print(f"[yellow]Warning: Expected 3 refined query objects, but got {len(parsed_json)} on attempt {refinement_attempts}. Using as is.[/yellow]")
-
-                refined_query_objects = parsed_json
-                console.print(f"[success]Successfully parsed refined queries on attempt {refinement_attempts}.[/success]")
-                break 
-                
-            except (json.JSONDecodeError, ValueError) as e_parse:
-                console.print(f"[red]Error parsing Query-RefinerAgent output on attempt {refinement_attempts}: {e_parse}. Raw output: {refined_queries_str}[/red]")
-                refined_query_objects = [] 
-                if refinement_attempts == MAX_REFINEMENT_ATTEMPTS:
-                    console.print(f"[red]Max refinement attempts reached. Could not parse refined queries.[/red]")
-            except Exception as e_team_run: 
-                console.print(f"[red]Unexpected error during query_team.run or parsing on attempt {refinement_attempts}: {e_team_run}[/red]")
-                refined_query_objects = []
-                if refinement_attempts == MAX_REFINEMENT_ATTEMPTS:
-                    console.print(f"[red]Max refinement attempts reached due to unexpected error.[/red]")
-        
-        if not refined_query_objects: # If loop finished without break (i.e. all attempts failed)
-            console.print("[yellow]Falling back: Using original query as general query due to refinement failure.[/yellow]")
-            refined_query_objects = [{"pubmed_query": "", "general_query": original_query if original_query else ""}]
-
-        console.print(f"[secondary]Using Refined Query Objects:[/secondary] {refined_query_objects}")
-        all_refined_queries.extend([obj.get("general_query", "") for obj in refined_query_objects])
-
-        # Literature Search Loop (still within the outer try block)
-        for j, query_obj in enumerate(refined_query_objects):
-            pubmed_q = query_obj.get("pubmed_query", "")
-            general_q = query_obj.get("general_query", "")
-
-            if not pubmed_q and not general_q:
-                console.print(f"[yellow]Skipping empty refined query object in query {j+1}.[/yellow]")
-                continue
-            
-            console.print(f"[secondary]Calling search_literature with:[/secondary]")
-            console.print(f"  [highlight]PubMed Query: '{pubmed_q}'[/highlight]")
-            console.print(f"  [highlight]General Query: '{general_q}'[/highlight]")
-            
-            search_params = SearchLiteratureParams(
-                pubmed_query=pubmed_q,
-                general_query=general_q,
-                max_results_per_source=max_results_to_use,
-                publication_types=final_publication_types_to_use if final_publication_types_to_use else None
-            )
-            search_output = await literature_search_tool.run(
-                args=search_params,
-                cancellation_token=CancellationToken()
-            )
-            
-            search_results_data = search_output.get("data", [])
-            
-            for record in search_results_data:
-                # Ensure record is a dictionary and 'doi' exists
-                if isinstance(record, dict):
-                    doi_val = record.get('doi')
-                    # Ensure doi_val is a string and not empty before adding to set and checking membership
-                    if isinstance(doi_val, str) and doi_val.strip():
-                        if doi_val not in processed_dois_for_articles:
-                            all_articles_data.append(record)
-                            processed_dois_for_articles.add(doi_val)
-                    elif doi_val is None: # Handle articles with no DOI (add them if not otherwise identifiable as duplicate)
-                        # This part is tricky without another unique ID. For now, let's assume if DOI is None, we add it.
-                        # A more robust solution might involve checking title/authors if DOI is None.
-                        # However, the current logic relies on DOI for deduplication.
-                        # If we simply add all records with None DOI, we might get duplicates if other sources provide the same article without DOI.
-                        # For now, let's stick to DOI-based deduplication. If DOI is None, it won't be added to processed_dois_for_articles
-                        # and won't be processed by this specific 'if' block for deduplication.
-                        # A simpler approach for now: if it has a DOI, deduplicate. If not, add it.
-                        # This might lead to duplicates if an article appears from two sources, one with DOI and one without.
-                        # The current structure of processed_dois_for_articles is for DOIs.
-                        # Let's refine: only add if DOI is present and unique.
-                        pass # Articles without a valid string DOI won't be added via this DOI-based deduplication.
-                            # This means all_articles_data will only contain articles that had a valid, unique DOI.
+                    console.print(f"[info]Collected in this iteration (potentially merged): {newly_collected}. Current total collected: {collected_metadata}[/info]")
                 else:
-                    console.print(f"[yellow]Warning: search_results_data contained a non-dictionary item: {type(record)}[/yellow]")
+                    console.print(f"[yellow]No new metadata parsed in iteration {clarification_iteration}. Check chat history and parsing logic.[/yellow]")
+            else:
+                console.print(f"[yellow]No chat history from user_proxy_agent.initiate_chat in iteration {clarification_iteration}.[/yellow]")
+                break
+        
+        if not all(field in collected_metadata for field in active_fields_to_collect):
+            console.print(f"[red]Failed to collect all required metadata for {active_fields_to_collect} after {clarification_iteration} iterations. Collected: {collected_metadata}[/red]")
+            search_params = convert_metadata_to_search_params({}, original_query, console)
+        else:
+            console.print(f"[success]All required metadata collected for {active_fields_to_collect}: {collected_metadata}[/success]")
+            search_params = convert_metadata_to_search_params(collected_metadata, original_query, console)
 
-    except Exception as e: # OUTER EXCEPT, correctly aligned with the OUTER TRY
+    # After metadata collection loop, try to get refined search terms
+    refined_search_terms = None
+    if chat_result and chat_result.messages:
+        # Get the last message from query_refiner_agent
+        last_refiner_msg_content = None
+        for msg in reversed(chat_result.messages):
+            if isinstance(msg, BaseChatMessage) and msg.source == query_refiner_agent.name:
+                if isinstance(msg.content, str):
+                    last_refiner_msg_content = msg.content
+                    break
+        
+        if last_refiner_msg_content:
+            match = re.search(r"Refined Search Terms: (.*)", last_refiner_msg_content, re.IGNORECASE)
+            if match:
+                refined_search_terms = match.group(1).strip()
+                console.print(f"[info]Extracted refined search terms: '{refined_search_terms}'[/info]")
+
+    # Pass refined terms (if any) to convert_metadata_to_search_params
+    search_params = convert_metadata_to_search_params(collected_metadata, original_query, console, refined_search_terms)
+
+    # Fallback if search_params could not be formed
+    if not search_params:
+        if original_query: # Try one last time with original query if search_params is None
+            console.print("[yellow]Search params were None, attempting fallback to original query directly.[/yellow]")
+            search_params = convert_metadata_to_search_params({}, original_query, console, None) # Pass None for refined_terms
+        
+        if not search_params: # If still None, then critical failure
+             console.print("[red]CRITICAL: Could not form any search parameters.[/red]")
+             return {"query": original_query, "refined_queries": [], "triaged_articles": []}
+
+    if search_params and search_params.general_query:
+        all_refined_queries.append(f"General: {search_params.general_query}")
+    if search_params.pubmed_query: # This might be empty if not well-formulated
+        all_refined_queries.append(f"PubMed: {search_params.pubmed_query}")
+    
+    # Ensure original_query is added if no refined queries were generated, or add refined if available
+    if not all_refined_queries and original_query:
+        all_refined_queries.append(f"Original (used as fallback): {original_query}")
+    elif refined_search_terms and f"General: {refined_search_terms}" not in all_refined_queries: # Avoid duplicate if refined_terms became general_query
+        # This logic might need refinement based on how search_params uses refined_terms
+        pass
+
+
+    try: # OUTER TRY BLOCK for the rest of the pipeline (search, triage, etc.)
+        final_publication_types_to_use = []
+        if cli_args.pub_types:
+            final_publication_types_to_use = [s.strip().lower() for s in cli_args.pub_types.split(',') if s.strip()]
+            console.print(f"[info]Using publication types from CLI: {final_publication_types_to_use}[/info]")
+        else:
+            default_pub_types_from_settings = settings_config.get('search_settings', {}).get('default_publication_types', [])
+            if default_pub_types_from_settings:
+                 final_publication_types_to_use = [str(s).strip().lower() for s in default_pub_types_from_settings if str(s).strip()]
+                 console.print(f"[info]Using default publication types from settings: {final_publication_types_to_use}[/info]")
+            else:
+                console.print(f"[info]No publication type filter applied.[/info]")
+
+        default_max_results = settings_config.get('search_settings', {}).get('default_max_results_per_source', 50)
+        max_results_to_use = default_max_results
+        console.print(f"[info]Using max results per source: {max_results_to_use}[/info]")
+
+        search_params.max_results_per_source = max_results_to_use
+        search_params.publication_types = final_publication_types_to_use if final_publication_types_to_use else None
+        
+        console.print(f"[secondary]Executing literature search with parameters:[/secondary]")
+        console.print(f"  [highlight]PubMed Query: '{search_params.pubmed_query}'[/highlight]")
+        console.print(f"  [highlight]General Query: '{search_params.general_query}'[/highlight]")
+        console.print(f"  [highlight]Max Results: {search_params.max_results_per_source}[/highlight]")
+        console.print(f"  [highlight]Pub Types: {search_params.publication_types}[/highlight]")
+
+        search_output = await literature_search_tool.run(
+            args=search_params,
+            cancellation_token=CancellationToken()
+        )
+        
+        search_results_data = search_output.get("data", [])
+        
+        for record in search_results_data:
+            if isinstance(record, dict):
+                doi_val = record.get('doi')
+                if isinstance(doi_val, str) and doi_val.strip():
+                    if doi_val not in processed_dois_for_articles:
+                        all_articles_data.append(record)
+                        processed_dois_for_articles.add(doi_val)
+            else:
+                console.print(f"[yellow]Warning: search_results_data contained a non-dictionary item: {type(record)}[/yellow]")
+
+    except Exception as e:
         console.print(f"[red]Error during the main query refinement or search process: {e}[/red]")
         # Ensure all_articles_data is initialized if an error occurs before search loop
         # or if we want to proceed with empty/partially filled data for triage.
@@ -496,7 +706,8 @@ async def main():
 
     # 2. Manually instantiate agents and teams
     agents = {}
-    query_team = None # Initialize query_team to None
+    query_team = None
+    query_refiner_config_params_for_pipeline = None # To store QueryRefiner's specific config
     
     # Extract publication_type_mappings from settings_config for LiteratureSearchTool
     publication_type_mappings_from_settings = settings_config.get('publication_type_mappings', {})
@@ -504,7 +715,6 @@ async def main():
     if agents_config_list:
         for agent_config_original in agents_config_list:
             if not isinstance(agent_config_original, dict) or "name" not in agent_config_original:
-                # console.print(f"[yellow]Skipping invalid agent configuration: {agent_config_original}[/yellow]")
                 continue
 
             agent_name = agent_config_original.get('name', 'Unknown')
@@ -543,31 +753,26 @@ async def main():
                 if agent_name == "user_proxy":
                     component = UserProxyAgent(**filtered_agent_config_params)
                 elif agent_name == "query_refiner":
-                    # Define the actual clarifier tool function here, so it has access to 'console'
-                    async def actual_clarifier_tool_func(content: str) -> str:
-                        # 'content' will be the question from the query_refiner's tool call
-                        loop = asyncio.get_event_loop()
-                        # 'console' is the Rich Console instance from the outer scope (main)
-                        answer = await loop.run_in_executor(None, styled_input, f"{content}", console)
-                        console.print(f"[debug]User answer via actual_clarifier_tool_func: {answer}[/debug]")
-                        return answer
+                    # Store the raw config for query_refiner to pass to pipeline
+                    query_refiner_config_params_for_pipeline = agent_config_params.copy() # Use .copy()
+                    
+                    # The clarify_query tool is removed from QueryRefinerAgent's config in agents.yaml
+                    # and its human_input_mode is ALWAYS. So, no FunctionTool needed here for it.
+                    # The 'tools' key might not even be in agent_config_params if not defined in YAML.
+                    # We should ensure 'tools' is an empty list if not present or if we want to override.
+                    assistant_params = {
+                        "name": "query_refiner", # Name from config
+                        "model_client": model_client_instance,
+                        "tools": agent_config_params.get("tools", []), # Use tools from YAML if any, else empty
+                        "description": agent_config_params.get("description"),
+                        "system_message": agent_config_params.get("system_message"),
+                        "reflect_on_tool_use": agent_config_params.get("reflect_on_tool_use", False),
+                        "tool_call_summary_format": agent_config_params.get("tool_call_summary_format", "{result}")
+                    }
+                    # Remove 'required_fields' from params passed to AssistantAgent constructor if it exists
+                    assistant_params.pop('required_fields', None)
 
-                    clarify_tool_for_agent = FunctionTool(
-                        name="clarify_query", # Must match the name used in query_refiner's prompts/system_message
-                        func=actual_clarifier_tool_func,
-                        description="Ask a plain-language follow-up to the user to clarify their query. The 'content' parameter should be the question you want to ask the user.",
-                        strict=True, 
-                    )
-
-                    component = AssistantAgent(
-                        name="query_refiner",
-                        model_client=model_client_instance,
-                        tools=[clarify_tool_for_agent], # Use the new tool
-                        description=agent_config_params.get("description"),
-                        system_message=agent_config_params.get("system_message"),
-                        reflect_on_tool_use=True, # IMPORTANT: Set to True for reflection
-                        tool_call_summary_format="{result}", # This will be used by the reflection step if needed
-                    )
+                    component = AssistantAgent(**assistant_params)
                     
                 elif agent_name == "query_team":
                     # Participants need to be instantiated first
@@ -583,7 +788,7 @@ async def main():
                     component = RoundRobinGroupChat(
                         participants=participants_instances,
                         termination_condition=None,  
-                        max_turns=1,  # stop immediately after the first agent turn
+                        max_turns=2,  # Allow for question and answer
                     )
                 elif agent_name == "triage":
                     component = TriageAgent(model_client=model_client_instance, **{k:v for k,v in filtered_agent_config_params.items() if k != "model_client"})
@@ -670,14 +875,15 @@ async def main():
     # Pass the full 'agents' dictionary to run_search_pipeline
     # so it can retrieve FullTextRetrievalAgent or any other agent it might need.
     await run_search_pipeline(
-        query_team, 
-        literature_search_tool_instance, 
-        triage_agent_instance, 
-        agents, # Pass the whole agents dictionary
-        original_query, 
+        query_team,
+        literature_search_tool_instance,
+        triage_agent_instance,
+        agents,
+        original_query,
         console,
-        settings_config, 
-        args 
+        settings_config,
+        args,
+        query_refiner_config_params=query_refiner_config_params_for_pipeline # Pass the specific config
     )
 
 
