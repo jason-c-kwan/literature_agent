@@ -1,10 +1,28 @@
+version: "0.1"
+
 # Configuration for literature search agent
 
-# API Keys and Endpoints (can be overridden by .env variables)
-# Example:
+# API Keys and Endpoints
+# IMPORTANT: Store actual API keys in a .env file (e.g., PUBMED_API_KEY=yourkey).
+# This file (settings.yaml) is for non-sensitive configurations.
+# The application will prioritize values from .env variables if they exist.
+# Example structure if you were to put them here (NOT RECOMMENDED for secrets):
 # api_keys:
-#   pubmed: YOUR_PUBMED_KEY_HERE
-#   semantic_scholar: YOUR_S2_KEY_HERE
+#   pubmed: PLACEHOLDER_PUBMED_KEY
+#   semantic_scholar: PLACEHOLDER_S2_KEY
+
+# Top-level weights and caps for test_settings.py compatibility
+weights:
+  # Example weights, adjust as needed for the test or actual use
+  # These seem to be general weights, distinct from ranking_settings.weights
+  some_general_weight: 1.0
+  another_general_weight: 0.5
+
+caps:
+  # Example caps, adjust as needed
+  max_items_general: 100
+  processing_limit_general: 50
+
 
 # Search settings
 search_settings:

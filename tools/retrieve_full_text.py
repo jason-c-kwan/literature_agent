@@ -20,7 +20,7 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential, before_
 from tools import retrieve_europepmc
 from tools import parse_json_xml
 from tools import retrieve_pmc
-from tools import elink_pubmed
+from tools import elink_pubmed # Imports both _get_article_links_by_id_type_xml and new get_article_links
 from tools import resolve_pdf_link # Contains resolve_content
 from tools import advanced_scraper
 from tools.parse_pdf import convert_pdf_to_markdown_string # Import the refactored function
@@ -77,6 +77,23 @@ async def write_to_cache(doi: str, data: Dict[str, Any]):
         logger.error(f"Error writing cache for DOI {doi}: {e}", extra={"doi": doi, "event_type": "cache_write_error"})
 
 
+"""
+Module for retrieving the full text of academic articles from various sources.
+
+This module orchestrates the process of fetching full-text content for a given
+list of articles, primarily identified by their DOIs. It attempts retrieval through
+several channels in a fallback sequence:
+1. Europe PMC (structured JSON/XML if available)
+2. PubMed Central (PMC) XML (if PMCID is available)
+3. NCBI ELink 'prlinks' command (XML based, for publisher links via PMID or DOI)
+4. Unpaywall API (to find Open Access URLs)
+5. NCBI ELink 'llinks' command (JSON based, for PubMed LinkOut URLs via PMID)
+For URLs obtained from ELink, Unpaywall, or LinkOut, it uses `resolve_content`
+and `advanced_scraper` to download and parse PDFs or extract HTML content.
+Parsed content is converted to Markdown. Results are cached to avoid redundant
+requests.
+"""
+
 # --- Refactored PDF Parser (placeholder, actual refactoring of parse_pdf.py needed) ---
 async def parse_pdf_to_markdown(pdf_path: str) -> Optional[str]:
     """
@@ -117,7 +134,6 @@ async def parse_pdf_to_markdown(pdf_path: str) -> Optional[str]:
         logger.error(f"Unexpected exception during PDF parsing for {pdf_path}: {e}", exc_info=True, extra={"pdf_path": pdf_path, "event_type": "pdf_parse_exception"})
         return None
 
-
 # --- Individual DOI Retrieval Orchestrator ---
 @retry(
     stop=stop_after_attempt(3),
@@ -128,18 +144,29 @@ async def parse_pdf_to_markdown(pdf_path: str) -> Optional[str]:
 async def get_full_text_for_doi(
     article_data: Dict[str, Any],
     # TODO: Pass shared client sessions if needed, or manage them internally per call
-) -> Tuple[Optional[str], str]:
+) -> Tuple[Optional[str], str, List[str]]: # Added List[str] for tried_sources
     """
     Orchestrates the retrieval of full text for a single DOI using various methods.
-    Returns (markdown_content, status_message).
+    
+    Args:
+        article_data: A dictionary containing article metadata, including 'doi',
+                      'pmid', and 'pmcid'.
+                      
+    Returns:
+        A tuple containing:
+            - Optional[str]: The Markdown content of the full text, or None if not found.
+            - str: A status message describing the outcome of the retrieval attempt.
+            - List[str]: A list of sources that were attempted for this article.
     """
     doi = article_data.get("doi")
     pmid = article_data.get("pmid")
     pmcid_numeric = article_data.get("pmcid") # Numeric part, e.g., "8905495"
     pmcid_full = f"PMC{pmcid_numeric}" if pmcid_numeric else None
 
+    tried_sources: List[str] = [] # To track attempted sources
+
     if not doi:
-        return None, "DOI not provided in article data"
+        return None, "DOI not provided in article data", tried_sources
 
     logger.debug(f"Starting full text retrieval for DOI: {doi}", extra={"doi": doi, "event_type": "doi_retrieval_start"})
 
@@ -169,7 +196,8 @@ async def get_full_text_for_doi(
     if cached_result:
         if cached_result.get("status") == "success":
             logger.info(f"DOI {doi}: Cache hit and status is success.", extra={"doi": doi, "event_type": "cache_hit_success"})
-            return cached_result.get("markdown"), "Retrieved from cache"
+            # Assuming cached results don't store tried_sources, or we don't need them for cache hits
+            return cached_result.get("markdown"), "Retrieved from cache", ["Cache"] 
         elif cached_result.get("status") == "failure":
             logger.info(f"DOI {doi}: Cache hit and status is failure. Attempting fresh retrieval.", 
                         extra={"doi": doi, "event_type": "cache_hit_failure_override", "cached_reason": cached_result.get("reason")})
@@ -177,153 +205,141 @@ async def get_full_text_for_doi(
             logger.info(f"DOI {doi}: Cache hit but status is neither success nor failure ('{cached_result.get('status')}'). Proceeding with fresh retrieval.",
                         extra={"doi": doi, "event_type": "cache_hit_unknown_status_override", "cached_status": cached_result.get('status')})
 
+    current_markdown_content: Optional[str] = None
+    current_status_message: str = ""
+
     # Initialize shared HTTP clients
     logger.debug(f"DOI {doi}: Initializing HTTP clients for fresh retrieval attempt.", extra={"doi": doi, "event_type": "http_client_init"})
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as http_client, \
                aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20.0)) as aio_session:
 
-        # Step 1: Europe PMC (JSON) - Does not involve advanced_scraper or resolve_content, so no cookie handling here
+        # Step 1: Europe PMC (JSON)
+        tried_sources.append("EuropePMC_JSON")
         logger.debug(f"DOI {doi}: Attempting Europe PMC.", extra={"doi": doi, "event_type": "europepmc_attempt"})
         async with SEMAPHORE_EUROPEPMC:
             try:
                 europepmc_json = await retrieve_europepmc.fetch_europepmc(doi)
                 if europepmc_json:
-                    # ... (existing EuropePMC parsing logic)
                     structured_elements = parse_json_xml.parse_europe_pmc_json(europepmc_json)
                     if structured_elements and not (len(structured_elements) == 1 and structured_elements[0].get("type") == "error"):
-                        markdown_content = parse_json_xml._render_elements_to_markdown_string(structured_elements)
-                        if markdown_content and markdown_content.strip():
+                        current_markdown_content = parse_json_xml._render_elements_to_markdown_string(structured_elements)
+                        if current_markdown_content and current_markdown_content.strip():
                             logger.info(f"DOI {doi}: Successfully parsed Europe PMC JSON to Markdown.", extra={"doi": doi, "event_type": "europepmc_success"})
-                            await write_to_cache(doi, {"status": "success", "markdown": markdown_content, "source": "EuropePMC_JSON"})
-                            return markdown_content, "Retrieved and parsed from Europe PMC (JSON)"
+                            await write_to_cache(doi, {"status": "success", "markdown": current_markdown_content, "source": "EuropePMC_JSON"})
+                            return current_markdown_content, "Retrieved and parsed from Europe PMC (JSON)", tried_sources
             except Exception as e:
                 logger.error(f"DOI {doi}: Error fetching/parsing Europe PMC: {e}", exc_info=True, extra={"doi": doi, "event_type": "europepmc_exception"})
 
-        # Step 2: PMC XML - Does not involve advanced_scraper or resolve_content
+        # Step 2: PMC XML
         if pmcid_full:
+            tried_sources.append("PMC_XML")
             logger.debug(f"DOI {doi}: Attempting PMC XML for PMCID: {pmcid_full}.", extra={"doi": doi, "pmcid": pmcid_full, "event_type": "pmcxml_attempt"})
             async with SEMAPHORE_NCBI_PMC:
                 try:
                     pmc_xml_str = await retrieve_pmc.fetch_pmc_xml(pmcid_full, session=aio_session)
                     if pmc_xml_str:
-                        # ... (existing PMC XML parsing logic)
                         structured_elements = parse_json_xml.parse_pmc_xml(pmc_xml_str)
                         if structured_elements and not (len(structured_elements) == 1 and structured_elements[0].get("type") == "error"):
-                            markdown_content = parse_json_xml._render_elements_to_markdown_string(structured_elements)
-                            if markdown_content and markdown_content.strip():
+                            current_markdown_content = parse_json_xml._render_elements_to_markdown_string(structured_elements)
+                            if current_markdown_content and current_markdown_content.strip():
                                 logger.info(f"DOI {doi}: Successfully parsed PMC XML to Markdown for PMCID: {pmcid_full}.", extra={"doi": doi, "pmcid": pmcid_full, "event_type": "pmcxml_success"})
-                                await write_to_cache(doi, {"status": "success", "markdown": markdown_content, "source": "PMC_XML"})
-                                return markdown_content, f"Retrieved and parsed from PMC XML (PMCID: {pmcid_full})"
+                                await write_to_cache(doi, {"status": "success", "markdown": current_markdown_content, "source": "PMC_XML"})
+                                return current_markdown_content, f"Retrieved and parsed from PMC XML (PMCID: {pmcid_full})", tried_sources
                 except Exception as e:
                     logger.error(f"DOI {doi}: Error fetching/parsing PMC XML for PMCID {pmcid_full}: {e}", exc_info=True, extra={"doi": doi, "pmcid": pmcid_full, "event_type": "pmcxml_exception"})
         else:
             logger.debug(f"DOI {doi}: No PMCID available, skipping PMC XML.", extra={"doi": doi, "event_type": "pmcxml_skip_no_pmcid"})
 
-        # Step 3: Elink & Scrapers
-        identifier_for_elink = pmid if pmid else doi
-        id_type_for_elink = "pmid" if pmid else "doi"
+        # Step 3: Elink 'prlinks' (XML) & Scrapers
+        identifier_for_elink_xml = pmid if pmid else doi
+        id_type_for_elink_xml = "pmid" if pmid else "doi"
 
-        if identifier_for_elink:
-            logger.debug(f"DOI {doi}: Attempting Elink for {id_type_for_elink}: {identifier_for_elink}.", extra={"doi": doi, "identifier": identifier_for_elink, "id_type": id_type_for_elink, "event_type": "elink_attempt"})
+        if identifier_for_elink_xml:
+            tried_sources.append("Elink_prlinks_XML")
+            logger.debug(f"DOI {doi}: Attempting Elink (prlinks XML) for {id_type_for_elink_xml}: {identifier_for_elink_xml}.", extra={"doi": doi, "identifier": identifier_for_elink_xml, "id_type": id_type_for_elink_xml, "event_type": "elink_prlinks_attempt"})
             async with SEMAPHORE_NCBI_ELINK:
                 try:
-                    article_links = await elink_pubmed.get_article_links(identifier=identifier_for_elink, id_type=id_type_for_elink)
-                    if article_links:
-                        logger.info(f"DOI {doi}: Elink found {len(article_links)} links for {id_type_for_elink}: {identifier_for_elink}.", extra={"doi": doi, "count": len(article_links), "event_type": "elink_links_count_found"})
-                        for link_url in article_links:
-                            logger.debug(f"DOI {doi}: Processing Elink URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "elink_url_processing_start"})
-                            
+                    # Use the renamed XML-specific function
+                    article_links_xml = await elink_pubmed._get_article_links_by_id_type_xml(identifier=identifier_for_elink_xml, id_type=id_type_for_elink_xml)
+                    if article_links_xml:
+                        logger.info(f"DOI {doi}: Elink (prlinks XML) found {len(article_links_xml)} links for {id_type_for_elink_xml}: {identifier_for_elink_xml}.", extra={"doi": doi, "count": len(article_links_xml), "event_type": "elink_prlinks_links_count_found"})
+                        for link_url in article_links_xml:
+                            logger.debug(f"DOI {doi}: Processing Elink (prlinks XML) URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "elink_prlinks_url_processing_start"})
                             current_domain_for_call = urlparse(link_url).netloc
                             cookies_for_this_call = session_cookies_by_domain.get(current_domain_for_call)
-
                             async with SEMAPHORE_GENERAL_SCRAPING:
                                 content_result = await resolve_pdf_link.resolve_content(link_url, client=http_client, original_doi_for_referer=doi, session_cookies=cookies_for_this_call)
-                            
-                            # Update cookies from resolve_content result
                             _update_session_cookies(content_result, doi)
 
                             if content_result.type == "file":
                                 md = await parse_pdf_to_markdown(content_result.path)
                                 if md:
-                                    logger.info(f"DOI {doi}: Elink PDF to Markdown success from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "elink_pdf_success"})
-                                    await write_to_cache(doi, {"status": "success", "markdown": md, "source": f"Elink_PDF ({link_url})"})
-                                    return md, f"Retrieved PDF via Elink ({link_url}) and parsed"
+                                    logger.info(f"DOI {doi}: Elink (prlinks XML) PDF to Markdown success from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "elink_prlinks_pdf_success"})
+                                    await write_to_cache(doi, {"status": "success", "markdown": md, "source": f"Elink_prlinks_PDF ({link_url})"})
+                                    return md, f"Retrieved PDF via Elink (prlinks XML) ({link_url}) and parsed", tried_sources
                             elif content_result.type == "html":
-                                logger.info(f"DOI {doi}: Elink HTML success from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "elink_html_success"})
-                                await write_to_cache(doi, {"status": "success", "markdown": content_result.text, "source": f"Elink_HTML ({link_url})"})
-                                return content_result.text, f"Retrieved HTML via Elink ({link_url})"
+                                # Check length before returning
+                                if content_result.text and len(content_result.text) > resolve_pdf_link.MIN_HTML_CONTENT_LENGTH:
+                                    logger.info(f"DOI {doi}: Elink (prlinks XML) HTML success from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "elink_prlinks_html_success"})
+                                    await write_to_cache(doi, {"status": "success", "markdown": content_result.text, "source": f"Elink_prlinks_HTML ({link_url})"})
+                                    return content_result.text, f"Retrieved HTML via Elink (prlinks XML) ({link_url})", tried_sources
+                            # ... (rest of advanced_scraper fallback for prlinks)
                             else: 
-                                logger.warning(f"DOI {doi}: resolve_content failed for Elink URL: {link_url}. Reason: {content_result.reason}. Trying advanced_scraper.", extra={"doi": doi, "url": link_url, "reason": content_result.reason, "event_type": "elink_resolve_fail_try_advanced"})
-                                
-                                cookies_for_this_call = session_cookies_by_domain.get(current_domain_for_call) # Re-fetch, might have been updated
+                                logger.warning(f"DOI {doi}: resolve_content failed for Elink (prlinks XML) URL: {link_url}. Reason: {content_result.reason}. Trying advanced_scraper.", extra={"doi": doi, "url": link_url, "reason": content_result.reason, "event_type": "elink_prlinks_resolve_fail_try_advanced"})
+                                cookies_for_this_call = session_cookies_by_domain.get(current_domain_for_call) 
                                 async with SEMAPHORE_GENERAL_SCRAPING:
                                     advanced_result = await advanced_scraper.scrape_with_fallback(
-                                        link_url,
-                                        original_doi_for_referer=doi, # Pass original DOI
-                                        session_cookies=cookies_for_this_call
+                                        link_url, original_doi_for_referer=doi, session_cookies=cookies_for_this_call
                                     )
-                                
-                                # Update cookies from advanced_scraper result
                                 _update_session_cookies(advanced_result, doi)
-
                                 if advanced_result.type == "file":
                                     md = await parse_pdf_to_markdown(advanced_result.path)
                                     if md:
-                                        logger.info(f"DOI {doi}: Advanced scraper PDF success (from Elink path) from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "elink_advanced_pdf_success"})
-                                        await write_to_cache(doi, {"status": "success", "markdown": md, "source": f"Elink_AdvancedScraper_PDF ({link_url})"})
-                                        return md, f"Retrieved PDF via Elink > Advanced Scraper ({link_url}) and parsed"
+                                        logger.info(f"DOI {doi}: Advanced scraper PDF success (from Elink prlinks path) from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "elink_prlinks_advanced_pdf_success"})
+                                        await write_to_cache(doi, {"status": "success", "markdown": md, "source": f"Elink_prlinks_AdvancedScraper_PDF ({link_url})"})
+                                        return md, f"Retrieved PDF via Elink (prlinks) > Advanced Scraper ({link_url}) and parsed", tried_sources
                                 elif advanced_result.type == "html":
-                                    logger.info(f"DOI {doi}: Advanced scraper HTML success (from Elink path) from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "elink_advanced_html_success"})
-                                    await write_to_cache(doi, {"status": "success", "markdown": advanced_result.text, "source": f"Elink_AdvancedScraper_HTML ({link_url})"})
-                                    return advanced_result.text, f"Retrieved HTML via Elink > Advanced Scraper ({link_url})"
-                                elif advanced_result.type == "pdf_bytes": # Handle PDFBytesResult
-                                    # parse_pdf_to_markdown needs a path. Write bytes to temp file.
-                                    # This part needs careful implementation for temp file handling.
-                                    # For now, let's assume parse_pdf_to_markdown can handle bytes or we adapt it.
-                                    # Simplified: if parse_pdf_to_markdown is adapted to take bytes:
-                                    # md = await parse_pdf_to_markdown(pdf_bytes=advanced_result.content)
-                                    # For now, sticking to path-based:
+                                    if advanced_result.text and len(advanced_result.text) > resolve_pdf_link.MIN_HTML_CONTENT_LENGTH:
+                                        logger.info(f"DOI {doi}: Advanced scraper HTML success (from Elink prlinks path) from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "elink_prlinks_advanced_html_success"})
+                                        await write_to_cache(doi, {"status": "success", "markdown": advanced_result.text, "source": f"Elink_prlinks_AdvancedScraper_HTML ({link_url})"})
+                                        return advanced_result.text, f"Retrieved HTML via Elink (prlinks) > Advanced Scraper ({link_url})", tried_sources
+                                elif advanced_result.type == "pdf_bytes":
                                     temp_pdf_path = None
                                     try:
-                                        import tempfile
                                         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
                                             tmp_file.write(advanced_result.content)
                                             temp_pdf_path = tmp_file.name
                                         md = await parse_pdf_to_markdown(temp_pdf_path)
                                         if md:
-                                            logger.info(f"DOI {doi}: Advanced scraper PDFBytes success (from Elink path) from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "elink_advanced_pdfbytes_success"})
-                                            await write_to_cache(doi, {"status": "success", "markdown": md, "source": f"Elink_AdvancedScraper_PDFBytes ({link_url})"})
-                                            return md, f"Retrieved PDF (bytes) via Elink > Advanced Scraper ({link_url}) and parsed"
+                                            logger.info(f"DOI {doi}: Advanced scraper PDFBytes success (from Elink prlinks path) from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "elink_prlinks_advanced_pdfbytes_success"})
+                                            await write_to_cache(doi, {"status": "success", "markdown": md, "source": f"Elink_prlinks_AdvancedScraper_PDFBytes ({link_url})"})
+                                            return md, f"Retrieved PDF (bytes) via Elink (prlinks) > Advanced Scraper ({link_url}) and parsed", tried_sources
                                     finally:
-                                        if temp_pdf_path and os.path.exists(temp_pdf_path):
-                                            os.remove(temp_pdf_path)
+                                        if temp_pdf_path and os.path.exists(temp_pdf_path): os.remove(temp_pdf_path)
                                 else:
-                                    logger.warning(f"DOI {doi}: Advanced scraper also failed for Elink URL: {link_url}. Reason: {advanced_result.reason}", extra={"doi": doi, "url": link_url, "reason": advanced_result.reason, "event_type": "elink_advanced_fail"})
+                                    logger.warning(f"DOI {doi}: Advanced scraper also failed for Elink (prlinks XML) URL: {link_url}. Reason: {advanced_result.reason}", extra={"doi": doi, "url": link_url, "reason": advanced_result.reason, "event_type": "elink_prlinks_advanced_fail"})
                     else:
-                        logger.debug(f"DOI {doi}: No links found by Elink for {id_type_for_elink}: {identifier_for_elink}", extra={"doi": doi, "event_type": "elink_no_links"})
+                        logger.debug(f"DOI {doi}: No links found by Elink (prlinks XML) for {id_type_for_elink_xml}: {identifier_for_elink_xml}", extra={"doi": doi, "event_type": "elink_prlinks_no_links"})
                 except Exception as e:
-                    logger.error(f"DOI {doi}: Error during Elink processing for {id_type_for_elink} {identifier_for_elink}: {e}", exc_info=True, extra={"doi": doi, "event_type": "elink_exception"})
+                    logger.error(f"DOI {doi}: Error during Elink (prlinks XML) processing for {id_type_for_elink_xml} {identifier_for_elink_xml}: {e}", exc_info=True, extra={"doi": doi, "event_type": "elink_prlinks_exception"})
         else:
-            logger.debug(f"DOI {doi}: No PMID or DOI available for Elink, skipping.", extra={"doi": doi, "event_type": "elink_skip_no_id"})
+            logger.debug(f"DOI {doi}: No PMID or DOI available for Elink (prlinks XML), skipping.", extra={"doi": doi, "event_type": "elink_prlinks_skip_no_id"})
 
         # Step 4: Unpaywall & Scrapers
+        tried_sources.append("Unpaywall")
         logger.debug(f"DOI {doi}: Attempting Unpaywall.", extra={"doi": doi, "event_type": "unpaywall_attempt"})
         async with SEMAPHORE_UNPAYWALL:
             try:
                 oa_url = await retrieve_unpaywall.get_unpaywall_oa_url(doi, session=aio_session)
-                if oa_url and not isinstance(oa_url, str): # Add check
+                if oa_url and not isinstance(oa_url, str): 
                     logger.error(f"DOI {doi}: Unpaywall returned non-string OA URL: {type(oa_url)}. Treating as no URL.", extra={"doi": doi, "event_type": "unpaywall_non_string_url"})
                     oa_url = None
                 if oa_url:
                     logger.debug(f"DOI {doi}: Unpaywall found OA URL: {oa_url}", extra={"doi": doi, "url": oa_url, "event_type": "unpaywall_url_found"})
-                    
                     current_domain_for_call = urlparse(oa_url).netloc
                     cookies_for_this_call = session_cookies_by_domain.get(current_domain_for_call)
-                    
                     async with SEMAPHORE_GENERAL_SCRAPING:
                         content_result = await resolve_pdf_link.resolve_content(oa_url, client=http_client, original_doi_for_referer=doi, session_cookies=cookies_for_this_call)
-                    
-                    # Update cookies from resolve_content result
                     _update_session_cookies(content_result, doi)
 
                     if content_result.type == "file":
@@ -331,40 +347,34 @@ async def get_full_text_for_doi(
                         if md:
                             logger.info(f"DOI {doi}: Unpaywall PDF to Markdown success from URL: {oa_url}", extra={"doi": doi, "url": oa_url, "event_type": "unpaywall_pdf_success"})
                             await write_to_cache(doi, {"status": "success", "markdown": md, "source": f"Unpaywall_PDF ({oa_url})"})
-                            return md, f"Retrieved PDF via Unpaywall ({oa_url}) and parsed"
+                            return md, f"Retrieved PDF via Unpaywall ({oa_url}) and parsed", tried_sources
                     elif content_result.type == "html":
-                        logger.info(f"DOI {doi}: Unpaywall HTML success from URL: {oa_url}", extra={"doi": doi, "url": oa_url, "event_type": "unpaywall_html_success"})
-                        await write_to_cache(doi, {"status": "success", "markdown": content_result.text, "source": f"Unpaywall_HTML ({oa_url})"})
-                        return content_result.text, f"Retrieved HTML via Unpaywall ({oa_url})"
+                        if content_result.text and len(content_result.text) > resolve_pdf_link.MIN_HTML_CONTENT_LENGTH:
+                            logger.info(f"DOI {doi}: Unpaywall HTML success from URL: {oa_url}", extra={"doi": doi, "url": oa_url, "event_type": "unpaywall_html_success"})
+                            await write_to_cache(doi, {"status": "success", "markdown": content_result.text, "source": f"Unpaywall_HTML ({oa_url})"})
+                            return content_result.text, f"Retrieved HTML via Unpaywall ({oa_url})", tried_sources
                     else: 
                         logger.warning(f"DOI {doi}: resolve_content failed for Unpaywall URL: {oa_url}. Reason: {content_result.reason}. Trying advanced_scraper.", extra={"doi": doi, "url": oa_url, "reason": content_result.reason, "event_type": "unpaywall_resolve_fail_try_advanced"})
-                        
-                        cookies_for_this_call = session_cookies_by_domain.get(current_domain_for_call) # Re-fetch
+                        cookies_for_this_call = session_cookies_by_domain.get(current_domain_for_call)
                         async with SEMAPHORE_GENERAL_SCRAPING:
-                            # Pass original_doi_for_referer to advanced_scraper in Unpaywall path as well
                             advanced_result = await advanced_scraper.scrape_with_fallback(
-                                url=oa_url, # Explicitly name url argument
-                                original_doi_for_referer=doi, 
-                                session_cookies=cookies_for_this_call
+                                url=oa_url, original_doi_for_referer=doi, session_cookies=cookies_for_this_call
                             )
-                        
-                        # Update cookies from advanced_scraper result
                         _update_session_cookies(advanced_result, doi)
-
                         if advanced_result.type == "file":
                             md = await parse_pdf_to_markdown(advanced_result.path)
                             if md:
                                 logger.info(f"DOI {doi}: Advanced scraper PDF success (from Unpaywall path) for URL: {oa_url}", extra={"doi": doi, "url": oa_url, "event_type": "unpaywall_advanced_pdf_success"})
                                 await write_to_cache(doi, {"status": "success", "markdown": md, "source": f"Unpaywall_AdvancedScraper_PDF ({oa_url})"})
-                                return md, f"Retrieved PDF via Unpaywall > Advanced Scraper ({oa_url}) and parsed"
+                                return md, f"Retrieved PDF via Unpaywall > Advanced Scraper ({oa_url}) and parsed", tried_sources
                         elif advanced_result.type == "html":
-                            logger.info(f"DOI {doi}: Advanced scraper HTML success (from Unpaywall path) for URL: {oa_url}", extra={"doi": doi, "url": oa_url, "event_type": "unpaywall_advanced_html_success"})
-                            await write_to_cache(doi, {"status": "success", "markdown": advanced_result.text, "source": f"Unpaywall_AdvancedScraper_HTML ({oa_url})"})
-                            return advanced_result.text, f"Retrieved HTML via Unpaywall > Advanced Scraper ({oa_url})"
+                             if advanced_result.text and len(advanced_result.text) > resolve_pdf_link.MIN_HTML_CONTENT_LENGTH:
+                                logger.info(f"DOI {doi}: Advanced scraper HTML success (from Unpaywall path) for URL: {oa_url}", extra={"doi": doi, "url": oa_url, "event_type": "unpaywall_advanced_html_success"})
+                                await write_to_cache(doi, {"status": "success", "markdown": advanced_result.text, "source": f"Unpaywall_AdvancedScraper_HTML ({oa_url})"})
+                                return advanced_result.text, f"Retrieved HTML via Unpaywall > Advanced Scraper ({oa_url})", tried_sources
                         elif advanced_result.type == "pdf_bytes":
                             temp_pdf_path = None
                             try:
-                                import tempfile
                                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
                                     tmp_file.write(advanced_result.content)
                                     temp_pdf_path = tmp_file.name
@@ -372,21 +382,92 @@ async def get_full_text_for_doi(
                                 if md:
                                     logger.info(f"DOI {doi}: Advanced scraper PDFBytes success (from Unpaywall path) for URL: {oa_url}", extra={"doi": doi, "url": oa_url, "event_type": "unpaywall_advanced_pdfbytes_success"})
                                     await write_to_cache(doi, {"status": "success", "markdown": md, "source": f"Unpaywall_AdvancedScraper_PDFBytes ({oa_url})"})
-                                    return md, f"Retrieved PDF (bytes) via Unpaywall > Advanced Scraper ({oa_url}) and parsed"
+                                    return md, f"Retrieved PDF (bytes) via Unpaywall > Advanced Scraper ({oa_url}) and parsed", tried_sources
                             finally:
-                                if temp_pdf_path and os.path.exists(temp_pdf_path):
-                                    os.remove(temp_pdf_path)
+                                if temp_pdf_path and os.path.exists(temp_pdf_path): os.remove(temp_pdf_path)
                         else:
                             logger.warning(f"DOI {doi}: Advanced scraper also failed for Unpaywall URL: {oa_url}. Reason: {advanced_result.reason}", extra={"doi": doi, "url": oa_url, "reason": advanced_result.reason, "event_type": "unpaywall_advanced_fail"})
                 else:
                     logger.debug(f"DOI {doi}: No OA URL found by Unpaywall.", extra={"doi": doi, "event_type": "unpaywall_no_url"})
             except Exception as e:
                 logger.error(f"DOI {doi}: Error during Unpaywall processing: {e}", exc_info=True, extra={"doi": doi, "event_type": "unpaywall_exception"})
+        
+        # Step 5: PubMed LinkOut (llinks JSON) - NEW
+        if pmid and not current_markdown_content: # Only try if PMID exists and no content found yet
+            tried_sources.append("PubMed_LinkOut_llinks")
+            logger.debug(f"DOI {doi}, PMID {pmid}: Attempting PubMed LinkOut (llinks).", extra={"doi": doi, "pmid": pmid, "event_type": "pubmed_linkout_llinks_attempt"})
+            async with SEMAPHORE_NCBI_ELINK: # Reuse Elink semaphore or define a new one if different rate limits apply
+                try:
+                    linkout_urls = await elink_pubmed.get_article_links(pmid=pmid) # Call the new JSON-based function
+                    if linkout_urls:
+                        logger.info(f"DOI {doi}, PMID {pmid}: PubMed LinkOut (llinks) found {len(linkout_urls)} links.", extra={"doi": doi, "pmid": pmid, "count": len(linkout_urls), "event_type": "pubmed_linkout_llinks_found"})
+                        for link_url in linkout_urls:
+                            logger.debug(f"DOI {doi}: Processing PubMed LinkOut (llinks) URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "pubmed_linkout_llinks_url_processing_start"})
+                            current_domain_for_call = urlparse(link_url).netloc
+                            cookies_for_this_call = session_cookies_by_domain.get(current_domain_for_call)
+                            async with SEMAPHORE_GENERAL_SCRAPING:
+                                content_result = await resolve_pdf_link.resolve_content(link_url, client=http_client, original_doi_for_referer=doi, session_cookies=cookies_for_this_call)
+                            _update_session_cookies(content_result, doi)
+
+                            if content_result.type == "file":
+                                md = await parse_pdf_to_markdown(content_result.path)
+                                if md:
+                                    logger.info(f"DOI {doi}: PubMed LinkOut (llinks) PDF to Markdown success from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "pubmed_linkout_llinks_pdf_success"})
+                                    await write_to_cache(doi, {"status": "success", "markdown": md, "source": f"PubMed_LinkOut_llinks_PDF ({link_url})"})
+                                    return md, f"Retrieved PDF via PubMed LinkOut (llinks) ({link_url}) and parsed", tried_sources
+                            elif content_result.type == "html":
+                                if content_result.text and len(content_result.text) > resolve_pdf_link.MIN_HTML_CONTENT_LENGTH:
+                                    logger.info(f"DOI {doi}: PubMed LinkOut (llinks) HTML success from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "pubmed_linkout_llinks_html_success"})
+                                    await write_to_cache(doi, {"status": "success", "markdown": content_result.text, "source": f"PubMed_LinkOut_llinks_HTML ({link_url})"})
+                                    return content_result.text, f"Retrieved HTML via PubMed LinkOut (llinks) ({link_url})", tried_sources
+                            else: # resolve_content failed for this LinkOut URL
+                                logger.warning(f"DOI {doi}: resolve_content failed for PubMed LinkOut (llinks) URL: {link_url}. Reason: {content_result.reason}. Trying advanced_scraper.", extra={"doi": doi, "url": link_url, "reason": content_result.reason, "event_type": "pubmed_linkout_llinks_resolve_fail_try_advanced"})
+                                cookies_for_this_call = session_cookies_by_domain.get(current_domain_for_call)
+                                async with SEMAPHORE_GENERAL_SCRAPING:
+                                    advanced_result = await advanced_scraper.scrape_with_fallback(
+                                        link_url, original_doi_for_referer=doi, session_cookies=cookies_for_this_call
+                                    )
+                                _update_session_cookies(advanced_result, doi)
+                                if advanced_result.type == "file":
+                                    md = await parse_pdf_to_markdown(advanced_result.path)
+                                    if md:
+                                        logger.info(f"DOI {doi}: Advanced scraper PDF success (from PubMed LinkOut llinks path) from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "pubmed_linkout_llinks_advanced_pdf_success"})
+                                        await write_to_cache(doi, {"status": "success", "markdown": md, "source": f"PubMed_LinkOut_llinks_AdvancedScraper_PDF ({link_url})"})
+                                        return md, f"Retrieved PDF via PubMed LinkOut (llinks) > Advanced Scraper ({link_url}) and parsed", tried_sources
+                                elif advanced_result.type == "html":
+                                    if advanced_result.text and len(advanced_result.text) > resolve_pdf_link.MIN_HTML_CONTENT_LENGTH:
+                                        logger.info(f"DOI {doi}: Advanced scraper HTML success (from PubMed LinkOut llinks path) from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "pubmed_linkout_llinks_advanced_html_success"})
+                                        await write_to_cache(doi, {"status": "success", "markdown": advanced_result.text, "source": f"PubMed_LinkOut_llinks_AdvancedScraper_HTML ({link_url})"})
+                                        return advanced_result.text, f"Retrieved HTML via PubMed LinkOut (llinks) > Advanced Scraper ({link_url})", tried_sources
+                                elif advanced_result.type == "pdf_bytes":
+                                    temp_pdf_path = None
+                                    try:
+                                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                                            tmp_file.write(advanced_result.content)
+                                            temp_pdf_path = tmp_file.name
+                                        md = await parse_pdf_to_markdown(temp_pdf_path)
+                                        if md:
+                                            logger.info(f"DOI {doi}: Advanced scraper PDFBytes success (from PubMed LinkOut llinks path) from URL: {link_url}", extra={"doi": doi, "url": link_url, "event_type": "pubmed_linkout_llinks_advanced_pdfbytes_success"})
+                                            await write_to_cache(doi, {"status": "success", "markdown": md, "source": f"PubMed_LinkOut_llinks_AdvancedScraper_PDFBytes ({link_url})"})
+                                            return md, f"Retrieved PDF (bytes) via PubMed LinkOut (llinks) > Advanced Scraper ({link_url}) and parsed", tried_sources
+                                    finally:
+                                        if temp_pdf_path and os.path.exists(temp_pdf_path): os.remove(temp_pdf_path)
+                                else:
+                                    logger.warning(f"DOI {doi}: Advanced scraper also failed for PubMed LinkOut (llinks) URL: {link_url}. Reason: {advanced_result.reason}", extra={"doi": doi, "url": link_url, "reason": advanced_result.reason, "event_type": "pubmed_linkout_llinks_advanced_fail"})
+                    else:
+                        logger.debug(f"DOI {doi}, PMID {pmid}: No links found by PubMed LinkOut (llinks).", extra={"doi": doi, "pmid": pmid, "event_type": "pubmed_linkout_llinks_no_links"})
+                except Exception as e:
+                    logger.error(f"DOI {doi}, PMID {pmid}: Error during PubMed LinkOut (llinks) processing: {e}", exc_info=True, extra={"doi": doi, "pmid": pmid, "event_type": "pubmed_linkout_llinks_exception"})
+        else:
+            if not pmid:
+                logger.debug(f"DOI {doi}: No PMID available, skipping PubMed LinkOut (llinks).", extra={"doi": doi, "event_type": "pubmed_linkout_llinks_skip_no_pmid"})
+            # If pmid exists but current_markdown_content is already found, this block is skipped.
 
     # If all steps fail
-    logger.warning(f"DOI {doi}: All retrieval attempts failed.", extra={"doi": doi, "event_type": "doi_retrieval_failed_all_steps"})
-    await write_to_cache(doi, {"status": "failure", "reason": "All retrieval methods failed"})
-    return None, "Full text not found after all attempts"
+    failure_reason = f"All retrieval methods failed. Tried: {', '.join(tried_sources) if tried_sources else 'None'}."
+    logger.warning(f"DOI {doi}: {failure_reason}", extra={"doi": doi, "tried_sources": tried_sources, "event_type": "doi_retrieval_failed_all_steps"})
+    await write_to_cache(doi, {"status": "failure", "reason": failure_reason})
+    return None, "Full text not found after all attempts", tried_sources
 
 
 # --- Main Entry Point ---
@@ -626,37 +707,48 @@ async def retrieve_full_texts_for_dois(
     # This semaphore limits how many get_full_text_for_doi coroutines run at once.
     # Individual semaphores inside get_full_text_for_doi control service-specific concurrency.
     processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOI_PROCESSING)
-    results_with_status: List[Tuple[Optional[str], str]] = []
-
+    
     async def worker(task_coro):
         async with processing_semaphore:
             return await task_coro
 
     # Gather results
-    # results_with_status will be a list of (markdown_content, status_message) tuples
-    # in the same order as articles_to_process
+    # raw_results will be a list of (markdown_content, status_message, tried_sources) tuples
+    # or Exception instances, in the same order as articles_to_process
     raw_results = await asyncio.gather(*(worker(task) for task in tasks), return_exceptions=True)
-
-    # Update the original query_refiner_output structure
     
     # Create a map of DOI to its result for easier lookup
-    doi_to_result_map: Dict[str, Tuple[Optional[str], str]] = {}
+    # The value in the map will be (markdown_content, status_message, tried_sources_list)
+    doi_to_result_map: Dict[str, Tuple[Optional[str], str, List[str]]] = {}
     for i, article_data in enumerate(articles_to_process):
         doi = article_data["doi"]
         result_item = raw_results[i]
         if isinstance(result_item, Exception):
             logger.error(f"Unhandled exception for DOI {doi}: {result_item}", exc_info=result_item, extra={"doi": doi, "event_type": "doi_processing_unhandled_exception"})
-            doi_to_result_map[doi] = (None, f"Error: {str(result_item)}")
+            # Ensure a list of tried_sources (empty if error before any attempt)
+            doi_to_result_map[doi] = (None, f"Error: {str(result_item)}", []) 
+        elif isinstance(result_item, tuple) and len(result_item) == 3:
+            doi_to_result_map[doi] = result_item # (markdown, status, tried_sources)
         else:
-            doi_to_result_map[doi] = result_item # (markdown, status)
+            # Should not happen if get_full_text_for_doi always returns 3 items or raises
+            logger.error(f"Unexpected result format for DOI {doi}: {result_item}", extra={"doi": doi, "event_type": "doi_processing_unexpected_result_format"})
+            doi_to_result_map[doi] = (None, "Error: Unexpected result format from retrieval function", [])
+
 
     # Iterate through the original list of triaged_articles and update them
-    for original_article in original_articles_list: # Use the fetched list
-        updated_article = original_article.copy() # Start with a copy
+    for original_article in original_articles_list: 
+        updated_article = original_article.copy() 
         doi = original_article.get("doi")
         
-        if doi and doi in doi_to_result_map: # If this DOI was processed
-            markdown_content, status_message = doi_to_result_map[doi]
+        if doi and doi in doi_to_result_map: 
+            markdown_content, status_message, tried_sources_list = doi_to_result_map[doi]
+            
+            # Update status message if it's a failure and we have tried_sources
+            if not markdown_content and tried_sources_list:
+                 status_message = f"Full text not found. Tried: {', '.join(tried_sources_list)}."
+            elif not markdown_content: # No markdown, no tried_sources (e.g. early error)
+                 status_message = status_message # Keep original error message
+            
             if markdown_content:
                 updated_article["fulltext"] = markdown_content
                 updated_article["fulltext_retrieval_status"] = "success"
@@ -665,12 +757,14 @@ async def retrieve_full_texts_for_dois(
                 updated_article["fulltext"] = None
                 updated_article["fulltext_retrieval_status"] = "failure"
                 updated_article["fulltext_retrieval_message"] = status_message
+            
+            # Add tried_sources to the article for transparency, if desired
+            # updated_article["fulltext_retrieval_sources_attempted"] = tried_sources_list
+
         elif original_article.get("relevance_score", 0) not in [4, 5]:
-            # Article was not processed due to relevance score, mark as skipped
             updated_article["fulltext_retrieval_status"] = "skipped_relevance"
             updated_article["fulltext_retrieval_message"] = "Not processed due to relevance score"
         else:
-            # Article should have been processed but wasn't (e.g. no DOI)
             updated_article["fulltext_retrieval_status"] = "skipped_no_doi"
             updated_article["fulltext_retrieval_message"] = "Not processed, DOI missing or other issue pre-processing"
             

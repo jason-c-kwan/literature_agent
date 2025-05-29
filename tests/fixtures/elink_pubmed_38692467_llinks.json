@@ -1,0 +1,92 @@
+{
+  "header": {
+    "type": "esummary",
+    "version": "2.0"
+  },
+  "linksets": [
+    {
+      "dbfrom": "pubmed",
+      "idurls": {
+        "38692467": {
+          "objurls": [
+            {
+              "url": {
+                "$": "https://www.example.com/some_html_page_for_38692467",
+                "lang": "en",
+                "type": "text/html"
+              },
+              "iconurl": "https://www.example.com/icon.png",
+              "linktext": "Full Text Article",
+              "provider": {
+                "name": "Example Publisher",
+                "nameabbr": "EXPUB",
+                "id": "1234"
+              },
+              "attributes": [
+                "full-text online"
+              ],
+              "category": "Full Text"
+            },
+            {
+              "url": {
+                "$": "https://www.example.com/fulltext/38692467.pdf",
+                "lang": "en",
+                "type": "application/pdf"
+              },
+              "iconurl": "https://www.example.com/pdf_icon.png",
+              "linktext": "Free Full Text PDF",
+              "provider": {
+                "name": "Another Example Publisher",
+                "nameabbr": "AEXPUB",
+                "id": "5678"
+              },
+              "attributes": [
+                "full-text online",
+                "subscription/paid access"
+              ],
+              "category": "Full Text"
+            },
+            {
+              "url": {
+                "$": "https://europepmc.org/articles/PMC1234567?pdf=render",
+                "lang": "en",
+                "type": "application/pdf"
+              },
+              "iconurl": "https://europepmc.org/icon.gif",
+              "linktext": "Europe PMC PDF",
+              "provider": {
+                "name": "Europe PMC",
+                "nameabbr": "Europe PMC",
+                "id": "2222"
+              },
+              "attributes": [
+                "full-text online",
+                "open access"
+              ],
+              "category": "Full Text"
+            },
+            {
+              "url": {
+                "$": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9876543/",
+                "lang": "en",
+                "type": "text/html"
+              },
+              "iconurl": "https://www.ncbi.nlm.nih.gov/pmc/icon.png",
+              "linktext": "PubMed Central HTML",
+              "provider": {
+                "name": "PubMed Central",
+                "nameabbr": "PMC",
+                "id": "0001"
+              },
+              "attributes": [
+                "full-text online",
+                "open access"
+              ],
+              "category": "Full Text"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

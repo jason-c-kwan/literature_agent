@@ -122,10 +122,10 @@ async def _convert_to_pmid(identifier: str, id_type_tag: str) -> Optional[str]:
     
     return None
 
-async def get_pubmed_prlinks(pmid: str) -> List[str]:
+async def _get_pubmed_prlinks_xml(pmid: str) -> List[str]:
     """
     Obtains publisher-provided full-text or PDF links for a given PubMed ID
-    via NCBI ELink's "prlinks" command using httpx and manual XML parsing.
+    via NCBI ELink's "prlinks" command (XML output) using httpx and manual XML parsing.
     """
     urls: List[str] = []
     if not pmid or not pmid.strip():
@@ -212,10 +212,10 @@ async def get_pubmed_prlinks(pmid: str) -> List[str]:
 
     return list(set(urls))
 
-async def get_article_links(identifier: str, id_type: str) -> List[str]:
+async def _get_article_links_by_id_type_xml(identifier: str, id_type: str) -> List[str]:
     """
     Obtains publisher-provided full-text or PDF links for a given article identifier
-    (PMID, DOI, or PMC ID).
+    (PMID, DOI, or PMC ID) using the ELink 'prlinks' command (XML output).
 
     Args:
         identifier: The article identifier string.
@@ -242,13 +242,138 @@ async def get_article_links(identifier: str, id_type: str) -> List[str]:
         return []
 
     if pmid_to_use:
-        return await get_pubmed_prlinks(pmid_to_use)
+        return await _get_pubmed_prlinks_xml(pmid_to_use)
     else:
-        print(f"Could not obtain PMID for identifier '{identifier}' (type: {id_type}). Cannot fetch links.")
+        print(f"Could not obtain PMID for identifier '{identifier}' (type: {id_type}). Cannot fetch links via XML prlinks.")
         return []
+
+async def get_article_links(pmid: str) -> List[str]:
+    """
+    Retrieves full-text article links from PubMed LinkOut using the 'llinks' command.
+
+    This function queries the NCBI ELink utility for a given PubMed ID (PMID)
+    to find associated links, specifically looking for those likely to lead to
+    full text (e.g., "Free full text", "PDF", "PubMed Central").
+
+    Args:
+        pmid: The PubMed ID (PMID) of the article.
+
+    Returns:
+        A list of unique URLs that are likely to provide access to the
+        full text of the article, preserving the order of discovery.
+        Returns an empty list if no suitable links are found or if an
+        error occurs.
+    """
+    if not pmid or not pmid.strip():
+        print(f"Error: PMID is empty or invalid for get_article_links (llinks).")
+        return []
+
+    print(f"Attempting to get article links (llinks) for PMID: {pmid}...")
+    
+    request_params: Dict[str, Any] = {
+        "dbfrom": "pubmed",
+        "id": pmid.strip(),
+        "cmd": "llinks", # Command for LinkOut links
+        "retmode": "json", # Request JSON response
+        "tool": TOOL_NAME, 
+        "email": API_EMAIL,
+    }
+    if PUBMED_API_KEY:
+        request_params["api_key"] = PUBMED_API_KEY
+    
+    request_params = {k: v for k, v in request_params.items() if v is not None}
+
+    link_keywords = ["Free full text", "Full Text", "PubMed Central", "Europe PMC", "PDF"]
+    found_urls: List[str] = []
+
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await _execute_ncbi_utility_request(client, NCBI_ELINK_URL, request_params)
+                response.raise_for_status() 
+
+            response_json = response.json()
+            
+            linksets = response_json.get("linksets")
+            if not linksets or not isinstance(linksets, list) or not linksets:
+                print(f"No 'linksets' found or invalid format in ELink JSON response for PMID {pmid}.")
+                return []
+
+            first_linkset = linksets[0]
+            if not isinstance(first_linkset, dict):
+                print(f"First linkset is not a dictionary for PMID {pmid}.")
+                return []
+            
+            idurls_data = first_linkset.get("idurls")
+            if not idurls_data or not isinstance(idurls_data, dict):
+                print(f"No 'idurls' dictionary found in ELink JSON for PMID {pmid}.")
+                return []
+
+            pmid_key_in_json = pmid.strip()
+            pmid_specific_links_data = idurls_data.get(pmid_key_in_json)
+            if not pmid_specific_links_data or not isinstance(pmid_specific_links_data, dict):
+                print(f"No link data found for PMID key '{pmid_key_in_json}' in 'idurls' for PMID {pmid}.")
+                return []
+            
+            objurls = pmid_specific_links_data.get("objurls")
+            if not objurls or not isinstance(objurls, list):
+                print(f"No 'objurls' list found for PMID {pmid}, though PMID key was present.")
+                return []
+
+            for obj_url_entry in objurls:
+                if not isinstance(obj_url_entry, dict):
+                    continue
+
+                url_info = obj_url_entry.get("url")
+                if not url_info or not isinstance(url_info, dict) or not url_info.get("$"):
+                    continue 
+
+                url_str = url_info["$"]
+                
+                link_text = obj_url_entry.get("linktext", "").lower()
+                provider_name = ""
+                provider_info = obj_url_entry.get("provider")
+                if provider_info and isinstance(provider_info, dict):
+                    provider_name = provider_info.get("name", "").lower()
+
+                if any(keyword.lower() in link_text for keyword in link_keywords) or \
+                   any(keyword.lower() in provider_name for keyword in link_keywords):
+                    if url_str not in found_urls: 
+                        found_urls.append(url_str)
+            
+            print(f"Found {len(found_urls)} relevant LinkOut URLs for PMID {pmid}.")
+            return found_urls
+
+        except httpx.HTTPStatusError as e:
+            print(f"HTTP error during ELink (llinks) for PMID {pmid} (attempt {attempt + 1}/{RETRY_ATTEMPTS}): {e.response.status_code} - {e.response.text}")
+            if e.response.status_code == 429 and attempt < RETRY_ATTEMPTS - 1:
+                print("Rate limit (429) hit for ELink (llinks), retrying after delay...")
+            elif e.response.status_code in [400, 404] or attempt == RETRY_ATTEMPTS - 1:
+                break 
+        except RateLimitException:
+            print(f"Rate limit actively hit by decorator during ELink (llinks) for PMID {pmid} (attempt {attempt + 1}/{RETRY_ATTEMPTS}).")
+            if attempt == RETRY_ATTEMPTS - 1:
+                print(f"Failed ELink (llinks) for PMID {pmid} due to persistent rate limiting after {RETRY_ATTEMPTS} attempts.")
+                break
+        except httpx.RequestError as e:
+            print(f"Request error during ELink (llinks) for PMID {pmid} (attempt {attempt + 1}/{RETRY_ATTEMPTS}): {str(e)}")
+        except json.JSONDecodeError as e: # Ensure json is imported
+            print(f"JSON parsing error during ELink (llinks) for PMID {pmid} (attempt {attempt + 1}/{RETRY_ATTEMPTS}): {e}")
+            break 
+        except Exception as e:
+            print(f"An unexpected error occurred during ELink (llinks) for PMID {pmid} (attempt {attempt + 1}/{RETRY_ATTEMPTS}): {type(e).__name__} - {e}")
+        
+        if attempt < RETRY_ATTEMPTS - 1:
+            await asyncio.sleep(RETRY_DELAY_SECONDS * (attempt + 1)) 
+        else:
+            print(f"Failed to get ELinks (llinks) for PMID {pmid} after {RETRY_ATTEMPTS} attempts.")
+            
+    return found_urls
+
 
 if __name__ == "__main__":
     import argparse
+    import json # Ensure json is imported for the new function if not already
 
     parser = argparse.ArgumentParser(description="Fetch publisher links for PubMed articles using PMID, DOI, or PMC ID.")
     parser.add_argument("--identifier", type=str, help="The article identifier (PMID, DOI, or PMC ID).")
@@ -257,11 +382,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     async def run_single_query(identifier: str, id_type: str):
-        print(f"\n--- Querying for identifier: '{identifier}' (type: {id_type}) ---")
+        print(f"\n--- Querying for identifier: '{identifier}' (type: {id_type}) using _get_article_links_by_id_type_xml ---")
         try:
-            links = await get_article_links(identifier, id_type)
+            links = await _get_article_links_by_id_type_xml(identifier, id_type)
             if links:
-                print(f"Found links for '{identifier}':")
+                print(f"Found links (XML prlinks) for '{identifier}':")
                 for link_url in links:
                     print(f"- {link_url}")
             else:
@@ -269,10 +394,23 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Error during query for '{identifier}': {e}")
 
+    async def run_new_llinks_test(pmid_to_test: str):
+        print(f"\n--- Testing new get_article_links (llinks) for PMID: {pmid_to_test} ---")
+        try:
+            links = await get_article_links(pmid_to_test)
+            if links:
+                print(f"Found LinkOut links for PMID '{pmid_to_test}':")
+                for link_url in links:
+                    print(f"- {link_url}")
+            else:
+                print(f"No LinkOut links found or error for PMID '{pmid_to_test}'.")
+        except Exception as e:
+            print(f"Error during get_article_links (llinks) test for PMID '{pmid_to_test}': {e}")
+
     async def run_test_suite():
-        print("\n--- Running Test Suite ---")
-        test_cases = [
-            {"id": "31345905", "type": "pmid", "desc": "Valid PMID"},
+        print("\n--- Running Test Suite (XML prlinks) ---")
+        test_cases_xml = [
+            {"id": "31345905", "type": "pmid", "desc": "Valid PMID (XML)"},
             {"id": "10.1016/j.cell.2020.01.001", "type": "doi", "desc": "Valid DOI"},
             {"id": "PMC3499990", "type": "pmc", "desc": "Valid PMC ID (PMC3499990)"}, # Corresponds to PMID 23144561
             {"id": "1", "type": "pmid", "desc": "Early PMID"},
@@ -281,15 +419,15 @@ if __name__ == "__main__":
             {"id": "10.invalid/doi", "type": "doi", "desc": "Invalid DOI string"},
             {"id": "PMCinvalid", "type": "pmc", "desc": "Invalid PMC string"},
             {"id": "33577005", "type": "pmid", "desc": "Another valid PMID"},
-            {"id": "not_a_real_id", "type": "doi", "desc": "Non-existent DOI"},
+            {"id": "not_a_real_id", "type": "doi", "desc": "Non-existent DOI (XML)"},
         ]
 
-        for test_case in test_cases:
-            print(f"\n--- Testing with {test_case['desc']}: '{test_case['id']}' (type: {test_case['type']}) ---")
+        for test_case in test_cases_xml:
+            print(f"\n--- Testing with {test_case['desc']}: '{test_case['id']}' (type: {test_case['type']}) using _get_article_links_by_id_type_xml ---")
             try:
-                links = await get_article_links(test_case["id"], test_case["type"])
+                links = await _get_article_links_by_id_type_xml(test_case["id"], test_case["type"])
                 if links:
-                    print(f"Found links for {test_case['desc']} '{test_case['id']}':")
+                    print(f"Found links (XML prlinks) for {test_case['desc']} '{test_case['id']}':")
                     for link_url in links:
                         print(f"- {link_url}")
                 else:
@@ -301,7 +439,14 @@ if __name__ == "__main__":
 
     if args.identifier and args.type:
         asyncio.run(run_single_query(args.identifier, args.type))
+        if args.type.lower() == "pmid":
+            # Also run the new llinks test if a PMID is provided
+            asyncio.run(run_new_llinks_test(args.identifier))
     else:
         print("No specific identifier provided, running test suite instead.")
         print("Usage: python tools/elink_pubmed.py --identifier <ID> --type <pmid|doi|pmc>")
-        asyncio.run(run_test_suite())
+        asyncio.run(run_test_suite()) # Runs XML prlinks tests
+        # Add a specific test for the new llinks function
+        print("\n--- Running Standalone Test for New get_article_links (llinks) ---")
+        asyncio.run(run_new_llinks_test("38692467")) # Test with PMID from task
+        asyncio.run(run_new_llinks_test("31345905")) # Another example

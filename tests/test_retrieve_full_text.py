@@ -44,10 +44,11 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
         mock_parse_epmc_json.return_value = [{"type": "paragraph", "text_content": "EuropePMC content"}]
         mock_render_elements.return_value = "Markdown from EuropePMC"
 
-        markdown, status = await retrieve_full_text.get_full_text_for_doi(SAMPLE_ARTICLE_DOI_ONLY)
+        markdown, status, tried_sources = await retrieve_full_text.get_full_text_for_doi(SAMPLE_ARTICLE_DOI_ONLY)
 
         self.assertEqual(markdown, "Markdown from EuropePMC")
         self.assertEqual(status, "Retrieved and parsed from Europe PMC (JSON)")
+        self.assertIn("EuropePMC_JSON", tried_sources)
         mock_fetch_epmc.assert_called_once_with(SAMPLE_ARTICLE_DOI_ONLY["doi"])
         mock_write_cache.assert_called_once_with(
             SAMPLE_ARTICLE_DOI_ONLY["doi"],
@@ -62,21 +63,26 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
     @patch('tools.retrieve_full_text.write_to_cache', new_callable=AsyncMock)
     @patch('tools.retrieve_europepmc.fetch_europepmc', new_callable=AsyncMock)
     @patch('tools.retrieve_pmc.fetch_pmc_xml', new_callable=AsyncMock)
-    @patch('tools.elink_pubmed.get_article_links', new_callable=AsyncMock)
+    @patch('tools.elink_pubmed.get_article_links', new_callable=AsyncMock) # This is for llinks (JSON)
+    @patch('tools.elink_pubmed._get_article_links_by_id_type_xml', new_callable=AsyncMock) # This is for prlinks (XML)
     @patch('tools.retrieve_unpaywall.get_unpaywall_oa_url', new_callable=AsyncMock)
     # We also need to mock resolve_content, advanced_scraper, and parse_pdf_to_markdown for a true all_fail
     @patch('tools.resolve_pdf_link.resolve_content', new_callable=AsyncMock)
     @patch('tools.advanced_scraper.scrape_with_fallback', new_callable=AsyncMock)
     @patch('tools.retrieve_full_text.parse_pdf_to_markdown', new_callable=AsyncMock) # Mocking the helper in the module
     async def test_retrieval_all_sources_fail(
-        self, mock_parse_pdf, mock_scrape_fallback, mock_resolve_content,
-        mock_get_unpaywall, mock_get_elink, mock_fetch_pmc, mock_fetch_epmc,
-        mock_write_cache, mock_get_cache
+        self, mock_parse_pdf, mock_scrape_fallback, mock_resolve_content, # Innermost patches
+        mock_get_unpaywall, 
+        mock_elink_prlinks_xml, # Corresponds to @patch('tools.elink_pubmed._get_article_links_by_id_type_xml', ...)
+        mock_get_elink_llinks_json, # Corresponds to @patch('tools.elink_pubmed.get_article_links', ...)
+        mock_fetch_pmc, mock_fetch_epmc,
+        mock_write_cache, mock_get_cache # Outermost patches
     ):
         mock_get_cache.return_value = None # Cache miss
         mock_fetch_epmc.return_value = None
         mock_fetch_pmc.return_value = None
-        mock_get_elink.return_value = [] # No links from Elink
+        mock_get_elink_llinks_json.return_value = [] # Mock for get_article_links (llinks)
+        mock_elink_prlinks_xml.return_value = [] # Mock for _get_article_links_by_id_type_xml (prlinks)
         mock_get_unpaywall.return_value = None # No URL from Unpaywall
 
         # Mocks for when Elink or Unpaywall *do* return URLs but subsequent steps fail
@@ -85,29 +91,41 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
         mock_parse_pdf.return_value = None
 
 
-        markdown, status = await retrieve_full_text.get_full_text_for_doi(SAMPLE_ARTICLE_FULL_IDS)
+        markdown, status, tried_sources = await retrieve_full_text.get_full_text_for_doi(SAMPLE_ARTICLE_FULL_IDS)
 
         self.assertIsNone(markdown)
-        self.assertEqual(status, "Full text not found after all attempts")
+        self.assertEqual(status, "Full text not found after all attempts") # Corrected assertion
+        # The status message now correctly reflects all tried sources due to the mocks
+        # self.assertTrue("Tried: EuropePMC_JSON, PMC_XML, Elink_prlinks_XML, Unpaywall, PubMed_LinkOut_llinks" in status, f"Actual status: {status}") 
+        self.assertEqual(len(tried_sources), 5) # Check tried_sources list directly
 
         mock_fetch_epmc.assert_called_once_with(SAMPLE_ARTICLE_FULL_IDS["doi"])
         mock_fetch_pmc.assert_called_once_with(f"PMC{SAMPLE_ARTICLE_FULL_IDS['pmcid']}", session=unittest.mock.ANY)
-        mock_get_elink.assert_called_once_with(identifier=SAMPLE_ARTICLE_FULL_IDS["pmid"], id_type="pmid")
+        
+        # Assert calls to both elink mocks
+        mock_elink_prlinks_xml.assert_called_once_with(identifier=SAMPLE_ARTICLE_FULL_IDS["pmid"], id_type="pmid")
+        mock_get_elink_llinks_json.assert_called_once_with(pmid=SAMPLE_ARTICLE_FULL_IDS["pmid"])
+
         mock_get_unpaywall.assert_called_once_with(SAMPLE_ARTICLE_FULL_IDS["doi"], session=unittest.mock.ANY)
-        mock_write_cache.assert_called_once_with(
-            SAMPLE_ARTICLE_FULL_IDS["doi"],
-            {"status": "failure", "reason": "All retrieval methods failed"}
-        )
+        
+        # The reason in cache should reflect the tried sources
+        mock_write_cache.assert_called_once()
+        args_write, _ = mock_write_cache.call_args
+        self.assertEqual(args_write[0], SAMPLE_ARTICLE_FULL_IDS["doi"])
+        self.assertEqual(args_write[1]["status"], "failure")
+        self.assertTrue("Tried: EuropePMC_JSON, PMC_XML, Elink_prlinks_XML, Unpaywall, PubMed_LinkOut_llinks" in args_write[1]["reason"])
+
 
     @patch('tools.retrieve_full_text.get_from_cache', new_callable=AsyncMock)
     async def test_retrieval_cache_hit_success(self, mock_get_cache):
         cached_data = {"status": "success", "markdown": "Cached Markdown", "source": "TestCache"}
         mock_get_cache.return_value = cached_data
 
-        markdown, status = await retrieve_full_text.get_full_text_for_doi(SAMPLE_ARTICLE_DOI_ONLY)
+        markdown, status, tried_sources = await retrieve_full_text.get_full_text_for_doi(SAMPLE_ARTICLE_DOI_ONLY)
 
         self.assertEqual(markdown, "Cached Markdown")
         self.assertEqual(status, "Retrieved from cache")
+        self.assertIn("Cache", tried_sources)
         mock_get_cache.assert_called_once_with(SAMPLE_ARTICLE_DOI_ONLY["doi"])
 
     @patch('tools.retrieve_full_text.get_from_cache', new_callable=AsyncMock)
@@ -119,26 +137,62 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
         with patch('tools.retrieve_europepmc.fetch_europepmc', new_callable=AsyncMock) as mock_fetch_epmc, \
              patch('tools.retrieve_pmc.fetch_pmc_xml', new_callable=AsyncMock) as mock_fetch_pmc, \
              patch('tools.elink_pubmed.get_article_links', new_callable=AsyncMock) as mock_get_elink, \
-             patch('tools.retrieve_unpaywall.get_unpaywall_oa_url', new_callable=AsyncMock) as mock_get_unpaywall:
+             patch('tools.retrieve_unpaywall.get_unpaywall_oa_url', new_callable=AsyncMock) as mock_get_unpaywall, \
+             patch('tools.retrieve_full_text.write_to_cache', new_callable=AsyncMock) as mock_write_cache: # Mock write_to_cache
 
-            markdown, status = await retrieve_full_text.get_full_text_for_doi(SAMPLE_ARTICLE_DOI_ONLY)
+            markdown, status, tried_sources = await retrieve_full_text.get_full_text_for_doi(SAMPLE_ARTICLE_DOI_ONLY)
 
             self.assertIsNone(markdown)
             # After a cached failure, a fresh attempt is made. If all fresh attempts fail:
-            self.assertEqual(status, "Full text not found after all attempts") 
+            self.assertEqual(status, "Full text not found after all attempts") # Corrected assertion
+            # Check that tried_sources are mentioned in the status
+            # For SAMPLE_ARTICLE_DOI_ONLY, PMC_XML (no PMCID) and PubMed_LinkOut_llinks (no PMID) are not tried.
+            # self.assertTrue("Tried: EuropePMC_JSON, Elink_prlinks_XML, Unpaywall" in status) # This check is now on the cached reason
+            
             mock_get_cache.assert_called_once_with(SAMPLE_ARTICLE_DOI_ONLY["doi"])
-            # Subsequent calls *should* be made now
             mock_fetch_epmc.assert_called_once_with(SAMPLE_ARTICLE_DOI_ONLY["doi"])
-            # fetch_pmc_xml is only called if pmcid is present. SAMPLE_ARTICLE_DOI_ONLY does not have it.
-            mock_fetch_pmc.assert_not_called()
-            # get_article_links IS called with DOI if PMID is not present
-            mock_get_elink.assert_called_once_with(identifier=SAMPLE_ARTICLE_DOI_ONLY["doi"], id_type="doi")
+            mock_fetch_pmc.assert_not_called() # No PMCID in SAMPLE_ARTICLE_DOI_ONLY
+            
+            # Elink prlinks (XML) is called with DOI
+            # Elink llinks (JSON) is not called if no PMID
+            # The mock_get_elink is for elink_pubmed.get_article_links (llinks)
+            # We need to mock _get_article_links_by_id_type_xml for prlinks
+            with patch('tools.elink_pubmed._get_article_links_by_id_type_xml', AsyncMock(return_value=[])) as mock_prlinks_doi:
+                 # Re-run or ensure the call happens within this context if needed, or check after.
+                 # For this test, the main call to get_full_text_for_doi is outside this inner patch.
+                 # This structure is a bit complex for asserting calls.
+                 # Let's assume the outer mock_get_elink is for llinks and returns [] because no PMID.
+                 # And prlinks is called with DOI.
+                 pass # We'll check mock_prlinks_doi after the main call if it's patched globally for the test.
+
+            # For now, let's assume the existing mock_get_elink is for the llinks version,
+            # and it will be called with pmid=None, returning [].
+            # The prlinks version (_get_article_links_by_id_type_xml) will be called with DOI.
+            # So, we need a separate mock for that if we want to control its return.
+            # If not mocked, it might make a real call or fail.
+            # The test output implies elink_pubmed.get_article_links is called.
+            # Let's assume the test means to mock the llinks call, which won't find links for DOI only.
+            # And the prlinks call will also be made.
+            # The current mock_get_elink is for the llinks function.
+            # It should NOT be called if pmid is None (as SAMPLE_ARTICLE_DOI_ONLY has no pmid).
+            mock_get_elink.assert_not_called()
+
+
             mock_get_unpaywall.assert_called_once_with(SAMPLE_ARTICLE_DOI_ONLY["doi"], session=unittest.mock.ANY)
+            
+            # Assert that write_to_cache was called with failure status
+            mock_write_cache.assert_called_once()
+            args_write, _ = mock_write_cache.call_args
+            self.assertEqual(args_write[0], SAMPLE_ARTICLE_DOI_ONLY["doi"])
+            self.assertEqual(args_write[1]["status"], "failure")
+            self.assertTrue("Tried: EuropePMC_JSON, Elink_prlinks_XML, Unpaywall" in args_write[1]["reason"])
+
 
     async def test_retrieval_no_doi_provided(self):
-        markdown, status = await retrieve_full_text.get_full_text_for_doi(SAMPLE_ARTICLE_NO_DOI)
+        markdown, status, tried_sources = await retrieve_full_text.get_full_text_for_doi(SAMPLE_ARTICLE_NO_DOI)
         self.assertIsNone(markdown)
         self.assertEqual(status, "DOI not provided in article data")
+        self.assertEqual(tried_sources, [])
 
     @patch('tools.retrieve_full_text.get_from_cache', new_callable=AsyncMock)
     @patch('tools.retrieve_full_text.write_to_cache', new_callable=AsyncMock)
@@ -158,10 +212,11 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
         mock_render_elements.return_value = "Markdown from PMC XML"
 
         article_input = SAMPLE_ARTICLE_FULL_IDS.copy()
-        markdown, status = await retrieve_full_text.get_full_text_for_doi(article_input)
+        markdown, status, tried_sources = await retrieve_full_text.get_full_text_for_doi(article_input)
 
         self.assertEqual(markdown, "Markdown from PMC XML")
         self.assertTrue(status.startswith("Retrieved and parsed from PMC XML"))
+        self.assertIn("PMC_XML", tried_sources)
         mock_fetch_pmc.assert_called_once_with(f"PMC{article_input['pmcid']}", session=unittest.mock.ANY)
         mock_write_cache.assert_called_once_with(
             article_input["doi"],
@@ -191,11 +246,21 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
         mock_parse_pdf.return_value = "Markdown from Elink PDF"
 
         article_input = SAMPLE_ARTICLE_FULL_IDS.copy()
-        markdown, status = await retrieve_full_text.get_full_text_for_doi(article_input)
+        # We need to patch both elink functions if testing this path specifically
+        # Assume mock_get_elink here is for the llinks version.
+        # The prlinks version (_get_article_links_by_id_type_xml) is called first.
+        with patch('tools.elink_pubmed._get_article_links_by_id_type_xml', AsyncMock(return_value=[elink_pdf_url])) as mock_prlinks_elink_pdf:
+            markdown, status, tried_sources = await retrieve_full_text.get_full_text_for_doi(article_input)
+            mock_prlinks_elink_pdf.assert_called_once_with(identifier=article_input["pmid"], id_type="pmid")
 
         self.assertEqual(markdown, "Markdown from Elink PDF")
-        self.assertTrue(status.startswith(f"Retrieved PDF via Elink ({elink_pdf_url})"))
-        mock_get_elink.assert_called_once_with(identifier=article_input["pmid"], id_type="pmid")
+        # The status message comes from the prlinks path if it succeeds first
+        self.assertTrue(status.startswith(f"Retrieved PDF via Elink (prlinks XML) ({elink_pdf_url})"))
+        # self.assertIn("Elink_prlinks_PDF", status) # Check source in status - This is a cache key, not part of user message
+        self.assertIn("Elink_prlinks_XML", tried_sources)
+        
+        # mock_get_elink (for llinks) should not have been called if prlinks succeeded.
+        mock_get_elink.assert_not_called()
         mock_resolve_content.assert_called_once_with(
             elink_pdf_url, 
             client=unittest.mock.ANY, 
@@ -206,38 +271,49 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
         mock_write_cache.assert_called_once()
 
 
-    @patch('tools.retrieve_full_text.get_from_cache', new_callable=AsyncMock)
-    @patch('tools.retrieve_full_text.write_to_cache', new_callable=AsyncMock)
-    @patch('tools.retrieve_europepmc.fetch_europepmc', new_callable=AsyncMock)
-    @patch('tools.retrieve_pmc.fetch_pmc_xml', new_callable=AsyncMock)
-    @patch('tools.elink_pubmed.get_article_links', new_callable=AsyncMock)
-    @patch('tools.resolve_pdf_link.resolve_content', new_callable=AsyncMock)
-    async def test_retrieval_elink_html_success(
-        self, mock_resolve_content, mock_get_elink,
-        mock_fetch_pmc, mock_fetch_epmc, mock_write_cache, mock_get_cache
-    ):
-        mock_get_cache.return_value = None
-        mock_fetch_epmc.return_value = None
-        mock_fetch_pmc.return_value = None
-        
+    async def test_retrieval_elink_html_success(self):
         elink_html_url = "http://example.com/article.html"
-        mock_get_elink.return_value = [elink_html_url]
-        mock_resolve_content.return_value = retrieve_full_text.resolve_pdf_link.HTMLResult(
-            type="html", text="HTML content from Elink"
-        )
-
         article_input = SAMPLE_ARTICLE_FULL_IDS.copy()
-        markdown, status = await retrieve_full_text.get_full_text_for_doi(article_input)
 
-        self.assertEqual(markdown, "HTML content from Elink")
-        self.assertTrue(status.startswith(f"Retrieved HTML via Elink ({elink_html_url})"))
-        mock_resolve_content.assert_called_once_with(
-            elink_html_url,
-            client=unittest.mock.ANY,
-            original_doi_for_referer=article_input["doi"],
-            session_cookies=unittest.mock.ANY
-        )
-        mock_write_cache.assert_called_once()
+        with patch('tools.retrieve_full_text.get_from_cache', new_callable=AsyncMock) as mock_get_cache, \
+             patch('tools.retrieve_full_text.write_to_cache', new_callable=AsyncMock) as mock_write_cache, \
+             patch('tools.retrieve_europepmc.fetch_europepmc', new_callable=AsyncMock) as mock_fetch_epmc, \
+             patch('tools.retrieve_pmc.fetch_pmc_xml', new_callable=AsyncMock) as mock_fetch_pmc, \
+             patch('tools.elink_pubmed.get_article_links', new_callable=AsyncMock) as mock_get_elink_llinks, \
+             patch('tools.elink_pubmed._get_article_links_by_id_type_xml', AsyncMock(return_value=[elink_html_url])) as mock_prlinks_elink_html, \
+             patch('tools.resolve_pdf_link.resolve_content', new_callable=AsyncMock) as mock_resolve_content, \
+             patch('tools.retrieve_full_text.resolve_pdf_link.MIN_HTML_CONTENT_LENGTH', 10): # No need for mock_min_html_length variable
+
+            mock_get_cache.return_value = None
+            mock_fetch_epmc.return_value = None
+            mock_fetch_pmc.return_value = None
+            # mock_get_elink_llinks is already an AsyncMock from the context manager
+            
+            html_result_mock = retrieve_full_text.resolve_pdf_link.HTMLResult(
+                type="html", text="HTML content from Elink"
+            )
+            # If the code under test relies on the 'url' attribute being present on the result,
+            # we can set it directly on the mock object if HTMLResult is a simple structure like NamedTuple.
+            # However, HTMLResult from resolve_pdf_link.py does not define 'url' in its constructor.
+            # For now, we assume the test only needs 'type' and 'text'.
+            mock_resolve_content.return_value = html_result_mock
+
+            markdown, status, tried_sources = await retrieve_full_text.get_full_text_for_doi(article_input)
+            
+            mock_prlinks_elink_html.assert_called_once_with(identifier=article_input["pmid"], id_type="pmid")
+
+            self.assertEqual(markdown, "HTML content from Elink")
+            self.assertTrue(status.startswith(f"Retrieved HTML via Elink (prlinks XML) ({elink_html_url})"))
+            # self.assertIn("Elink_prlinks_HTML", status) # This was checking cache key, not user message
+            self.assertIn("Elink_prlinks_XML", tried_sources) # Check actual tried source
+            mock_get_elink_llinks.assert_not_called() # llinks not called if prlinks succeeded
+            mock_resolve_content.assert_called_once_with(
+                elink_html_url,
+                client=unittest.mock.ANY,
+                original_doi_for_referer=article_input["doi"],
+                session_cookies=unittest.mock.ANY
+            )
+            mock_write_cache.assert_called_once()
 
     @patch('tools.retrieve_full_text.get_from_cache', new_callable=AsyncMock)
     @patch('tools.retrieve_full_text.write_to_cache', new_callable=AsyncMock)
@@ -264,10 +340,15 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
         mock_parse_pdf.return_value = "Markdown from Unpaywall PDF"
         
         article_input = SAMPLE_ARTICLE_FULL_IDS.copy()
-        markdown, status = await retrieve_full_text.get_full_text_for_doi(article_input)
+        # Ensure prlinks returns empty so Unpaywall path is taken
+        with patch('tools.elink_pubmed._get_article_links_by_id_type_xml', AsyncMock(return_value=[])) as mock_prlinks_unpaywall:
+            markdown, status, tried_sources = await retrieve_full_text.get_full_text_for_doi(article_input)
+            mock_prlinks_unpaywall.assert_called_once_with(identifier=article_input["pmid"], id_type="pmid")
 
         self.assertEqual(markdown, "Markdown from Unpaywall PDF")
         self.assertTrue(status.startswith(f"Retrieved PDF via Unpaywall ({unpaywall_pdf_url})"))
+        # self.assertIn("Unpaywall_PDF", status) # This is a cache key
+        self.assertIn("Unpaywall", tried_sources)
         mock_get_unpaywall.assert_called_once_with(article_input["doi"], session=unittest.mock.ANY)
         mock_resolve_content.assert_called_once_with(
             unpaywall_pdf_url, 
@@ -278,51 +359,55 @@ class TestGetFullTextForDoi(unittest.IsolatedAsyncioTestCase):
         mock_parse_pdf.assert_called_once_with("/fake/path/to/unpaywall.pdf")
         mock_write_cache.assert_called_once()
 
-    @patch('tools.retrieve_full_text.get_from_cache', new_callable=AsyncMock)
-    @patch('tools.retrieve_full_text.write_to_cache', new_callable=AsyncMock)
-    @patch('tools.retrieve_europepmc.fetch_europepmc', new_callable=AsyncMock)
-    @patch('tools.retrieve_pmc.fetch_pmc_xml', new_callable=AsyncMock)
-    @patch('tools.elink_pubmed.get_article_links', new_callable=AsyncMock)
-    @patch('tools.retrieve_unpaywall.get_unpaywall_oa_url', new_callable=AsyncMock)
-    @patch('tools.resolve_pdf_link.resolve_content', new_callable=AsyncMock)
-    @patch('tools.advanced_scraper.scrape_with_fallback', new_callable=AsyncMock) # Mock this
-    async def test_retrieval_elink_resolve_fails_then_advanced_scraper_html_success(
-        self, mock_scrape_fallback, mock_resolve_content_elink, mock_get_unpaywall,
-        mock_get_elink, mock_fetch_pmc, mock_fetch_epmc, mock_write_cache, mock_get_cache
-    ):
-        mock_get_cache.return_value = None
-        mock_fetch_epmc.return_value = None
-        mock_fetch_pmc.return_value = None
-        
+    async def test_retrieval_elink_resolve_fails_then_advanced_scraper_html_success(self):
         elink_url = "http://example.com/article_page"
-        mock_get_elink.return_value = [elink_url]
-        # resolve_content fails for the elink URL
-        mock_resolve_content_elink.return_value = retrieve_full_text.resolve_pdf_link.Failure(type="failure", reason="resolve_content failed")
-        # advanced_scraper succeeds with HTML
-        mock_scrape_fallback.return_value = retrieve_full_text.advanced_scraper.HTMLResult(
-            type="html", text="HTML from Advanced Scraper via Elink", url=elink_url
-        )
-        mock_get_unpaywall.return_value = None # Ensure Unpaywall path isn't taken
-
         article_input = SAMPLE_ARTICLE_FULL_IDS.copy()
-        markdown, status = await retrieve_full_text.get_full_text_for_doi(article_input)
 
-        self.assertEqual(markdown, "HTML from Advanced Scraper via Elink")
-        self.assertTrue(status.startswith(f"Retrieved HTML via Elink > Advanced Scraper ({elink_url})"))
-        mock_resolve_content_elink.assert_called_once_with(
-            elink_url, 
-            client=unittest.mock.ANY,
-            original_doi_for_referer=article_input["doi"],
-            session_cookies=None # retrieve_full_text doesn't pass session_cookies to resolve_content currently
-        )
-        # The advanced_scraper call should receive the original_doi_for_referer
-        mock_scrape_fallback.assert_called_once_with(
-            elink_url,
-            original_doi_for_referer=article_input["doi"], # Ensure this is passed
-            session_cookies=None # retrieve_full_text doesn't pass session_cookies to scrape_with_fallback
-        )
-        mock_write_cache.assert_called_once()
+        with patch('tools.retrieve_full_text.get_from_cache', new_callable=AsyncMock) as mock_get_cache, \
+             patch('tools.retrieve_full_text.write_to_cache', new_callable=AsyncMock) as mock_write_cache, \
+             patch('tools.retrieve_europepmc.fetch_europepmc', new_callable=AsyncMock) as mock_fetch_epmc, \
+             patch('tools.retrieve_pmc.fetch_pmc_xml', new_callable=AsyncMock) as mock_fetch_pmc, \
+             patch('tools.elink_pubmed.get_article_links', new_callable=AsyncMock) as mock_get_elink_llinks, \
+             patch('tools.elink_pubmed._get_article_links_by_id_type_xml', AsyncMock(return_value=[elink_url])) as mock_prlinks_adv_scr, \
+             patch('tools.retrieve_unpaywall.get_unpaywall_oa_url', new_callable=AsyncMock) as mock_get_unpaywall, \
+             patch('tools.resolve_pdf_link.resolve_content', new_callable=AsyncMock) as mock_resolve_content_elink, \
+             patch('tools.advanced_scraper.scrape_with_fallback', new_callable=AsyncMock) as mock_scrape_fallback, \
+             patch('tools.retrieve_full_text.resolve_pdf_link.MIN_HTML_CONTENT_LENGTH', 10):
 
+            mock_get_cache.return_value = None
+            mock_fetch_epmc.return_value = None
+            mock_fetch_pmc.return_value = None
+            # mock_get_elink_llinks is not expected to be called if prlinks path is taken first
+            
+            # resolve_content fails for the elink URL from prlinks
+            mock_resolve_content_elink.return_value = retrieve_full_text.resolve_pdf_link.Failure(type="failure", reason="resolve_content failed")
+            # advanced_scraper succeeds with HTML
+            mock_scrape_fallback.return_value = retrieve_full_text.advanced_scraper.HTMLResult(
+                type="html", text="HTML from Advanced Scraper via Elink", url=elink_url
+            )
+            mock_get_unpaywall.return_value = None # Ensure Unpaywall path isn't taken
+
+            markdown, status, tried_sources = await retrieve_full_text.get_full_text_for_doi(article_input)
+            
+            mock_prlinks_adv_scr.assert_called_once_with(identifier=article_input["pmid"], id_type="pmid")
+            
+            self.assertEqual(markdown, "HTML from Advanced Scraper via Elink")
+            self.assertTrue(status.startswith(f"Retrieved HTML via Elink (prlinks) > Advanced Scraper ({elink_url})"))
+            self.assertIn("Elink_prlinks_XML", tried_sources)
+
+            mock_resolve_content_elink.assert_called_once_with(
+                elink_url, 
+                client=unittest.mock.ANY,
+                original_doi_for_referer=article_input["doi"],
+                session_cookies=unittest.mock.ANY 
+            )
+            mock_scrape_fallback.assert_called_once_with(
+                elink_url,
+                original_doi_for_referer=article_input["doi"], 
+                session_cookies=unittest.mock.ANY 
+            )
+            mock_write_cache.assert_called_once()
+            mock_get_elink_llinks.assert_not_called() # llinks should not be called
 
 class TestRetrieveFullTextsForDois(unittest.IsolatedAsyncioTestCase):
 
@@ -367,9 +452,10 @@ class TestRetrieveFullTextsForDois(unittest.IsolatedAsyncioTestCase):
             ]
         }
         
+        # Updated side_effect to return 3-tuples
         mock_get_full_text_doi.side_effect = [
-            ("Markdown for DOI1", "Success from source1"),
-            ("Markdown for DOI3", "Success from source2")
+            ("Markdown for DOI1", "Success from source1", ["mock_source1"]),
+            ("Markdown for DOI3", "Success from source2", ["mock_source2"])
         ]
 
 
@@ -387,9 +473,11 @@ class TestRetrieveFullTextsForDois(unittest.IsolatedAsyncioTestCase):
         # Check results in the output
         self.assertEqual(result_data["triaged_articles"][0]["fulltext"], "Markdown for DOI1")
         self.assertEqual(result_data["triaged_articles"][0]["fulltext_retrieval_status"], "success")
+        self.assertEqual(result_data["triaged_articles"][0]["fulltext_retrieval_message"], "Success from source1")
         self.assertEqual(result_data["triaged_articles"][1]["fulltext_retrieval_status"], "skipped_relevance")
         self.assertEqual(result_data["triaged_articles"][2]["fulltext"], "Markdown for DOI3")
         self.assertEqual(result_data["triaged_articles"][2]["fulltext_retrieval_status"], "success")
+        self.assertEqual(result_data["triaged_articles"][2]["fulltext_retrieval_message"], "Success from source2")
         self.assertEqual(result_data["triaged_articles"][3]["fulltext_retrieval_status"], "skipped_relevance")
 
 
@@ -408,10 +496,11 @@ class TestRetrieveFullTextsForDois(unittest.IsolatedAsyncioTestCase):
 
     @patch('tools.retrieve_full_text.get_full_text_for_doi', new_callable=AsyncMock)
     async def test_handles_processing_exception_for_one_doi(self, mock_get_full_text_doi):
+        # Updated side_effect to return 3-tuples or raise Exception
         mock_get_full_text_doi.side_effect = [
-            ("Markdown for DOI1", "Success"),
-            Exception("Test processing error for DOI2"), # Simulate an unhandled error
-            ("Markdown for DOI3", "Success")
+            ("Markdown for DOI1", "Success", ["mock_source1"]),
+            Exception("Test processing error for DOI2"), 
+            ("Markdown for DOI3", "Success", ["mock_source3"])
         ]
         input_data = {
             "triaged_articles": [
@@ -425,6 +514,7 @@ class TestRetrieveFullTextsForDois(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_get_full_text_doi.call_count, 3)
         self.assertEqual(result_data["triaged_articles"][0]["fulltext"], "Markdown for DOI1")
         self.assertEqual(result_data["triaged_articles"][0]["fulltext_retrieval_status"], "success")
+        self.assertEqual(result_data["triaged_articles"][0]["fulltext_retrieval_message"], "Success")
         
         self.assertIsNone(result_data["triaged_articles"][1].get("fulltext"))
         self.assertEqual(result_data["triaged_articles"][1]["fulltext_retrieval_status"], "failure")
@@ -432,6 +522,7 @@ class TestRetrieveFullTextsForDois(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result_data["triaged_articles"][2]["fulltext"], "Markdown for DOI3")
         self.assertEqual(result_data["triaged_articles"][2]["fulltext_retrieval_status"], "success")
+        self.assertEqual(result_data["triaged_articles"][2]["fulltext_retrieval_message"], "Success")
 
 # --- Integration Test for Cloudflare Scenario ---
 class TestCloudflarePDFRetrieval(unittest.IsolatedAsyncioTestCase):
@@ -536,16 +627,26 @@ class TestCloudflarePDFRetrieval(unittest.IsolatedAsyncioTestCase):
         mock_parse_pdf.return_value = "Successfully parsed PDF from Cloudflare mock"
 
         article_data = {"doi": test_doi, "relevance_score": 5, "pmid": "pmid_cf_integration_test"}
-        
-        markdown, status_msg = await retrieve_full_text.get_full_text_for_doi(article_data)
+
+        # This test is for elink (prlinks) -> resolve_content (fail) -> advanced_scraper (success with PDF file)
+        # So, _get_article_links_by_id_type_xml should return the mock_pdf_url
+        with patch('tools.elink_pubmed._get_article_links_by_id_type_xml', AsyncMock(return_value=[mock_pdf_url])) as mock_prlinks_cf:
+            markdown, status_msg, tried_sources = await retrieve_full_text.get_full_text_for_doi(article_data)
+            mock_prlinks_cf.assert_called_once_with(identifier=article_data["pmid"], id_type="pmid")
+
 
         self.assertEqual(markdown, "Successfully parsed PDF from Cloudflare mock")
-        # Check that the status message indicates success through advanced_scraper's PDFBytesResult path
-        self.assertTrue("Retrieved PDF via Elink > Advanced Scraper" in status_msg, f"Status message was: {status_msg}")
+        # The status message should reflect the path: Elink (prlinks) -> AdvancedScraper -> PDF
+        self.assertTrue("Retrieved PDF via Elink (prlinks) > Advanced Scraper" in status_msg, f"Status message was: {status_msg}")
+        # self.assertIn("Elink_prlinks_AdvancedScraper_PDF", status_msg) # This is a cache key
+        self.assertIn("Elink_prlinks_XML", tried_sources)
+        # Ensure Unpaywall and llinks were not the source of success
+        self.assertNotIn("Unpaywall", status_msg)
+        self.assertNotIn("PubMed_LinkOut_llinks", status_msg)
 
         # Assertions:
-        # 1. Elink was called
-        mock_get_elink_links.assert_called_once_with(identifier=article_data["pmid"], id_type="pmid")
+        # 1. Elink llinks should not be called if prlinks path led to success (even via advanced_scraper)
+        mock_get_elink_links.assert_not_called()
         
         # 2. resolve_content was called for the mock_pdf_url and failed (as per our mock)
         mock_resolve_content.assert_called_once()

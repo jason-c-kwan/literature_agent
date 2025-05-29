@@ -4,9 +4,10 @@ from unittest.mock import AsyncMock, patch
 
 # Import the functions to be tested
 from tools.elink_pubmed import (
-    get_article_links,
+    get_article_links, # This will be the new JSON-based one
+    _get_article_links_by_id_type_xml, # The renamed old one
     _convert_to_pmid,
-    get_pubmed_prlinks,
+    _get_pubmed_prlinks_xml, # The renamed helper
     NCBI_ELINK_URL, 
     NCBI_ESEARCH_URL
 )
@@ -178,114 +179,114 @@ async def test_convert_to_pmid_empty_identifier():
 
 @pytest.mark.asyncio
 @patch('tools.elink_pubmed._execute_ncbi_utility_request', new_callable=AsyncMock)
-async def test_get_pubmed_prlinks_success(mock_execute_request):
+async def test_get_pubmed_prlinks_xml_success(mock_execute_request):
     mock_response = create_mock_response(200, MOCK_ELINK_PRLINKS_SUCCESS_XML, NCBI_ELINK_URL)
     mock_execute_request.return_value = mock_response
     
-    links = await get_pubmed_prlinks("123456")
+    links = await _get_pubmed_prlinks_xml("123456")
     assert len(links) == 2
     assert "http://example.com/fulltext/123456" in links
     assert "http://another.example.com/pdf/123456.pdf" in links
 
 @pytest.mark.asyncio
 @patch('tools.elink_pubmed._execute_ncbi_utility_request', new_callable=AsyncMock)
-async def test_get_pubmed_prlinks_linksetdb_success(mock_execute_request):
+async def test_get_pubmed_prlinks_xml_linksetdb_success(mock_execute_request):
     mock_response = create_mock_response(200, MOCK_ELINK_PRLINKS_LINKSETDB_SUCCESS_XML, NCBI_ELINK_URL)
     mock_execute_request.return_value = mock_response
     
-    links = await get_pubmed_prlinks("98765")
+    links = await _get_pubmed_prlinks_xml("98765")
     assert len(links) == 1
     assert "http://example.com/linksetdb/98765" in links
 
 @pytest.mark.asyncio
 @patch('tools.elink_pubmed._execute_ncbi_utility_request', new_callable=AsyncMock)
-async def test_get_pubmed_prlinks_no_links(mock_execute_request):
+async def test_get_pubmed_prlinks_xml_no_links(mock_execute_request):
     mock_response = create_mock_response(200, MOCK_ELINK_PRLINKS_NO_LINKS_XML, NCBI_ELINK_URL)
     mock_execute_request.return_value = mock_response
     
-    links = await get_pubmed_prlinks("123456")
+    links = await _get_pubmed_prlinks_xml("123456")
     assert len(links) == 0
 
 @pytest.mark.asyncio
 @patch('tools.elink_pubmed._execute_ncbi_utility_request', new_callable=AsyncMock)
-async def test_get_pubmed_prlinks_api_error_xml(mock_execute_request):
+async def test_get_pubmed_prlinks_xml_api_error_xml(mock_execute_request):
     mock_response = create_mock_response(200, MOCK_ELINK_API_ERROR_XML, NCBI_ELINK_URL)
     mock_execute_request.return_value = mock_response
     
-    links = await get_pubmed_prlinks("123456")
+    links = await _get_pubmed_prlinks_xml("123456")
     assert len(links) == 0
 
 @pytest.mark.asyncio
 @patch('tools.elink_pubmed._execute_ncbi_utility_request', new_callable=AsyncMock)
-async def test_get_pubmed_prlinks_http_error(mock_execute_request):
+async def test_get_pubmed_prlinks_xml_http_error(mock_execute_request):
     error_response = create_mock_response(500, "Internal Server Error", NCBI_ELINK_URL)
     mock_execute_request.side_effect = httpx.HTTPStatusError(
         "Server Error", request=error_response.request, response=error_response
     )
-    links = await get_pubmed_prlinks("123456")
+    links = await _get_pubmed_prlinks_xml("123456")
     assert len(links) == 0
     assert mock_execute_request.call_count == 3 # Due to retries
 
 @pytest.mark.asyncio
-async def test_get_pubmed_prlinks_empty_pmid():
-    links = await get_pubmed_prlinks("")
+async def test_get_pubmed_prlinks_xml_empty_pmid():
+    links = await _get_pubmed_prlinks_xml("")
     assert len(links) == 0
-    links = await get_pubmed_prlinks("  ")
+    links = await _get_pubmed_prlinks_xml("  ")
     assert len(links) == 0
 
 
 @pytest.mark.asyncio
 @patch('tools.elink_pubmed._convert_to_pmid', new_callable=AsyncMock)
-@patch('tools.elink_pubmed.get_pubmed_prlinks', new_callable=AsyncMock)
-async def test_get_article_links_with_pmid(mock_get_prlinks, mock_convert_pmid):
-    mock_get_prlinks.return_value = ["http://example.com/link_pmid"]
+@patch('tools.elink_pubmed._get_pubmed_prlinks_xml', new_callable=AsyncMock)
+async def test_get_article_links_by_id_type_xml_with_pmid(mock_get_prlinks_xml, mock_convert_pmid):
+    mock_get_prlinks_xml.return_value = ["http://example.com/link_pmid"]
     
-    links = await get_article_links("111", "pmid")
+    links = await _get_article_links_by_id_type_xml("111", "pmid")
     assert links == ["http://example.com/link_pmid"]
     mock_convert_pmid.assert_not_called()
-    mock_get_prlinks.assert_called_once_with("111")
+    mock_get_prlinks_xml.assert_called_once_with("111")
 
 @pytest.mark.asyncio
 @patch('tools.elink_pubmed._convert_to_pmid', new_callable=AsyncMock)
-@patch('tools.elink_pubmed.get_pubmed_prlinks', new_callable=AsyncMock)
-async def test_get_article_links_with_doi(mock_get_prlinks, mock_convert_pmid):
+@patch('tools.elink_pubmed._get_pubmed_prlinks_xml', new_callable=AsyncMock)
+async def test_get_article_links_by_id_type_xml_with_doi(mock_get_prlinks_xml, mock_convert_pmid):
     mock_convert_pmid.return_value = "222" # Converted PMID
-    mock_get_prlinks.return_value = ["http://example.com/link_doi"]
+    mock_get_prlinks_xml.return_value = ["http://example.com/link_doi"]
     
-    links = await get_article_links("10.123/doi", "doi")
+    links = await _get_article_links_by_id_type_xml("10.123/doi", "doi")
     assert links == ["http://example.com/link_doi"]
     mock_convert_pmid.assert_called_once_with("10.123/doi", "DOI")
-    mock_get_prlinks.assert_called_once_with("222")
+    mock_get_prlinks_xml.assert_called_once_with("222")
 
 @pytest.mark.asyncio
 @patch('tools.elink_pubmed._convert_to_pmid', new_callable=AsyncMock)
-@patch('tools.elink_pubmed.get_pubmed_prlinks', new_callable=AsyncMock)
-async def test_get_article_links_with_pmc(mock_get_prlinks, mock_convert_pmid):
+@patch('tools.elink_pubmed._get_pubmed_prlinks_xml', new_callable=AsyncMock)
+async def test_get_article_links_by_id_type_xml_with_pmc(mock_get_prlinks_xml, mock_convert_pmid):
     mock_convert_pmid.return_value = "333" # Converted PMID
-    mock_get_prlinks.return_value = ["http://example.com/link_pmc"]
+    mock_get_prlinks_xml.return_value = ["http://example.com/link_pmc"]
     
-    links = await get_article_links("PMC123", "pmc")
+    links = await _get_article_links_by_id_type_xml("PMC123", "pmc")
     assert links == ["http://example.com/link_pmc"]
     mock_convert_pmid.assert_called_once_with("PMC123", "PMCID")
-    mock_get_prlinks.assert_called_once_with("333")
+    mock_get_prlinks_xml.assert_called_once_with("333")
 
 @pytest.mark.asyncio
 @patch('tools.elink_pubmed._convert_to_pmid', new_callable=AsyncMock)
-async def test_get_article_links_doi_conversion_fails(mock_convert_pmid):
+async def test_get_article_links_by_id_type_xml_doi_conversion_fails(mock_convert_pmid):
     mock_convert_pmid.return_value = None # Conversion fails
     
-    links = await get_article_links("10.failed/doi", "doi")
+    links = await _get_article_links_by_id_type_xml("10.failed/doi", "doi")
     assert len(links) == 0
     mock_convert_pmid.assert_called_once_with("10.failed/doi", "DOI")
 
 @pytest.mark.asyncio
-async def test_get_article_links_invalid_type():
-    links = await get_article_links("123", "invalid_type")
+async def test_get_article_links_by_id_type_xml_invalid_type():
+    links = await _get_article_links_by_id_type_xml("123", "invalid_type")
     assert len(links) == 0
 
 @pytest.mark.asyncio
-async def test_get_article_links_empty_identifier():
-    links = await get_article_links("", "pmid")
+async def test_get_article_links_by_id_type_xml_empty_identifier():
+    links = await _get_article_links_by_id_type_xml("", "pmid")
     assert len(links) == 0
-    links = await get_article_links("  ", "doi")
+    links = await _get_article_links_by_id_type_xml("  ", "doi")
     assert len(links) == 0

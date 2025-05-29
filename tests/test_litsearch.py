@@ -17,9 +17,10 @@ try:
     from cli.litsearch import main as litsearch_main_coro, run_search_pipeline, load_rich_theme
     from autogen_core import ComponentLoader, CancellationToken
     from tools.search import LiteratureSearchTool, SearchLiteratureParams
-    from tools.triage import TriageAgent 
-    from autogen_agentchat.messages import TextMessage, ToolCallSummaryMessage 
-    import autogen_agentchat.agents as agents_module 
+    from tools.triage import TriageAgent
+    from autogen_agentchat.messages import TextMessage, ToolCallSummaryMessage
+    import autogen_agentchat.agents as agents_module
+    from autogen_agentchat.teams import BaseGroupChat # Added for spec
 except ImportError as e:
     print(f"ImportError in test setup: {e}. Ensure cli/litsearch.py and tools/search.py are accessible.")
     litsearch_main_coro = None
@@ -92,7 +93,10 @@ async def test_script_output_captures_reply(capsys, mocker, tmp_path, monkeypatc
         {"name": user_proxy_name, "provider": "autogen_agentchat.agents.UserProxyAgent", "config": {"name": user_proxy_name, "human_input_mode": "NEVER"}},
         {"name": assistant_name, "provider": "autogen_agentchat.agents.AssistantAgent", "config": {"name": assistant_name, "system_message": "System message for query_refiner.", "model_client": {"provider": "mock.Client", "config": {}}}},
         {"name": "query_team", "provider": "autogen_agentchat.teams.RoundRobinGroupChat", "config": {"participants": [{"name": assistant_name}, {"name": user_proxy_name}], "termination_condition": {"provider": "autogen_agentchat.conditions.HandoffTermination", "config": {"target": "user"}}}},
-        {"name": "triage", "provider": "tools.triage.TriageAgent", "config": {"name": "triage", "model_client": {"provider": "mock.Client", "config": {}}}}
+        {"name": "triage", "provider": "tools.triage.TriageAgent", "config": {"name": "triage", "model_client": {"provider": "mock.Client", "config": {}}}},
+        # Add missing agents that main() expects or has fallbacks for
+        {"name": "search_literature", "provider": "tools.search.LiteratureSearchTool", "config": {}},
+        {"name": "FullTextRetrievalAgent", "provider": "tools.retrieve_full_text.FullTextRetrievalAgent", "config": {}}
     ]
     create_dummy_configs(tmp_path, agents_content=valid_agents_config)
     
@@ -116,40 +120,39 @@ async def test_script_output_captures_reply(capsys, mocker, tmp_path, monkeypatc
     # This ensures that when TriageAgent is instantiated in cli.litsearch,
     # it creates a MagicMock instance, and isinstance(mock_instance, MagicMock_class) is True.
     mocker.patch("cli.litsearch.TriageAgent", MagicMock) 
+    # Mock FullTextRetrievalAgent as well, as it's in the config now
+    mocker.patch("cli.litsearch.FullTextRetrievalAgent", MagicMock)
     
-    mock_query_team_inst = MagicMock(name="MockQueryTeamInstance")
+    mock_query_team_inst = MagicMock(name="MockQueryTeamInstance", spec=BaseGroupChat) # Added spec
     mocker.patch("cli.litsearch.RoundRobinGroupChat", return_value=mock_query_team_inst)
     
     # Mock Console.print directly to ensure capsys captures it
     mock_console_print = mocker.patch("rich.console.Console.print")
 
     async def mock_run_pipeline_for_output(*args, **kwargs):
-        # args[4] is console, args[3] is original_query
+        # Corrected indices:
+        # args[0]=query_team, args[1]=literature_search_tool, args[2]=triage_agent, 
+        # args[3]=agents_dict, args[4]=original_query, args[5]=console, 
+        # args[6]=settings_config, args[7]=cli_args
+        original_query_arg = args[4]
+        console_instance = args[5]
+
         output_file = tmp_path / "workspace" / "triage_results.json"
         (tmp_path / "workspace").mkdir(exist_ok=True)
         with open(output_file, "w") as f: json.dump({}, f)
-        
+    
         # Simulate the print call that would happen in run_search_pipeline
-        # This call will now be to the mocked rich.console.Console.print
-        # The actual Console instance from main will have its print method mocked.
-        # We rely on capsys to capture what's written to stdout/stderr by the mock.
-        # Forcing print to sys.stdout via a new Console instance was an alternative,
-        # but mocking Console.print globally for the test is cleaner.
-        # The mock_console_print will be called by the actual Console instance from main.
-        # We need to ensure the string it's called with is what we expect.
-        # The actual print in run_search_pipeline is:
-        # console.print(f"[primary]Search and triage pipeline completed. Results saved to {output_file_path}[/primary]")
-        # So, we don't need to do the print here in the mock of run_search_pipeline if Console.print is globally mocked.
-        # Instead, the mock_console_print will capture the call.
-        # Actually, the mock_run_pipeline_for_output *does* need to make the print call
-        # for mock_console_print (which is a mock of rich.console.Console.print) to capture it.
-        # args[4] is the console object passed to run_search_pipeline.
-        console_instance = args[4]
         console_instance.print(f"[primary]Search and triage pipeline completed. Results saved to {output_file}[/primary]")
-        return {"query": args[3], "refined_queries": [], "triaged_articles": []}
+        return {"query": original_query_arg, "refined_queries": [], "triaged_articles": []}
     
     mocker.patch("cli.litsearch.run_search_pipeline", side_effect=mock_run_pipeline_for_output)
-    mocker.patch("cli.litsearch.LiteratureSearchTool", return_value=MagicMock(spec=LiteratureSearchTool))
+    
+    # Patch LiteratureSearchTool with MagicMock class.
+    # Instances created from LiteratureSearchTool in cli.litsearch.py will be MagicMock instances.
+    # The isinstance(instance, LiteratureSearchTool) check in cli.litsearch.py
+    # will effectively become isinstance(mock_instance, MagicMock), which is valid.
+    mocker.patch("cli.litsearch.LiteratureSearchTool", MagicMock)
+    
     mocker.patch("argparse.ArgumentParser.parse_args", return_value=MagicMock(spec=[]))
     mocker.patch("cli.litsearch.styled_input", return_value="test query")
 
@@ -164,12 +167,26 @@ async def test_script_output_captures_reply(capsys, mocker, tmp_path, monkeypatc
     found_print_call = False
     expected_print_fragment = "Search and triage pipeline completed. Results saved to"
     expected_path_fragment = "workspace/triage_results.json"
+    # Debug: print all calls to mock_console_print
+    # print("DEBUG: mock_console_print.call_args_list:")
+    # for i, call_args_item in enumerate(mock_console_print.call_args_list):
+    #     print(f"Call {i}: {call_args_item}")
+    #     if call_args_item[0]: # Positional arguments
+    #         print(f"  Arg 0 type: {type(call_args_item[0][0])}")
+    #         print(f"  Arg 0 content: {str(call_args_item[0][0])}")
+
+
     for call_args in mock_console_print.call_args_list:
-        printed_text = call_args[0][0] # First positional argument to print
-        if isinstance(printed_text, str) and expected_print_fragment in printed_text and expected_path_fragment in printed_text:
+        # The first positional argument to Console.print()
+        arg = call_args[0][0]
+        
+        # Convert Rich Text object to plain string if necessary
+        plain_text_arg = str(arg) # Works for str and rich.text.Text
+
+        if expected_print_fragment in plain_text_arg and expected_path_fragment in plain_text_arg:
             found_print_call = True
             break
-    assert found_print_call, f"Expected console print containing '{expected_print_fragment}' and '{expected_path_fragment}' was not found."
+    assert found_print_call, f"Expected console print containing '{expected_print_fragment}' and '{expected_path_fragment}' was not found. Calls: {mock_console_print.call_args_list}"
 
     assert "System message for query_refiner." in mock_query_refiner.system_message
 
@@ -188,10 +205,23 @@ async def test_search_pipeline_logic(mocker, tmp_path, monkeypatch):
     mock_triage_agent = MagicMock(spec=TriageAgent)
     mock_triage_agent.triage_articles_async.return_value = []
     mock_console = MagicMock(spec=Console)
+    # Add mocks for the new parameters
+    mock_agents_dict = {"FullTextRetrievalAgent": MagicMock()} 
+    mock_settings_config = {"search_settings": {"default_publication_types": ["journal article"], "default_max_results_per_source": 10}}
+    mock_cli_args = MagicMock(pub_types=None) # Simulate no CLI pub_types
 
     with monkeypatch.context() as m:
         m.chdir(tmp_path)
-        await run_search_pipeline(mock_query_team, mock_literature_search_tool, mock_triage_agent, original_query, mock_console)
+        await run_search_pipeline(
+            mock_query_team, 
+            mock_literature_search_tool, 
+            mock_triage_agent, 
+            mock_agents_dict, # Added
+            original_query, 
+            mock_console,
+            mock_settings_config, # Added
+            mock_cli_args # Added
+        )
     mock_query_team.run.assert_called_once_with(task=original_query)
 
 @pytest.mark.skipif(load_rich_theme is None, reason="load_rich_theme could not be imported")
@@ -219,8 +249,21 @@ async def test_groupchat_query_pipeline(mocker, tmp_path, monkeypatch):
     mock_console = MagicMock(spec=Console)
     mock_triage_agent = MagicMock(spec=TriageAgent)
     mock_triage_agent.triage_articles_async.return_value = []
+    # Add mocks for the new parameters
+    mock_agents_dict = {"FullTextRetrievalAgent": MagicMock()}
+    mock_settings_config = {"search_settings": {"default_publication_types": ["journal article"], "default_max_results_per_source": 10}}
+    mock_cli_args = MagicMock(pub_types=None)
 
     with monkeypatch.context() as m:
         m.chdir(tmp_path)
-        await run_search_pipeline(mock_query_team, mock_literature_search_tool, mock_triage_agent, original_query, mock_console)
+        await run_search_pipeline(
+            mock_query_team, 
+            mock_literature_search_tool, 
+            mock_triage_agent, 
+            mock_agents_dict, # Added
+            original_query, 
+            mock_console,
+            mock_settings_config, # Added
+            mock_cli_args # Added
+        )
     mock_query_team.run.assert_called_once_with(task=original_query)
