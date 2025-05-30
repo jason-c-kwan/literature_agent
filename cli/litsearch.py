@@ -51,6 +51,28 @@ class QueryRefinerJsonTermination(TerminationCondition):
     def terminated(self) -> bool:
         return self._terminated
 
+    def _is_valid_query_summary(self, summary: Any) -> bool:
+        if not isinstance(summary, dict):
+            return False
+        expected_keys = {
+            "research_focus": str,
+            "model_preferences": list,
+            "must_include": list,
+            "exclusions": list,
+            "time_window": str,
+            "requested_outputs": str
+        }
+        for key, expected_type in expected_keys.items():
+            if key not in summary:
+                return False
+            if not isinstance(summary[key], expected_type):
+                return False
+            if expected_type == list and not all(isinstance(item, str) for item in summary[key]):
+                # Allow empty lists, but if not empty, items must be strings
+                if summary[key] and not all(isinstance(item, str) for item in summary[key]):
+                    return False
+        return True
+
     async def __call__(self, messages: Sequence[BaseChatMessage]) -> Optional[StopMessage]:
         if self._terminated:
             return None
@@ -66,17 +88,20 @@ class QueryRefinerJsonTermination(TerminationCondition):
                     if isinstance(parsed_json, list) and len(parsed_json) > 0:
                         all_valid = True
                         for item in parsed_json:
-                            if not (isinstance(item, dict) and \
-                                    "pubmed_query" in item and isinstance(item["pubmed_query"], str) and \
-                                    "general_query" in item and isinstance(item["general_query"], str) and \
-                                    "article_type" in item and isinstance(item["article_type"], list) and \
-                                    all(isinstance(at, str) for at in item["article_type"]) and \
-                                    "date_range" in item and isinstance(item["date_range"], str)):
+                            if not (
+                                isinstance(item, dict) and
+                                "pubmed_query" in item and isinstance(item["pubmed_query"], str) and
+                                "general_query" in item and isinstance(item["general_query"], str) and
+                                "article_type" in item and isinstance(item["article_type"], list) and
+                                all(isinstance(at, str) for at in item["article_type"]) and
+                                "date_range" in item and isinstance(item["date_range"], str) and
+                                "query_summary" in item and self._is_valid_query_summary(item["query_summary"])
+                            ):
                                 all_valid = False
                                 break
                         if all_valid:
                             self._terminated = True
-                            return StopMessage(content="QueryRefinerAgent produced valid JSON output with article_type and date_range.", source=self._query_refiner_agent_name)
+                            return StopMessage(content="QueryRefinerAgent produced valid JSON output with query_summary.", source=self._query_refiner_agent_name)
                 except json.JSONDecodeError:
                     pass # Will be handled by the agent if it's not valid JSON
         return None
@@ -84,10 +109,18 @@ class QueryRefinerJsonTermination(TerminationCondition):
     async def reset(self) -> None:
         self._terminated = False
 
+def _is_valid_query_summary_for_extraction(summary: Any) -> bool:
+    # Simplified check for extraction, main validation in Termination class
+    if not isinstance(summary, dict): return False
+    expected_keys = ["research_focus", "model_preferences", "must_include", "exclusions", "time_window", "requested_outputs"]
+    return all(key in summary for key in expected_keys)
+
+
 def extract_queries(text: str) -> list[dict]:
     """
     Parses a fenced JSON block from the input text and returns a list of query dictionaries.
-    Each dictionary is expected to have 'pubmed_query', 'general_query', 'article_type', and 'date_range'.
+    Each dictionary is expected to have 'pubmed_query', 'general_query', 'article_type', 
+    'date_range', and 'query_summary'.
     Returns an empty list if parsing fails or the structure is incorrect.
     """
     match = re.search(r"```json\s*([\s\S]*?)\s*```", text)
@@ -105,21 +138,23 @@ def extract_queries(text: str) -> list[dict]:
                    "general_query" in item and isinstance(item["general_query"], str) and \
                    "article_type" in item and isinstance(item["article_type"], list) and \
                    all(isinstance(at, str) for at in item["article_type"]) and \
-                   "date_range" in item and isinstance(item["date_range"], str):
+                   "date_range" in item and isinstance(item["date_range"], str) and \
+                   "query_summary" in item and _is_valid_query_summary_for_extraction(item["query_summary"]):
                     valid_queries.append({
                         "pubmed_query": item["pubmed_query"],
                         "general_query": item["general_query"],
                         "article_type": item["article_type"],
-                        "date_range": item["date_range"]
+                        "date_range": item["date_range"],
+                        "query_summary": item["query_summary"]
                     })
                 else:
                     # If any item doesn't match the full structure, consider the whole JSON invalid for this function's purpose.
-                    console.print(f"[yellow]Warning: Invalid item structure in JSON query block: {item}[/yellow]")
+                    console.print(f"[yellow]Warning: Invalid item structure in JSON query block (extract_queries): {item}[/yellow]")
                     return [] 
             return valid_queries
         return []
     except json.JSONDecodeError:
-        console.print(f"[yellow]Warning: JSONDecodeError while parsing query block.[/yellow]")
+        console.print(f"[yellow]Warning: JSONDecodeError while parsing query block (extract_queries).[/yellow]")
         return []
 
 def parse_chat_history_for_metadata(
@@ -321,11 +356,14 @@ async def run_search_pipeline(
             if extracted_query_pairs:
                 console.print(f"[success]Successfully extracted {len(extracted_query_pairs)} refined query objects.[/success]")
                 for i, pair in enumerate(extracted_query_pairs):
-                    console.print(f"  Pair {i+1}: PubMed='{pair['pubmed_query']}', General='{pair['general_query']}', ArticleTypes={pair['article_type']}, DateRange='{pair['date_range']}'")
-                    all_refined_queries_for_logging.append(f"Extracted Pair {i+1} PubMed: {pair['pubmed_query']}")
-                    all_refined_queries_for_logging.append(f"Extracted Pair {i+1} General: {pair['general_query']}")
-                    all_refined_queries_for_logging.append(f"Extracted Pair {i+1} ArticleTypes: {pair['article_type']}")
-                    all_refined_queries_for_logging.append(f"Extracted Pair {i+1} DateRange: {pair['date_range']}")
+                    console.print(f"  Pair {i+1}: PubMed='{pair['pubmed_query']}', General='{pair['general_query']}', ArticleTypes={pair['article_type']}, DateRange='{pair['date_range']}', QuerySummary={json.dumps(pair.get('query_summary'))}")
+                    all_refined_queries_for_logging.append({
+                        "pubmed_query": pair['pubmed_query'],
+                        "general_query": pair['general_query'],
+                        "article_type": pair['article_type'],
+                        "date_range": pair['date_range'],
+                        "query_summary": pair.get('query_summary') 
+                    })
             else:
                 console.print(f"[red]Failed to extract valid JSON query objects from QueryRefinerAgent's last message. Content: {last_refiner_msg_content[:500]}...[/red]")
         else:
@@ -482,39 +520,81 @@ async def run_search_pipeline(
         all_articles_data = deduplicated_for_triage
         console.print(f"[info]Articles after deduplication for triage: {len(all_articles_data)}[/info]")
 
-    triaged_articles_with_scores: List[Dict[str, Any]] = [] # Ensure it's initialized
-    if not all_articles_data: # Check if the list to be triaged is empty
+    triaged_articles_with_scores: List[Dict[str, Any]] = []
+    query_summary_for_triage: Optional[Dict[str, Any]] = None
+
+    if extracted_query_pairs: # If we have refined queries, use the first summary
+        query_summary_for_triage = extracted_query_pairs[0].get('query_summary')
+        if query_summary_for_triage:
+            console.print(f"[info]Using query summary for triage: {json.dumps(query_summary_for_triage)}[/info]")
+        else:
+            console.print("[yellow]Warning: Refined queries extracted, but no query_summary found in the first one. Triage might be affected.[/yellow]")
+    elif use_fallback_query: # No refined queries, and fallback is active
+        console.print("[yellow]Warning: Using fallback query. No query_summary available for triage. Triage will proceed without detailed summary.[/yellow]")
+        # query_summary_for_triage remains None
+    
+    if not all_articles_data:
         console.print("[info]No articles to triage after deduplication.[/info]")
     else:
         console.print(f"[secondary]Triaging {len(all_articles_data)} unique articles...[/secondary]")
         try:
-            # Pass the deduplicated list to triage
             triaged_articles_with_scores = await triage_agent.triage_articles_async(
-                articles=all_articles_data, user_query=original_query
+                articles=all_articles_data, query_summary=query_summary_for_triage # Pass the extracted or None summary
             )
-            console.print(f"[secondary]Triage complete. {len(triaged_articles_with_scores)} articles were processed by triage (this count includes all scores).[/secondary]")
+            console.print(f"[secondary]Triage complete. {len(triaged_articles_with_scores)} articles were processed by triage.[/secondary]")
         except Exception as e:
             console.print(f"[red]Error during article triage: {e}[/red]")
-            # Fallback: use all_articles_data but mark score as N/A
+            # Fallback: use all_articles_data but mark scores as None or error state
             triaged_articles_with_scores = all_articles_data 
-            for article_item in triaged_articles_with_scores: # Ensure correct variable name
-                if 'relevance_score' not in article_item: article_item['relevance_score'] = "N/A (Triage Error)"
+            for article_item in triaged_articles_with_scores:
+                article_item['detailed_relevance_scores'] = {key: None for key in ["research_focus", "model_preferences", "must_include", "exclusions", "time_window", "requested_outputs"]}
+                article_item['average_relevance_score'] = None
     
     highly_relevant_articles = []
-    if triaged_articles_with_scores: # This list now contains all triaged articles with their scores
-        console.print(f"[secondary]Filtering {len(triaged_articles_with_scores)} triaged articles for relevance scores 4 or 5...[/secondary]")
-        for article_item_scored in triaged_articles_with_scores: # Ensure correct variable name
-            score = article_item_scored.get('relevance_score')
-            if isinstance(score, (int, float)) and score >= 4: # Assuming scores can be float, and 4 or 5 are highly relevant
-                highly_relevant_articles.append(article_item_scored)
-        console.print(f"[info]Found {len(highly_relevant_articles)} articles with relevance score >= 4.[/info]")
+    if triaged_articles_with_scores:
+        console.print(f"[secondary]Filtering {len(triaged_articles_with_scores)} triaged articles based on new criteria...[/secondary]")
+        for article in triaged_articles_with_scores:
+            avg_score = article.get('average_relevance_score')
+            detailed_scores = article.get('detailed_relevance_scores', {})
+            passes_overall_filter = True
+
+            # Condition 1: Average Score Check
+            if avg_score is None or avg_score < 4.0:
+                passes_overall_filter = False
+
+            # Condition 2: Individual Category Score Check (only if Condition 1 is met)
+            if passes_overall_filter:
+                has_at_least_one_valid_detailed_score = False
+                for category_score_value in detailed_scores.values():
+                    if isinstance(category_score_value, (int, float)): # It's a numerical score
+                        has_at_least_one_valid_detailed_score = True
+                        if category_score_value < 3.0:
+                            passes_overall_filter = False
+                            break # Fails individual category threshold
+                
+                # If avg_score was >= 4.0, but there were no valid detailed scores to check against >=3.0
+                # (e.g., all categories were broad, resulting in avg_score being None, which fails Condition 1)
+                # This check ensures that if an article somehow got a high avg_score without any scorable categories, it's caught.
+                # However, if avg_score is None (all broad), it's already filtered.
+                # If avg_score is not None, it means there was at least one valid detailed score.
+                # So, this specific 'if not has_at_least_one_valid_detailed_score' might be redundant
+                # if avg_score calculation correctly results in None when no valid_numerical_scores exist.
+                # For safety, if avg_score passed but no detailed scores were numeric, it should fail.
+                if avg_score is not None and not has_at_least_one_valid_detailed_score:
+                     passes_overall_filter = False
+
+
+            if passes_overall_filter:
+                highly_relevant_articles.append(article)
+        
+        console.print(f"[info]Found {len(highly_relevant_articles)} articles meeting the new relevance criteria.[/info]")
     else:
         console.print(f"[secondary]No triaged articles with scores to filter.[/secondary]")
 
     output_data = {
         "query": original_query,
-        "refined_queries": all_refined_queries_for_logging, # This contains the full query objects now
-        "triaged_articles": highly_relevant_articles # This is the list of dicts
+        "refined_queries": all_refined_queries_for_logging, 
+        "triaged_articles": highly_relevant_articles
     }
     
     workspace_dir = Path("workspace")
@@ -524,6 +604,36 @@ async def run_search_pipeline(
         json.dump(output_data, f, indent=2)
     console.print(f"[primary]Search and triage pipeline completed. Results saved to {output_file_path}[/primary]")
     console.print(f"[secondary]Total unique articles (relevance 4 or 5) saved:[/secondary] [highlight]{len(highly_relevant_articles)}[/highlight]")
+
+    # Create a unique run ID and directory for this specific run's detailed outputs
+    run_id = str(uuid.uuid4())
+    workspace_debug_dir = Path("workspace") / run_id 
+    workspace_debug_dir.mkdir(parents=True, exist_ok=True)
+    console.print(f"[info]Run-specific output directory created: {workspace_debug_dir}[/info]")
+
+    # Determine articles that were triaged but not deemed highly relevant
+    other_triaged_articles = []
+    if triaged_articles_with_scores:
+        highly_relevant_ids = set()
+        for article_hr in highly_relevant_articles:
+            hr_doi = str(article_hr.get("doi", "")).lower().strip() if article_hr.get("doi") else ""
+            hr_pmid = str(article_hr.get("pmid", "")).strip() if article_hr.get("pmid") else ""
+            # Using a tuple of (doi, pmid) as a unique key.
+            highly_relevant_ids.add((hr_doi, hr_pmid))
+
+        for article_t in triaged_articles_with_scores:
+            t_doi = str(article_t.get("doi", "")).lower().strip() if article_t.get("doi") else ""
+            t_pmid = str(article_t.get("pmid", "")).strip() if article_t.get("pmid") else ""
+            if (t_doi, t_pmid) not in highly_relevant_ids:
+                other_triaged_articles.append(article_t)
+    
+    if other_triaged_articles:
+        other_triaged_output_path = workspace_debug_dir / "triaged_results.json"
+        with open(other_triaged_output_path, "w") as f:
+            json.dump(other_triaged_articles, f, indent=2)
+        console.print(f"[info]Other triaged articles ({len(other_triaged_articles)}) saved to {other_triaged_output_path}[/info]")
+    else:
+        console.print("[info]No 'other' triaged articles to save.[/info]")
     
     full_text_agent_instance = agents.get("FullTextRetrievalAgent")
     full_text_results_list = highly_relevant_articles
@@ -538,10 +648,9 @@ async def run_search_pipeline(
                 if isinstance(response_content, str):
                     full_text_results_list = json.loads(response_content)
                     console.print(f"[info]Full text retrieval agent processed {len(full_text_results_list)} articles.[/info]")
-                    run_id = str(uuid.uuid4())
-                    workspace_debug_dir = os.path.join("workspace", run_id)
-                    os.makedirs(workspace_debug_dir, exist_ok=True)
-                    full_text_output_path = os.path.join(workspace_debug_dir, "full_text_results.json")
+                    # run_id and workspace_debug_dir are now defined and created earlier.
+                    # workspace_debug_dir.mkdir(parents=True, exist_ok=True) # This directory is already created.
+                    full_text_output_path = workspace_debug_dir / "full_text_results.json" # Use Path object
                     with open(full_text_output_path, "w") as f:
                         json.dump(full_text_results_list, f, indent=2)
                     console.print(f"[debug]Full text results saved to {full_text_output_path}[/debug]")
@@ -557,8 +666,8 @@ async def run_search_pipeline(
     else:
         console.print("[yellow]FullTextRetrievalAgent not found or not loaded. Skipping full text retrieval.[/yellow]")
 
-    output_data["triaged_articles"] = full_text_results_list
-    with open(output_file_path, "w") as f:
+    output_data["triaged_articles"] = full_text_results_list # This updates the main summary file data
+    with open(output_file_path, "w") as f: # output_file_path is "workspace/triage_results.json"
         json.dump(output_data, f, indent=2)
     console.print(f"[primary]Main pipeline results (including full text attempt) saved to {output_file_path}[/primary]")
     console.print(f"[secondary]Total articles in final output (after full text attempt):[/secondary] [highlight]{len(full_text_results_list)}[/highlight]")

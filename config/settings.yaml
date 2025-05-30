@@ -26,7 +26,7 @@ caps:
 
 # Search settings
 search_settings:
-  default_max_results_per_source: 5
+  default_max_results_per_source: 100
   default_publication_types: # Default if --pub-types CLI flag is not used
     - "research"
     - "review"

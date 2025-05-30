@@ -677,7 +677,7 @@ async def retrieve_full_texts_for_dois(
 
     articles_to_process = [
         article for article in query_refiner_output.get("triaged_articles", [])
-        if isinstance(article, dict) and article.get("relevance_score", 0) in [4, 5] and article.get("doi")
+        if isinstance(article, dict) and article.get("average_relevance_score", 0.0) >= 4.0 and article.get("doi")
     ]
 
     original_articles_list = query_refiner_output.get("triaged_articles", [])
@@ -761,7 +761,7 @@ async def retrieve_full_texts_for_dois(
             # Add tried_sources to the article for transparency, if desired
             # updated_article["fulltext_retrieval_sources_attempted"] = tried_sources_list
 
-        elif original_article.get("relevance_score", 0) not in [4, 5]:
+        elif original_article.get("average_relevance_score", 0.0) < 4.0: # Changed from 'not in [4,5]' to '< 4.0'
             updated_article["fulltext_retrieval_status"] = "skipped_relevance"
             updated_article["fulltext_retrieval_message"] = "Not processed due to relevance score"
         else:

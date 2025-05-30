@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import os
 from typing import List, Dict, Any, Optional
+import json # Added import
 
 import yaml
 from autogen_agentchat.agents import AssistantAgent
@@ -19,20 +20,18 @@ class TriageAgent(AssistantAgent):
         self,
         name: str,
         model_client: ChatCompletionClient,
-        system_message: Optional[str] = "You are a biomedical literature triage assistant. Your task is to assess relevance. Respond with only a score from 1 to 5.",
+        system_message: Optional[str] = "You are a biomedical literature triage assistant. Your task is to assess relevance based on a query summary and respond with a JSON object of scores.", # Updated default
         settings_path: str = SETTINGS_FILE_PATH,
         **kwargs, 
     ):
         super().__init__(
             name=name,
             model_client=model_client,
-            system_message=system_message,
+            system_message=system_message, # This will be overridden by agents.yaml if specified there
             **kwargs 
         )
         self._load_settings(settings_path)
-        # The system_message from agents.yaml will be used by AssistantAgent's LLM calls.
-        # It should be generic, e.g.: "You are a scorer... Respond with score 1-5."
-        # The specific query and article details will be in the user message.
+        # The detailed system_message from agents.yaml (instructing JSON output etc.) will be used.
 
     def _load_settings(self, settings_path: str):
         try:
@@ -53,105 +52,121 @@ class TriageAgent(AssistantAgent):
             self.norm_citation_threshold = 1.0
             self.oa_statuses_accepted = ['gold', 'hybrid', 'green']
 
-    async def get_relevance_score(self, article_title: str, article_abstract: Optional[str], user_query: str) -> int:
+    async def get_detailed_relevance_scores(self, article_title: str, article_abstract: Optional[str], query_summary: dict) -> Dict[str, Optional[int]]:
         """
-        Gets a relevance score from the LLM for a given article against a user query.
-        The agent's system_message (set at initialization from agents.yaml) should instruct the LLM
-        on its role and how to score. The prompt here provides the specific data.
+        Gets detailed relevance scores from the LLM for a given article against a query_summary.
+        The agent's system_message (from agents.yaml) instructs the LLM on its role and JSON output format.
         """
+        default_score_keys = ["research_focus", "model_preferences", "must_include", "exclusions", "time_window", "requested_outputs"]
+        error_scores = {key: None for key in default_score_keys} # Return None for all categories on error
+
+        try:
+            query_summary_str = json.dumps(query_summary, indent=2)
+        except TypeError:
+            print(f"Error: Could not serialize query_summary to JSON for article '{article_title}'.")
+            return error_scores
+            
         prompt_content = (
-            f"User Query: {user_query}\n\n"
-            f"Title: {article_title}\n\n"
-            f"Abstract: {article_abstract if article_abstract else 'N/A'}"
+            f"Query Summary:\n```json\n{query_summary_str}\n```\n\n"
+            f"Publication Title: {article_title}\n\n"
+            f"Publication Abstract: {article_abstract if article_abstract else 'N/A'}\n\n"
+            f"Provide your category scores as a single JSON object based on the instructions in the system message."
         )
         
         try:
-            # Use the AssistantAgent's on_messages method to interact with the LLM.
-            # This method uses the system_message configured during agent initialization.
             response_obj = await super().on_messages(
-                messages=[TextMessage(content=prompt_content, source="user_data_provider")], 
+                messages=[TextMessage(content=prompt_content, source="user_data_provider")],
                 cancellation_token=CancellationToken()
             )
             
-            # The response_obj.chat_message should contain the LLM's direct response.
             llm_response_content = response_obj.chat_message.content
 
             if isinstance(llm_response_content, str):
-                score_str = llm_response_content.strip()
-                if score_str.isdigit():
-                    score = int(score_str)
-                    if 1 <= score <= 5:
-                        return score
-                print(f"Warning: LLM returned invalid score format: '{score_str}' for title: '{article_title}' with query '{user_query}'")
-            else:
-                print(f"Warning: LLM response content is not a string: {type(llm_response_content)} for title: '{article_title}'")
-        except Exception as e:
-            print(f"Error getting relevance score for '{article_title}' with query '{user_query}': {e}")
-        return 1 # Default to lowest score on error or invalid format
+                try:
+                    # Attempt to parse the entire response as JSON
+                    # The system prompt for triage agent now demands the *entire* response be JSON.
+                    scores_dict = json.loads(llm_response_content.strip())
+                    
+                    # Validate structure and values
+                    validated_scores = {}
+                    valid_structure = True
+                    for key in default_score_keys: # Ensure all expected keys are present or handled
+                        if key in scores_dict:
+                            value = scores_dict[key]
+                            if value is None: # Explicit null for broad categories is fine
+                                validated_scores[key] = None
+                            elif isinstance(value, int) and 1 <= value <= 5:
+                                validated_scores[key] = value
+                            else: # Invalid score value for a key
+                                print(f"Warning: LLM returned invalid score value '{value}' for category '{key}' in article '{article_title}'. Setting to None.")
+                                validated_scores[key] = None # Or handle as error, e.g. score of 1
+                                valid_structure = False # Or just for this key
+                        else: # Key missing from LLM response
+                            print(f"Warning: LLM response missing score for category '{key}' in article '{article_title}'. Setting to None.")
+                            validated_scores[key] = None
+                            valid_structure = False
+                    
+                    # Ensure all expected keys are in the output, even if they were missing from LLM
+                    for key in default_score_keys:
+                        if key not in validated_scores:
+                             validated_scores[key] = None
 
-    async def triage_articles_async(self, articles: List[Dict[str, Any]], user_query: str) -> List[Dict[str, Any]]:
+                    return validated_scores
+
+                except json.JSONDecodeError:
+                    print(f"Warning: LLM response was not valid JSON: '{llm_response_content.strip()}' for article '{article_title}'.")
+                    return error_scores # Return dict with all Nones
+            else:
+                print(f"Warning: LLM response content is not a string: {type(llm_response_content)} for article '{article_title}'.")
+                return error_scores
+        except Exception as e:
+            print(f"Error getting detailed relevance scores for '{article_title}': {e}")
+            return error_scores
+
+    async def triage_articles_async(self, articles: List[Dict[str, Any]], query_summary: Optional[dict]) -> List[Dict[str, Any]]:
         """
-        Performs relevance assessment and quality filtering on a list of articles.
+        Performs relevance assessment based on query_summary and calculates average scores.
         """
-        triaged_articles: List[Dict[str, Any]] = []
-        current_year = datetime.datetime.now().year
+        triaged_articles_output: List[Dict[str, Any]] = []
+        # current_year = datetime.datetime.now().year # Keep if needed for other filters, but primary filters removed
+
+        if query_summary is None:
+            print("Warning: No query_summary provided to triage_articles_async. Articles will not be scored by LLM.")
+            for article_data in articles:
+                article = article_data.copy()
+                article['detailed_relevance_scores'] = {key: None for key in ["research_focus", "model_preferences", "must_include", "exclusions", "time_window", "requested_outputs"]}
+                article['average_relevance_score'] = None
+                # Decide if articles should still be added to output if no summary, or just return empty.
+                # For now, let's add them with None scores, filtering will happen in cli/litsearch.py
+                triaged_articles_output.append(article)
+            return triaged_articles_output
 
         for article_data in articles:
-            # Make a copy to avoid modifying the original list of dicts if it's passed around
             article = article_data.copy()
-            
             title = article.get('title', 'N/A')
-            abstract = article.get('abstract') # May be None
+            abstract = article.get('abstract')
+
+            detailed_scores = await self.get_detailed_relevance_scores(title, abstract, query_summary)
+            article['detailed_relevance_scores'] = detailed_scores
+
+            valid_numerical_scores = []
+            if isinstance(detailed_scores, dict):
+                for score_value in detailed_scores.values():
+                    if isinstance(score_value, (int, float)): # Check if it's a number
+                        valid_numerical_scores.append(score_value)
             
-            # 1. Get LLM Relevance Score
-            relevance_score = await self.get_relevance_score(title, abstract, user_query)
-            article['relevance_score'] = relevance_score
+            if valid_numerical_scores:
+                article['average_relevance_score'] = sum(valid_numerical_scores) / len(valid_numerical_scores)
+            else:
+                article['average_relevance_score'] = None # No valid numerical scores to average
 
-            # 2. Apply Filters
-            # SJR Percentile Filter
-            sjr = article.get('sjr_percentile')
-            if sjr is not None:
-                try:
-                    if float(sjr) < self.sjr_threshold:
-                        continue
-                except ValueError:
-                    print(f"Warning: Invalid SJR percentile value '{sjr}' for article '{title}'. Skipping SJR filter for this article.")
-
-
-            # Open Access Filter
-            oa_status = article.get('oa_status')
-            accepted_oa_statuses = self.oa_statuses_accepted if isinstance(self.oa_statuses_accepted, list) else []
-            # Only apply filter if oa_status is present and not in accepted list. If oa_status is None, article passes this filter.
-            if oa_status is not None and oa_status not in accepted_oa_statuses:
-                continue
-
-            # Age-Normalized Citation Count Filter
-            citations = article.get('citation_count')
-            pub_year_val = article.get('year') or article.get('publication_year') # Prioritize 'year', fallback to 'publication_year'
+            # Old filtering logic (SJR, OA, Citations) is removed as per plan.
+            # The new filtering will be based on average_relevance_score and detailed_relevance_scores
+            # and will be handled in cli/litsearch.py after this method returns.
             
-            if citations is not None and pub_year_val is not None:
-                try:
-                    pub_year = int(pub_year_val)
-                    citations_val = int(citations)
-                    
-                    age = current_year - pub_year + 1
-                    if age <= 0: 
-                        age = 1 # Avoid division by zero or negative age
-                    
-                    normalized_citations = float(citations_val) / age
-                    if normalized_citations < self.norm_citation_threshold:
-                        continue
-                except ValueError:
-                    print(f"Warning: Invalid citation count ('{citations}') or year ('{pub_year_val}') for article '{title}'. Skipping citation filter.")
-                    # If data is bad for calculation, consider it as failing the filter.
-                    continue 
-            elif citations is None or pub_year_val is None: # If data is missing for required calculation
-                # If data is missing for this filter, the article cannot pass it.
-                continue
-                
-            triaged_articles.append(article)
+            triaged_articles_output.append(article)
 
-        return triaged_articles
+        return triaged_articles_output
 
 # Note: For this TriageAgent to be correctly loaded and used by the AutoGen framework
 # based on `agents.yaml`, the `system_message` in `agents.yaml` for the `triage`
